@@ -1,0 +1,22 @@
+[tools]
+zig = "0.15.2"
+
+[tasks.build]
+description = "Build the project"
+run = "zig build"
+
+[tasks.run]
+description = "Run the application"
+run = "zig build run"
+
+[tasks.test]
+description = "Run tests"
+run = "zig build test"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "rm -rf zig-cache zig-out"
+
+[tasks.check]
+description = "Check code without building"
+run = "zig build --summary all"
