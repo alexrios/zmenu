@@ -65,6 +65,7 @@ cd "$selected"
 - Selected item has `>` prefix and highlighted color
 
 ## Development
+
 - [mise](https://mise.jdx.dev/) for version management
 - **No SDL3 system libraries required!** - zig-sdl3 bundles everything
 
@@ -176,8 +177,6 @@ zig build -Dtarget=x86_64-linux
 - **Windows**: Works with cmd.exe, PowerShell, and Windows Terminal
 - **macOS**: Window positioning on multi-monitor setups may vary
 - **Linux**: Tested on X11 and Wayland (via SDL3)
-
----
 
 ## Changelog
 
