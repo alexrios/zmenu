@@ -147,7 +147,6 @@ const App = struct {
     }
 
     fn loadItemsFromStdin(self: *App) !void {
-        // Cross-platform: std.posix maps to Windows/POSIX appropriately
         const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
         const max_size = 10 * 1024 * 1024; // 10MB max
         const content = try stdin_file.readToEndAlloc(self.allocator, max_size);
@@ -308,7 +307,6 @@ const App = struct {
     fn handleKeyEvent(self: *App, event: sdl.events.Keyboard) !bool {
         const key = event.key orelse return false;
 
-        // Use else-if chain to prevent multiple handlers
         if (key == .escape) {
             return true; // Quit without selection
         } else if (key == .return_key or key == .kp_enter) {
