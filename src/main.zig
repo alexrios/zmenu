@@ -40,6 +40,7 @@ const Config = struct {
     item_buffer_size: usize = 4096 + 16, // max_item_length + prefix + safety
     count_buffer_size: usize = 64,
     scroll_buffer_size: usize = 64,
+    // Base dimensions (before scaling) - these are in logical coordinates
     item_line_height: f32 = 20.0,
     prompt_y: f32 = 5.0,
     items_start_y: f32 = 30.0,
@@ -47,6 +48,8 @@ const Config = struct {
     // Font configuration
     font_path: ?[:0]const u8 = null, // null = use platform defaults
     font_size: f32 = 22,
+    // High DPI support
+    enable_high_dpi: bool = true, // Request high pixel density when available
 };
 
 // Text texture cache entry
@@ -84,6 +87,10 @@ const App = struct {
     prompt_cache: TextureCache,
     count_cache: TextureCache,
     no_match_cache: TextureCache,
+    // High DPI state
+    display_scale: f32, // Combined scale factor (pixel density × content scale)
+    pixel_width: u32, // Actual pixel dimensions
+    pixel_height: u32,
 
     fn tryLoadFont(config: Config) !struct { font: sdl.ttf.Font, path: []const u8 } {
         // If user specified a custom font path, try only that
@@ -128,12 +135,17 @@ const App = struct {
 
         const config = Config{};
 
-        // Create window and renderer
+        // Create window and renderer with high DPI support
+        const window_flags = if (config.enable_high_dpi)
+            sdl.video.Window.Flags{ .borderless = true, .always_on_top = true, .high_pixel_density = true }
+        else
+            sdl.video.Window.Flags{ .borderless = true, .always_on_top = true };
+
         const window, const renderer = try sdl.render.Renderer.initWithWindow(
             "zmenu",
             config.window_width,
             config.window_height,
-            .{ .borderless = true, .always_on_top = true },
+            window_flags,
         );
         errdefer renderer.deinit();
         errdefer window.deinit();
@@ -142,6 +154,10 @@ const App = struct {
         window.setPosition(.{ .centered = null }, .{ .absolute = 0 }) catch |err| {
             std.debug.print("Warning: Failed to position window: {}\n", .{err});
         };
+
+        // Query display scale and pixel dimensions for high DPI support
+        const display_scale = try window.getDisplayScale();
+        const pixel_width, const pixel_height = try window.getSizeInPixels();
 
         // Allocate render buffers
         const prompt_buffer = try allocator.alloc(u8, config.prompt_buffer_size);
@@ -177,6 +193,9 @@ const App = struct {
             .prompt_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
             .count_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
             .no_match_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+            .display_scale = display_scale,
+            .pixel_width = @intCast(pixel_width),
+            .pixel_height = @intCast(pixel_height),
         };
 
         // Load items from stdin
@@ -397,6 +416,15 @@ const App = struct {
         self.needs_render = true;
     }
 
+    fn updateDisplayScale(self: *App) !void {
+        // Query updated display scale and pixel dimensions
+        self.display_scale = try self.window.getDisplayScale();
+        const pixel_width, const pixel_height = try self.window.getSizeInPixels();
+        self.pixel_width = @intCast(pixel_width);
+        self.pixel_height = @intCast(pixel_height);
+        self.needs_render = true;
+    }
+
     fn handleKeyEvent(self: *App, event: sdl.events.Keyboard) !bool {
         const key = event.key orelse return false;
 
@@ -523,6 +551,9 @@ const App = struct {
         try self.renderer.setDrawColor(self.config.background_color);
         try self.renderer.clear();
 
+        // Apply display scale to all coordinates
+        const scale = self.display_scale;
+
         // Show prompt with input buffer
         const prompt_text = if (self.input_buffer.items.len > 0) blk: {
             // Truncate display if input is too long, showing last chars with ellipsis
@@ -546,7 +577,7 @@ const App = struct {
         } else
             std.fmt.bufPrintZ(self.prompt_buffer, "> ", .{}) catch "> ";
 
-        try self.renderCachedText(5, self.config.prompt_y, prompt_text, self.config.prompt_color, &self.prompt_cache);
+        try self.renderCachedText(5.0 * scale, self.config.prompt_y * scale, prompt_text, self.config.prompt_color, &self.prompt_cache);
 
         // Show filtered items count
         const count_text = std.fmt.bufPrintZ(
@@ -555,8 +586,8 @@ const App = struct {
             .{ self.filtered_items.items.len, self.items.items.len },
         ) catch "?/?";
 
-        const count_x = @as(f32, @floatFromInt(self.config.window_width)) - self.config.right_margin_offset;
-        try self.renderCachedText(count_x, self.config.prompt_y, count_text, self.config.foreground_color, &self.count_cache);
+        const count_x = (@as(f32, @floatFromInt(self.config.window_width)) - self.config.right_margin_offset) * scale;
+        try self.renderCachedText(count_x, self.config.prompt_y * scale, count_text, self.config.foreground_color, &self.count_cache);
 
         // Cache length to avoid race conditions
         const filtered_len = self.filtered_items.items.len;
@@ -565,7 +596,7 @@ const App = struct {
         if (filtered_len > 0) {
             const visible_end = @min(self.scroll_offset + self.config.max_visible_items, filtered_len);
 
-            var y_pos: f32 = self.config.items_start_y;
+            var y_pos: f32 = self.config.items_start_y * scale;
 
             for (self.scroll_offset..visible_end) |i| {
                 // Double check bounds before accessing
@@ -587,9 +618,9 @@ const App = struct {
 
                 // Use TTF rendering with appropriate color
                 const color = if (is_selected) self.config.selected_color else self.config.foreground_color;
-                try self.renderText(5, y_pos, item_text, color);
+                try self.renderText(5.0 * scale, y_pos, item_text, color);
 
-                y_pos += self.config.item_line_height;
+                y_pos += self.config.item_line_height * scale;
             }
 
             // Show scroll indicator if needed
@@ -600,10 +631,10 @@ const App = struct {
                     .{ self.scroll_offset + 1, visible_end },
                 ) catch "[?]";
 
-                try self.renderText(count_x, self.config.items_start_y, scroll_text, self.config.foreground_color);
+                try self.renderText(count_x, self.config.items_start_y * scale, scroll_text, self.config.foreground_color);
             }
         } else {
-            try self.renderCachedText(5, self.config.items_start_y, "No matches", self.config.foreground_color, &self.no_match_cache);
+            try self.renderCachedText(5.0 * scale, self.config.items_start_y * scale, "No matches", self.config.foreground_color, &self.no_match_cache);
         }
 
         try self.renderer.present();
@@ -637,6 +668,14 @@ const App = struct {
                         },
                         .text_input => |text_event| {
                             try self.handleTextInput(text_event.text);
+                        },
+                        .window_display_scale_changed => {
+                            // Display DPI/scale changed - update our scale factor
+                            try self.updateDisplayScale();
+                        },
+                        .window_pixel_size_changed => {
+                            // Window pixel size changed - update dimensions
+                            try self.updateDisplayScale();
                         },
                         else => {
                             // Ignore other events (mouse, etc.)
@@ -777,6 +816,9 @@ test "deleteLastCodepoint - ASCII" {
         .prompt_cache = undefined,
         .count_cache = undefined,
         .no_match_cache = undefined,
+        .display_scale = 1.0,
+        .pixel_width = 800,
+        .pixel_height = 300,
     };
 
     try app.input_buffer.appendSlice(allocator, "hello");
@@ -808,6 +850,9 @@ test "deleteLastCodepoint - UTF-8 multi-byte" {
         .prompt_cache = undefined,
         .count_cache = undefined,
         .no_match_cache = undefined,
+        .display_scale = 1.0,
+        .pixel_width = 800,
+        .pixel_height = 300,
     };
 
     // "café" = c a f é(2 bytes)
@@ -843,6 +888,9 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
         .prompt_cache = undefined,
         .count_cache = undefined,
         .no_match_cache = undefined,
+        .display_scale = 1.0,
+        .pixel_width = 800,
+        .pixel_height = 300,
     };
 
     // "日" = 3 bytes
@@ -878,6 +926,9 @@ test "deleteLastCodepoint - empty buffer" {
         .prompt_cache = undefined,
         .count_cache = undefined,
         .no_match_cache = undefined,
+        .display_scale = 1.0,
+        .pixel_width = 800,
+        .pixel_height = 300,
     };
 
     app.deleteLastCodepoint(); // Should not crash
