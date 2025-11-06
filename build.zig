@@ -11,6 +11,12 @@ pub fn build(b: *std.Build) void {
         .ext_ttf = true,
     });
 
+    // Add flow-syntax dependency
+    const flow_syntax = b.dependency("flow_syntax", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "zmenu",
         .root_module = b.createModule(.{
@@ -22,6 +28,8 @@ pub fn build(b: *std.Build) void {
 
     // Import SDL3 module
     exe.root_module.addImport("sdl3", sdl3.module("sdl3"));
+    // Import flow-syntax module
+    exe.root_module.addImport("syntax", flow_syntax.module("syntax"));
 
     b.installArtifact(exe);
 
@@ -35,6 +43,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // Main tests (embedded in main.zig)
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -45,6 +54,8 @@ pub fn build(b: *std.Build) void {
 
     // Import SDL3 module for tests
     unit_tests.root_module.addImport("sdl3", sdl3.module("sdl3"));
+    // Import flow-syntax module for tests
+    unit_tests.root_module.addImport("syntax", flow_syntax.module("syntax"));
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
