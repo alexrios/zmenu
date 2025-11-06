@@ -172,3 +172,224 @@ unit_tests.root_module.addImport("sdl3", sdl3.module("sdl3"));
 ```
 
 **Lesson**: Test target needs explicit module imports even though it compiles the same source file.
+
+---
+
+### Syntax Highlighting Integration (flow-syntax/tree-sitter)
+
+**Challenge**: Integrating tree-sitter via flow-syntax library for syntax highlighting in preview pane.
+
+**Key Decisions**:
+
+1. **Span-based rendering**: Collect highlight spans with byte ranges and scopes from tree-sitter, then render line segments with appropriate colors.
+
+2. **Error handling**: Syntax parsing failures shouldn't crash the app - catch and clear stale spans:
+   ```zig
+   self.state.highlight_spans.clearRetainingCapacity();
+   self.applySyntaxHighlighting(file_path, content) catch |err| {
+       self.state.highlight_spans.clearRetainingCapacity();  // Clear on error
+       std.debug.print("Warning: {}\n", .{err});
+   };
+   ```
+
+3. **Callback signature**: Tree-sitter callback must return `error{Stop}!void` not generic error union:
+   ```zig
+   fn callback(ctx: *Context, range: Range, scope: []const u8, ...) error{Stop}!void {
+       ctx.spans.append(allocator, .{ ... }) catch return error.Stop;
+   }
+   ```
+
+**Pitfall**: Stale highlight data from previous file can render on new file with wrong byte offsets. Always clear spans before and after syntax parsing.
+
+---
+
+### Byte Offset Calculation for Multi-line Highlighting
+
+**Problem**: When rendering preview line-by-line, byte offsets must match the full content for highlight spans to align correctly.
+
+**Critical Bug Found**: Using `splitScalar` iterator and adding `+1` for every line, even when file doesn't end with newline:
+```zig
+// WRONG - adds extra byte at end
+while (iter.next()) |line| {
+    byte_offset += line.len + 1;  // Assumes newline always exists
+}
+```
+
+**Correct Approach**: Track whether newline actually exists:
+```zig
+var iter = std.mem.splitScalar(u8, content, '\n');
+while (iter.next()) |line| {
+    const has_newline = (byte_offset + line.len < content.len);
+
+    // ... render line ...
+
+    byte_offset += line.len;
+    if (has_newline) byte_offset += 1;  // Only count actual newlines
+}
+```
+
+**Lesson**: Never assume text ends with newline. Files without trailing newlines are common and valid.
+
+---
+
+### Line Counting Consistency
+
+**Problem**: Multiple locations counted lines differently, causing scroll bounds mismatch.
+
+**Original Issues**:
+1. Byte iteration counting newlines (used in scrolling)
+2. `splitScalar` iterator counting elements (used in height calculation)
+3. Redundant condition: `items.len > 0 and (items.len == 0 or ...)`
+
+**Solution**: Single helper function with clear logic:
+```zig
+fn countLines(content: []const u8) usize {
+    if (content.len == 0) return 0;
+
+    var count: usize = 0;
+    for (content) |byte| {
+        if (byte == '\n') count += 1;
+    }
+
+    // Add 1 if content doesn't end with newline
+    if (content[content.len - 1] != '\n') {
+        count += 1;
+    }
+
+    return count;
+}
+```
+
+**Impact**: Used in scrolling, scroll indicators, and height calculations for consistency.
+
+**Lesson**: When the same calculation appears in multiple places, extract it to a helper function. This prevents subtle differences that cause bugs.
+
+---
+
+### Scroll Bounds Edge Cases
+
+**Problem**: Allowing `scroll_offset` to equal `line_count` resulted in blank preview screen.
+
+**Why**: If file has 10 lines (indices 0-9) and `max_visible = 30`, setting offset to 10 means "start rendering at line 10" which doesn't exist.
+
+**Correct Logic**:
+```zig
+const max_offset = if (line_count > max_visible)
+    line_count - max_visible  // Last page starts here
+else
+    0;  // All lines fit on one page
+
+// Only allow scrolling up to max_offset
+if (scroll_offset < max_offset) {
+    scroll_offset += 1;
+}
+```
+
+**Lesson**: For scrollable views, maximum offset is `total_items - visible_items`, not `total_items`.
+
+---
+
+### Keybinding Order in else-if Chains
+
+**Critical Bug**: Alt+Arrow keys weren't working because regular arrow key checks came first:
+
+```zig
+// WRONG - Alt+Up never reached
+} else if (key == .up or key == .k) {
+    navigate(-1);  // Matches FIRST, ignores Alt modifier
+} else if (key == .up and (event.mod.left_alt or event.mod.right_alt)) {
+    scrollPreviewUp();  // Never reached
+}
+```
+
+**Fix**: Put more specific checks (with modifiers) BEFORE general checks:
+```zig
+// CORRECT - Check Alt+Up before regular Up
+} else if (key == .up and (event.mod.left_alt or event.mod.right_alt)) {
+    scrollPreviewUp();  // Checks modifier FIRST
+} else if (key == .up or key == .k) {
+    navigate(-1);  // Catches unmodified keys
+}
+```
+
+**Lesson**: In else-if chains, order matters. More specific conditions must come before general ones.
+
+---
+
+### Performance: Repeated Line Counting
+
+**Problem**: For 1MB file with 10K+ lines, counting lines 2-4 times per scroll operation:
+- `scrollPreviewDown()` - counts lines
+- `scrollPreviewDownPage()` - counts lines
+- Scroll indicator rendering - counts lines
+- Height calculation - counts lines
+
+**Current Approach**: Accepts O(n) line counting but consolidated to single method for consistency.
+
+**Future Optimization**: Cache line count in `AppState` and update when preview content changes:
+```zig
+// Add to AppState:
+preview_line_count: usize = 0,
+
+// Update in loadPreview():
+self.state.preview_line_count = countLines(content);
+
+// Use cached value in all locations
+```
+
+**Lesson**: Profile before optimizing. Current approach is "good enough" for <1MB files, but caching would help with very large files.
+
+---
+
+### UI Overlay Conflicts
+
+**Problem**: Preview scroll indicator `[1-30/187]` overlapped with items count `7/7 Preview: ON` in top-right corner.
+
+**Solution**: Position indicators on different Y coordinates:
+```zig
+// Items count at prompt line
+const count_y = self.config.layout.prompt_y * scale;
+
+// Preview scroll one line below
+const scroll_y = (self.config.layout.prompt_y + self.config.layout.item_line_height) * scale;
+```
+
+**Lesson**: When adding new UI elements, check for positional conflicts with existing elements. Vertical stacking prevents overlap.
+
+---
+
+### Height Calculation with Scrollable Content
+
+**Problem**: Window height calculated for ALL lines in preview (e.g., 187 lines) but only 30 lines displayed, creating huge bottom gap.
+
+**Fix**: Limit height calculation to visible lines:
+```zig
+const line_count = countLines(preview_content);
+const visible_lines = @min(line_count, max_visible_items);
+const height = base_height + (visible_lines * line_height);
+```
+
+**Lesson**: When implementing scrolling, window/viewport size should be based on visible items, not total items.
+
+---
+
+### Test Coverage Gaps
+
+**Discovered Issues** (from code review):
+
+1. **Tests don't compile**: Missing `query_cache` field in App initialization
+2. **No tests for**:
+   - Line counting edge cases (with/without trailing newline)
+   - Scroll bounds validation
+   - Byte offset calculation
+   - Syntax highlighting span collection
+   - Preview state transitions
+
+**Action Items**:
+- Add `query_cache` to all test App structs
+- Write tests for `countLines()` with various inputs
+- Test scroll bounds at edges (0 lines, 1 line, exactly max_visible, more than max_visible)
+- Test byte offset tracking through multi-line content
+- Mock tree-sitter callbacks to test span collection
+
+**Lesson**: When adding complex features, write tests incrementally. Don't wait until "it's working" - test as you build.
