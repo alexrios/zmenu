@@ -26,13 +26,18 @@ const default_font_paths = switch (builtin.os.tag) {
 };
 
 const Config = struct {
-    window_width: u32 = 800,
-    window_height: u32 = 300,
+    // Default/initial window dimensions
+    initial_window_width: u32 = 800,
+    initial_window_height: u32 = 300,
+    min_window_width: u32 = 600,
+    min_window_height: u32 = 150,
+    max_window_width: u32 = 1600,
+    max_window_height: u32 = 800,
     background_color: sdl.pixels.Color = .{ .r = 0x1e, .g = 0x1e, .b = 0x2e, .a = 0xff },
     foreground_color: sdl.pixels.Color = .{ .r = 0xcd, .g = 0xd6, .b = 0xf4, .a = 0xff },
     selected_color: sdl.pixels.Color = .{ .r = 0x89, .g = 0xb4, .b = 0xfa, .a = 0xff },
     prompt_color: sdl.pixels.Color = .{ .r = 0xf5, .g = 0xe0, .b = 0xdc, .a = 0xff },
-    max_visible_items: usize = 10,
+    max_visible_items: usize = 30,
     max_item_length: usize = 4096,
     max_input_length: usize = 1024,
     input_ellipsis_margin: usize = 100, // Show ellipsis when input within this margin of max
@@ -45,6 +50,13 @@ const Config = struct {
     prompt_y: f32 = 5.0,
     items_start_y: f32 = 30.0,
     right_margin_offset: f32 = 60.0,
+    bottom_margin: f32 = 10.0, // Bottom margin for height calculation
+    // Width calculation settings
+    width_padding: f32 = 10.0, // Horizontal padding for width calculation
+    width_padding_multiplier: f32 = 4.0, // Accounts for left/right margins + spacing
+    sample_prompt_text: [:0]const u8 = "> Sample Input Text",
+    sample_count_text: [:0]const u8 = "999/999",
+    sample_scroll_text: [:0]const u8 = "[999-999]", // Longest possible scroll indicator
     // Font configuration
     font_path: ?[:0]const u8 = null, // null = use platform defaults
     font_size: f32 = 22,
@@ -91,6 +103,9 @@ const App = struct {
     display_scale: f32, // Combined scale factor (pixel density × content scale)
     pixel_width: u32, // Actual pixel dimensions
     pixel_height: u32,
+    // Current window dimensions (logical coordinates)
+    current_width: u32,
+    current_height: u32,
 
     fn tryLoadFont(config: Config) !struct { font: sdl.ttf.Font, path: []const u8 } {
         // If user specified a custom font path, try only that
@@ -143,21 +158,26 @@ const App = struct {
 
         const window, const renderer = try sdl.render.Renderer.initWithWindow(
             "zmenu",
-            config.window_width,
-            config.window_height,
+            config.initial_window_width,
+            config.initial_window_height,
             window_flags,
         );
         errdefer renderer.deinit();
         errdefer window.deinit();
 
-        // Position window at top center of screen
-        window.setPosition(.{ .centered = null }, .{ .absolute = 0 }) catch |err| {
+        // Position window at center of screen (both X and Y)
+        window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |err| {
             std.debug.print("Warning: Failed to position window: {}\n", .{err});
         };
 
         // Query display scale and pixel dimensions for high DPI support
         const display_scale = try window.getDisplayScale();
         const pixel_width, const pixel_height = try window.getSizeInPixels();
+
+        // Validate pixel dimensions fit in u32
+        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
+            return error.DisplayTooLarge;
+        }
 
         // Allocate render buffers
         const prompt_buffer = try allocator.alloc(u8, config.prompt_buffer_size);
@@ -196,6 +216,8 @@ const App = struct {
             .display_scale = display_scale,
             .pixel_width = @intCast(pixel_width),
             .pixel_height = @intCast(pixel_height),
+            .current_width = config.initial_window_width,
+            .current_height = config.initial_window_height,
         };
 
         // Load items from stdin
@@ -212,6 +234,9 @@ const App = struct {
         }
 
         try app.updateFilter();
+
+        // Calculate and set initial window size based on content
+        try app.updateWindowSize();
 
         // Start text input
         try sdl.keyboard.startTextInput(window);
@@ -280,6 +305,8 @@ const App = struct {
     }
 
     fn updateFilter(self: *App) !void {
+        const prev_filtered_count = self.filtered_items.items.len;
+
         self.filtered_items.clearRetainingCapacity();
 
         if (self.input_buffer.items.len == 0) {
@@ -308,6 +335,11 @@ const App = struct {
 
         // Adjust scroll to keep selection visible
         self.adjustScroll();
+
+        // Update window size if filtered count changed
+        if (prev_filtered_count != self.filtered_items.items.len) {
+            try self.updateWindowSize();
+        }
     }
 
     fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
@@ -420,6 +452,12 @@ const App = struct {
         // Query updated display scale and pixel dimensions
         self.display_scale = try self.window.getDisplayScale();
         const pixel_width, const pixel_height = try self.window.getSizeInPixels();
+
+        // Validate pixel dimensions fit in u32
+        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
+            return error.DisplayTooLarge;
+        }
+
         self.pixel_width = @intCast(pixel_width);
         self.pixel_height = @intCast(pixel_height);
         self.needs_render = true;
@@ -586,7 +624,9 @@ const App = struct {
             .{ self.filtered_items.items.len, self.items.items.len },
         ) catch "?/?";
 
-        const count_x = (@as(f32, @floatFromInt(self.config.window_width)) - self.config.right_margin_offset) * scale;
+        // Measure actual text width for right-alignment
+        const count_text_w, _ = try self.font.getStringSize(count_text);
+        const count_x = (@as(f32, @floatFromInt(self.current_width)) - @as(f32, @floatFromInt(count_text_w)) - self.config.width_padding) * scale;
         try self.renderCachedText(count_x, self.config.prompt_y * scale, count_text, self.config.foreground_color, &self.count_cache);
 
         // Cache length to avoid race conditions
@@ -631,7 +671,10 @@ const App = struct {
                     .{ self.scroll_offset + 1, visible_end },
                 ) catch "[?]";
 
-                try self.renderText(count_x, self.config.items_start_y * scale, scroll_text, self.config.foreground_color);
+                // Measure actual scroll text width for right-alignment
+                const scroll_text_w, _ = try self.font.getStringSize(scroll_text);
+                const scroll_x = (@as(f32, @floatFromInt(self.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - self.config.width_padding) * scale;
+                try self.renderText(scroll_x, self.config.items_start_y * scale, scroll_text, self.config.foreground_color);
             }
         } else {
             try self.renderCachedText(5.0 * scale, self.config.items_start_y * scale, "No matches", self.config.foreground_color, &self.no_match_cache);
@@ -642,6 +685,89 @@ const App = struct {
 
     fn colorEquals(a: sdl.pixels.Color, b: sdl.pixels.Color) bool {
         return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+    }
+
+    fn calculateOptimalWidth(self: *App) !u32 {
+        // Start with minimum width
+        var max_width: f32 = @floatFromInt(self.config.min_window_width);
+
+        // Measure sample prompt text width (uses config sample)
+        const prompt_w, _ = try self.font.getStringSize(self.config.sample_prompt_text);
+
+        // Measure count and scroll indicator text width (use the longest one)
+        const count_w, _ = try self.font.getStringSize(self.config.sample_count_text);
+        const scroll_w, _ = try self.font.getStringSize(self.config.sample_scroll_text);
+        const right_side_width = @max(count_w, scroll_w);
+
+        // Calculate required width for prompt + right side + margins
+        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (self.config.width_padding * self.config.width_padding_multiplier);
+        if (base_width > max_width) max_width = base_width;
+
+        // Check widths of visible items
+        const filtered_len = self.filtered_items.items.len;
+        const visible_end = @min(self.config.max_visible_items, filtered_len);
+
+        for (0..visible_end) |i| {
+            if (i >= filtered_len) break;
+
+            const item_index = self.filtered_items.items[i];
+            if (item_index >= self.items.items.len) continue;
+
+            const item = self.items.items[item_index];
+
+            // Measure item text (with prefix "> ")
+            const item_text = std.fmt.bufPrint(
+                self.item_buffer,
+                "> {s}",
+                .{item},
+            ) catch continue;
+
+            // Use fast text measurement without rendering
+            const item_w, _ = self.font.getStringSize(item_text) catch continue;
+
+            const total_item_width = @as(f32, @floatFromInt(item_w)) + (self.config.width_padding * 2.0);
+            if (total_item_width > max_width) max_width = total_item_width;
+        }
+
+        // Apply min/max bounds with proper rounding
+        const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));
+        const final_width = @max(rounded_width, self.config.min_window_width);
+        return @min(final_width, self.config.max_window_width);
+    }
+
+    fn calculateOptimalHeight(self: *App) u32 {
+        // Calculate how many items we'll actually show
+        const filtered_len = self.filtered_items.items.len;
+        const visible_items = @min(filtered_len, self.config.max_visible_items);
+
+        // Calculate required height: prompt area + (items × line height) + bottom margin
+        const prompt_area_height = self.config.items_start_y; // Includes prompt + spacing
+        const items_height = @as(f32, @floatFromInt(visible_items)) * self.config.item_line_height;
+
+        const total_height = prompt_area_height + items_height + self.config.bottom_margin;
+
+        // Apply min/max bounds with proper rounding
+        const rounded_height = @as(u32, @intFromFloat(@ceil(total_height)));
+        const final_height = @max(rounded_height, self.config.min_window_height);
+        return @min(final_height, self.config.max_window_height);
+    }
+
+    fn updateWindowSize(self: *App) !void {
+        const new_width = try self.calculateOptimalWidth();
+        const new_height = self.calculateOptimalHeight();
+
+        // Only update if dimensions changed
+        if (new_width != self.current_width or new_height != self.current_height) {
+            self.current_width = new_width;
+            self.current_height = new_height;
+
+            try self.window.setSize(new_width, new_height);
+
+            // Re-center window after resize
+            try self.window.setPosition(.{ .centered = null }, .{ .centered = null });
+
+            self.needs_render = true;
+        }
     }
 
     fn run(self: *App) !void {
@@ -819,6 +945,8 @@ test "deleteLastCodepoint - ASCII" {
         .display_scale = 1.0,
         .pixel_width = 800,
         .pixel_height = 300,
+        .current_width = 800,
+        .current_height = 300,
     };
 
     try app.input_buffer.appendSlice(allocator, "hello");
@@ -853,6 +981,8 @@ test "deleteLastCodepoint - UTF-8 multi-byte" {
         .display_scale = 1.0,
         .pixel_width = 800,
         .pixel_height = 300,
+        .current_width = 800,
+        .current_height = 300,
     };
 
     // "café" = c a f é(2 bytes)
@@ -891,6 +1021,8 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
         .display_scale = 1.0,
         .pixel_width = 800,
         .pixel_height = 300,
+        .current_width = 800,
+        .current_height = 300,
     };
 
     // "日" = 3 bytes
@@ -929,6 +1061,8 @@ test "deleteLastCodepoint - empty buffer" {
         .display_scale = 1.0,
         .pixel_width = 800,
         .pixel_height = 300,
+        .current_width = 800,
+        .current_height = 300,
     };
 
     app.deleteLastCodepoint(); // Should not crash
