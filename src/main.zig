@@ -1,6 +1,7 @@
 const std = @import("std");
 const sdl = @import("sdl3");
 const builtin = @import("builtin");
+const theme = @import("theme.zig");
 
 // Platform-specific default font paths (tried in order)
 const default_font_paths = switch (builtin.os.tag) {
@@ -33,10 +34,10 @@ const Config = struct {
     min_window_height: u32 = 150,
     max_window_width: u32 = 1600,
     max_window_height: u32 = 800,
-    background_color: sdl.pixels.Color = .{ .r = 0x1e, .g = 0x1e, .b = 0x2e, .a = 0xff },
-    foreground_color: sdl.pixels.Color = .{ .r = 0xcd, .g = 0xd6, .b = 0xf4, .a = 0xff },
-    selected_color: sdl.pixels.Color = .{ .r = 0x89, .g = 0xb4, .b = 0xfa, .a = 0xff },
-    prompt_color: sdl.pixels.Color = .{ .r = 0xf5, .g = 0xe0, .b = 0xdc, .a = 0xff },
+    background_color: sdl.pixels.Color = theme.default.background,
+    foreground_color: sdl.pixels.Color = theme.default.foreground,
+    selected_color: sdl.pixels.Color = theme.default.selected,
+    prompt_color: sdl.pixels.Color = theme.default.prompt,
     max_visible_items: usize = 30,
     max_item_length: usize = 4096,
     max_input_length: usize = 1024,
@@ -148,7 +149,19 @@ const App = struct {
         try sdl.ttf.init();
         errdefer sdl.ttf.quit();
 
-        const config = Config{};
+        var config = Config{};
+
+        // Apply theme from ZMENU_THEME environment variable (if set)
+        if (std.process.getEnvVarOwned(allocator, "ZMENU_THEME")) |theme_name| {
+            defer allocator.free(theme_name);
+            const selected_theme = theme.getByName(theme_name);
+            config.background_color = selected_theme.background;
+            config.foreground_color = selected_theme.foreground;
+            config.selected_color = selected_theme.selected;
+            config.prompt_color = selected_theme.prompt;
+        } else |_| {
+            // No env var set, use defaults
+        }
 
         // Create window and renderer with high DPI support
         const window_flags = if (config.enable_high_dpi)
