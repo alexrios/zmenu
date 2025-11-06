@@ -1,5 +1,29 @@
 const std = @import("std");
 const sdl = @import("sdl3");
+const builtin = @import("builtin");
+
+// Platform-specific default font paths (tried in order)
+const default_font_paths = switch (builtin.os.tag) {
+    .linux => [_][:0]const u8{
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch Linux
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf", // Some distros
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    },
+    .macos => [_][:0]const u8{
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNSText.ttf",
+        "/Library/Fonts/Arial.ttf",
+    },
+    .windows => [_][:0]const u8{
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\calibri.ttf",
+    },
+    else => [_][:0]const u8{
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    },
+};
 
 const Config = struct {
     window_width: u32 = 800,
@@ -20,6 +44,21 @@ const Config = struct {
     prompt_y: f32 = 5.0,
     items_start_y: f32 = 30.0,
     right_margin_offset: f32 = 60.0,
+    // Font configuration
+    font_path: ?[:0]const u8 = null, // null = use platform defaults
+    font_size: f32 = 22,
+};
+
+// Text texture cache entry
+const TextureCache = struct {
+    texture: ?sdl.render.Texture,
+    last_text: []u8,
+    last_color: sdl.pixels.Color,
+
+    fn deinit(self: *TextureCache, allocator: std.mem.Allocator) void {
+        if (self.texture) |tex| tex.deinit();
+        allocator.free(self.last_text);
+    }
 };
 
 const App = struct {
@@ -38,6 +77,41 @@ const App = struct {
     item_buffer: []u8,
     count_buffer: []u8,
     scroll_buffer: []u8,
+    // Font
+    font: sdl.ttf.Font,
+    loaded_font_path: []const u8, // Track which font was actually loaded
+    // Texture caching for text rendering performance
+    prompt_cache: TextureCache,
+    count_cache: TextureCache,
+    no_match_cache: TextureCache,
+
+    fn tryLoadFont(config: Config) !struct { font: sdl.ttf.Font, path: []const u8 } {
+        // If user specified a custom font path, try only that
+        if (config.font_path) |custom_path| {
+            const font = sdl.ttf.Font.init(custom_path, config.font_size) catch |err| {
+                std.debug.print("Error: Failed to load font '{s}': {}\n", .{ custom_path, err });
+                return err;
+            };
+            return .{ .font = font, .path = custom_path };
+        }
+
+        // Try platform-specific default fonts in order
+        for (default_font_paths) |font_path| {
+            if (sdl.ttf.Font.init(font_path, config.font_size)) |font| {
+                std.debug.print("Successfully loaded font: {s}\n", .{font_path});
+                return .{ .font = font, .path = font_path };
+            } else |_| {
+                // Silently continue to next font
+            }
+        }
+
+        // No fonts found
+        std.debug.print("Error: Could not find any suitable font. Tried:\n", .{});
+        for (default_font_paths) |font_path| {
+            std.debug.print("  - {s}\n", .{font_path});
+        }
+        return error.NoFontFound;
+    }
 
     fn init(allocator: std.mem.Allocator) !App {
         // Initialize SDL
@@ -47,6 +121,10 @@ const App = struct {
             const quit_flags = sdl.InitFlags{ .video = true, .events = true };
             sdl.quit(quit_flags);
         }
+
+        // Initialize SDL_ttf
+        try sdl.ttf.init();
+        errdefer sdl.ttf.quit();
 
         const config = Config{};
 
@@ -75,6 +153,10 @@ const App = struct {
         const scroll_buffer = try allocator.alloc(u8, config.scroll_buffer_size);
         errdefer allocator.free(scroll_buffer);
 
+        // Load font with platform-specific fallback
+        const font_result = try tryLoadFont(config);
+        errdefer font_result.font.deinit();
+
         var app = App{
             .window = window,
             .renderer = renderer,
@@ -90,6 +172,11 @@ const App = struct {
             .item_buffer = item_buffer,
             .count_buffer = count_buffer,
             .scroll_buffer = scroll_buffer,
+            .font = font_result.font,
+            .loaded_font_path = font_result.path,
+            .prompt_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+            .count_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+            .no_match_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
         };
 
         // Load items from stdin
@@ -127,8 +214,14 @@ const App = struct {
         self.allocator.free(self.item_buffer);
         self.allocator.free(self.count_buffer);
         self.allocator.free(self.scroll_buffer);
+        // Clean up texture caches
+        self.prompt_cache.deinit(self.allocator);
+        self.count_cache.deinit(self.allocator);
+        self.no_match_cache.deinit(self.allocator);
+        self.font.deinit();
         self.renderer.deinit();
         self.window.deinit();
+        sdl.ttf.quit();
         const quit_flags = sdl.InitFlags{ .video = true, .events = true };
         sdl.quit(quit_flags);
     }
@@ -369,6 +462,62 @@ const App = struct {
         // Silently ignore input that would exceed the limit
     }
 
+    fn renderText(self: *App, x: f32, y: f32, text: [:0]const u8, color: sdl.pixels.Color) !void {
+        // Convert sdl.pixels.Color to sdl.ttf.Color
+        const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+
+        // Render text to surface with anti-aliasing
+        const surface = try self.font.renderTextBlended(text, ttf_color);
+        defer surface.deinit();
+
+        // Create texture from surface
+        const texture = try self.renderer.createTextureFromSurface(surface);
+        defer texture.deinit();
+
+        // Get texture size
+        const width, const height = try texture.getSize();
+
+        // Render texture at position
+        const dst = sdl.rect.FRect{ .x = x, .y = y, .w = width, .h = height };
+        try self.renderer.renderTexture(texture, null, dst);
+    }
+
+    fn renderCachedText(
+        self: *App,
+        x: f32,
+        y: f32,
+        text: [:0]const u8,
+        color: sdl.pixels.Color,
+        cache: *TextureCache,
+    ) !void {
+        // Check if we can reuse cached texture
+        const text_changed = !std.mem.eql(u8, cache.last_text, text);
+        const color_changed = !colorEquals(cache.last_color, color);
+
+        if (text_changed or color_changed or cache.texture == null) {
+            // Invalidate old texture
+            if (cache.texture) |old_tex| old_tex.deinit();
+
+            // Update cache metadata
+            self.allocator.free(cache.last_text);
+            cache.last_text = try self.allocator.dupe(u8, text);
+            cache.last_color = color;
+
+            // Render new texture with anti-aliasing
+            const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+            const surface = try self.font.renderTextBlended(text, ttf_color);
+            defer surface.deinit();
+            cache.texture = try self.renderer.createTextureFromSurface(surface);
+        }
+
+        // Render cached texture
+        if (cache.texture) |texture| {
+            const width, const height = try texture.getSize();
+            const dst = sdl.rect.FRect{ .x = x, .y = y, .w = width, .h = height };
+            try self.renderer.renderTexture(texture, null, dst);
+        }
+    }
+
     fn render(self: *App) !void {
         // Clear background
         try self.renderer.setDrawColor(self.config.background_color);
@@ -397,8 +546,7 @@ const App = struct {
         } else
             std.fmt.bufPrintZ(self.prompt_buffer, "> ", .{}) catch "> ";
 
-        try self.renderer.setDrawColor(self.config.prompt_color);
-        try self.renderer.renderDebugText(.{ .x = 5, .y = self.config.prompt_y }, prompt_text);
+        try self.renderCachedText(5, self.config.prompt_y, prompt_text, self.config.prompt_color, &self.prompt_cache);
 
         // Show filtered items count
         const count_text = std.fmt.bufPrintZ(
@@ -407,9 +555,8 @@ const App = struct {
             .{ self.filtered_items.items.len, self.items.items.len },
         ) catch "?/?";
 
-        try self.renderer.setDrawColor(self.config.foreground_color);
         const count_x = @as(f32, @floatFromInt(self.config.window_width)) - self.config.right_margin_offset;
-        try self.renderer.renderDebugText(.{ .x = count_x, .y = self.config.prompt_y }, count_text);
+        try self.renderCachedText(count_x, self.config.prompt_y, count_text, self.config.foreground_color, &self.count_cache);
 
         // Cache length to avoid race conditions
         const filtered_len = self.filtered_items.items.len;
@@ -419,7 +566,6 @@ const App = struct {
             const visible_end = @min(self.scroll_offset + self.config.max_visible_items, filtered_len);
 
             var y_pos: f32 = self.config.items_start_y;
-            var last_color: ?sdl.pixels.Color = null;
 
             for (self.scroll_offset..visible_end) |i| {
                 // Double check bounds before accessing
@@ -439,14 +585,9 @@ const App = struct {
                     .{ prefix, item },
                 ) catch "  [error]";
 
-                // Optimize color changes - only set if different
+                // Use TTF rendering with appropriate color
                 const color = if (is_selected) self.config.selected_color else self.config.foreground_color;
-                if (last_color == null or !colorEquals(last_color.?, color)) {
-                    try self.renderer.setDrawColor(color);
-                    last_color = color;
-                }
-
-                try self.renderer.renderDebugText(.{ .x = 5, .y = y_pos }, item_text);
+                try self.renderText(5, y_pos, item_text, color);
 
                 y_pos += self.config.item_line_height;
             }
@@ -459,12 +600,10 @@ const App = struct {
                     .{ self.scroll_offset + 1, visible_end },
                 ) catch "[?]";
 
-                try self.renderer.setDrawColor(self.config.foreground_color);
-                try self.renderer.renderDebugText(.{ .x = count_x, .y = self.config.items_start_y }, scroll_text);
+                try self.renderText(count_x, self.config.items_start_y, scroll_text, self.config.foreground_color);
             }
         } else {
-            try self.renderer.setDrawColor(self.config.foreground_color);
-            try self.renderer.renderDebugText(.{ .x = 5, .y = self.config.items_start_y }, "No matches");
+            try self.renderCachedText(5, self.config.items_start_y, "No matches", self.config.foreground_color, &self.no_match_cache);
         }
 
         try self.renderer.present();
@@ -633,6 +772,11 @@ test "deleteLastCodepoint - ASCII" {
         .item_buffer = undefined,
         .count_buffer = undefined,
         .scroll_buffer = undefined,
+        .font = undefined,
+        .loaded_font_path = undefined,
+        .prompt_cache = undefined,
+        .count_cache = undefined,
+        .no_match_cache = undefined,
     };
 
     try app.input_buffer.appendSlice(allocator, "hello");
@@ -659,6 +803,11 @@ test "deleteLastCodepoint - UTF-8 multi-byte" {
         .item_buffer = undefined,
         .count_buffer = undefined,
         .scroll_buffer = undefined,
+        .font = undefined,
+        .loaded_font_path = undefined,
+        .prompt_cache = undefined,
+        .count_cache = undefined,
+        .no_match_cache = undefined,
     };
 
     // "café" = c a f é(2 bytes)
@@ -689,6 +838,11 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
         .item_buffer = undefined,
         .count_buffer = undefined,
         .scroll_buffer = undefined,
+        .font = undefined,
+        .loaded_font_path = undefined,
+        .prompt_cache = undefined,
+        .count_cache = undefined,
+        .no_match_cache = undefined,
     };
 
     // "日" = 3 bytes
@@ -719,6 +873,11 @@ test "deleteLastCodepoint - empty buffer" {
         .item_buffer = undefined,
         .count_buffer = undefined,
         .scroll_buffer = undefined,
+        .font = undefined,
+        .loaded_font_path = undefined,
+        .prompt_cache = undefined,
+        .count_cache = undefined,
+        .no_match_cache = undefined,
     };
 
     app.deleteLastCodepoint(); // Should not crash
