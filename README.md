@@ -64,6 +64,43 @@ cd "$selected"
 - Bottom right (if needed): Scroll indicator showing visible range
 - Selected item has `>` prefix and highlighted color
 
+## Themes
+
+zmenu supports multiple color themes via the `ZMENU_THEME` environment variable:
+
+```bash
+# Use a specific theme (note: env var must be set for zmenu, not the input command)
+echo -e "Apple\nBanana\nCherry" | ZMENU_THEME=dracula zmenu
+
+# Works with any command
+find . -type f | ZMENU_THEME=nord zmenu
+
+# Or export first, then use normally
+export ZMENU_THEME=gruvbox
+seq 1 100 | zmenu
+
+# Set as default in your shell config (~/.bashrc, ~/.zshrc, etc.)
+export ZMENU_THEME=gruvbox
+```
+
+### Available Themes
+
+**Catppuccin Family** (pastel themes):
+- **mocha** (default) - Dark pastel with purple-gray background
+- **latte** - Light pastel with lavender background
+- **frappe** - Medium-dark pastel
+- **macchiato** - Dark-medium pastel
+
+**Classic Themes**:
+- **dracula** - Popular dark theme with vibrant pink/cyan accents
+- **gruvbox** - Retro warm dark theme with earthy tones
+- **nord** - Cool arctic-inspired theme with blue accents
+- **solarized** - Low-contrast dark theme
+
+If `ZMENU_THEME` is not set or contains an invalid name, zmenu defaults to **mocha**.
+
+Theme names are case-insensitive (`NORD`, `nord`, and `NoRd` all work).
+
 ## Development
 
 - [mise](https://mise.jdx.dev/) for version management
@@ -102,7 +139,8 @@ zmenu/
 ├── build.zig           # Build configuration
 ├── build.zig.zon       # Dependencies (zig-sdl3)
 ├── src/
-│   └── main.zig        # Main application (726 lines: 534 code + 192 tests)
+│   ├── main.zig        # Main application (~740 lines)
+│   └── theme.zig       # Theme definitions (8 color themes)
 └── README.md
 ```
 
@@ -173,68 +211,16 @@ zig build -Dtarget=x86_64-macos
 zig build -Dtarget=x86_64-linux
 ```
 
-**Platform-specific notes:**
-- **Windows**: Works with cmd.exe, PowerShell, and Windows Terminal
-- **macOS**: Window positioning on multi-monitor setups may vary
-- **Linux**: Tested on X11 and Wayland (via SDL3)
-
-## Changelog
-
-### v0.4 (Current)
-- ✅ **Automated testing**: 14 comprehensive tests covering critical paths
-- ✅ **Cross-platform verification**: Confirmed Linux/Mac/Windows compatibility
-- ✅ **UTF-8 word deletion**: Ctrl+W now properly handles multi-byte characters
-- ✅ **UTF-8 safe truncation**: Items and input truncated at character boundaries
-- ✅ **Separate scroll buffer**: Eliminated buffer reuse race condition
-- ✅ **Input ellipsis margin**: Configurable threshold (100 bytes) for long input indicator
-- ✅ **Documentation**: Comprehensive development gotchas and lessons learned
-
-### v0.3
-- ✅ **UTF-8 support**: Backspace properly removes multi-byte characters
-- ✅ **Page navigation**: Page Up/Page Down for fast scrolling
-- ✅ **Ctrl+C support**: Additional quit shortcut
-- ✅ **Event-driven rendering**: waitTimeout reduces CPU usage when idle
-- ✅ **Reusable buffers**: Render buffers allocated once, reused every frame
-- ✅ **Input size limit**: 1KB max input, 4KB max item length
-- ✅ **Improved truncation feedback**: Shows ellipsis for long input
-- ✅ **Helper methods**: navigateToFirst/Last, navigatePage, deleteLastCodepoint
-- ✅ **Config consolidation**: All magic numbers moved to Config struct
-- ✅ **Fixed buffer overflow**: Item buffer now sized correctly for 4KB items
-- ✅ **Fixed memory leak**: Proper cleanup on NoItemsProvided error
-
-### v0.2
-- ✅ Added fuzzy matching with case-insensitive search
-- ✅ Multi-line item display (up to 10 visible items)
-- ✅ Scroll support with visual indicators
-- ✅ Enhanced keyboard controls (Home, End, Ctrl+U, Ctrl+W)
-- ✅ Dirty-flag rendering (efficient CPU usage)
-- ✅ Fixed memory leaks with proper errdefer cleanup
-- ✅ Fixed race conditions in rendering
-- ✅ Window centered at top of screen
-- ✅ Improved error messages and debugging
-- ✅ Larger buffer sizes for items
-- ✅ Whitespace trimming for cleaner input
-
-### v0.1 (Initial)
-- Basic dmenu functionality
-- Simple substring matching
-- Single-item display
-- SDL3 integration
-
 ## Known limitations
 
-- Uses SDL debug text rendering (bitmap font) instead of TTF
 - No configuration file support yet
-- Colors are hardcoded
 - No history/frecency tracking
 - Window size is fixed (800x300)
 
 ## Future Enhancements
 
 **Planned:**
-- [ ] SDL_ttf integration for better text rendering
 - [ ] Configuration file support (`~/.config/zmenu/config.toml`)
-- [ ] Customizable colors and fonts
 - [ ] History tracking with frecency scoring
 - [ ] Multi-column layout option
 - [ ] Preview pane for file paths
@@ -242,7 +228,7 @@ zig build -Dtarget=x86_64-linux
 
 **Maybe:**
 - [ ] Plugin system for custom filters
-- [ ] Theme support
+- [ ] Custom theme support (user-defined colors)
 - [ ] Desktop file integration (.desktop files)
 - [ ] Icon support
 
