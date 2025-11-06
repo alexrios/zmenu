@@ -145,27 +145,14 @@ The preview pane can display the following states:
 - **"Permission denied"** - Cannot read the file
 - **"File too large"** - File exceeds 1MB limit
 
-### Usage Examples
+### Usage Example
 
 ```bash
-# Preview files while searching (use find for full paths)
-find . -name "*.zig" | zmenu  # Press Ctrl+P to see file contents
-
-# Browse source files with preview
-find src -type f | zmenu  # Full paths work correctly
-
-# Search source code with preview
-rg -l "function" | zmenu  # ripgrep outputs full paths
-
-# Wrong: ls without full paths
-ls src/  # ❌ Returns "main.zig" not "src/main.zig"
-
-# Right: Use find or ls with directory prefix
-find src -type f | zmenu  # ✅ Returns "src/main.zig"
-(cd src && ls | sed 's|^|src/|') | zmenu  # ✅ Adds prefix
+# Preview files while searching
+find . -type f | zmenu  # Press Ctrl+P to see file contents
 ```
 
-**Important:** Preview requires **full file paths** from the current directory. Commands like `find`, `rg -l`, and `fd` output full paths by default. If using `ls`, you need to prefix the directory path manually.
+**Important:** Preview requires **full file paths** from the current directory. Commands like `find`, `rg -l`, and `fd` output full paths by default.
 
 ## Development
 
