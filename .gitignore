@@ -3,3 +3,6 @@ zig-out
 .idea
 
 CLAUDE.md
+
+# User configuration (copy config.def.zig to config.zig and customize)
+config.zig
