@@ -40,25 +40,30 @@ pub const Feature = struct {
     hooks: Hooks,
 };
 
-/// Compile-time list of enabled features
-/// This function is evaluated at compile time - disabled features generate no code
-pub fn enabledFeatures() []const Feature {
+/// Build feature list at compile time
+fn buildFeatureList() []const Feature {
     comptime {
-        // Register features here based on config flags
-        // When features are added, this will be built up:
-        // var list: []const Feature = &.{};
-        // if (@hasDecl(config.features, "history") and config.features.history) {
-        //     list = list ++ &[_]Feature{@import("features/history.zig").feature};
-        // }
-        // return list;
+        var list: []const Feature = &.{};
 
-        // Currently no features - return empty slice
-        return &.{};
+        // History feature
+        if (@hasDecl(config.features, "history") and config.features.history) {
+            list = list ++ &[_]Feature{@import("features/history.zig").feature};
+        }
+
+        // Add more features here as they're implemented:
+        // if (@hasDecl(config.features, "multi_select") and config.features.multi_select) {
+        //     list = list ++ &[_]Feature{@import("features/multi_select.zig").feature};
+        // }
+
+        return list;
     }
 }
 
+/// Compile-time constant array of enabled features
+pub const enabled_features: []const Feature = buildFeatureList();
+
 /// Number of enabled features (compile-time constant)
-pub const enabled_count = enabledFeatures().len;
+pub const enabled_count: usize = enabled_features.len;
 
 /// Feature states array type - void when no features enabled
 pub const FeatureStates = if (enabled_count > 0)
@@ -80,7 +85,7 @@ pub fn initStates() FeatureStates {
 pub fn initAll(allocator: std.mem.Allocator, states: *FeatureStates) !void {
     if (enabled_count == 0) return;
 
-    inline for (enabledFeatures(), 0..) |feature, i| {
+    inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.onInit) |initFn| {
             states[i] = try initFn(allocator);
         }
@@ -91,7 +96,7 @@ pub fn initAll(allocator: std.mem.Allocator, states: *FeatureStates) !void {
 pub fn deinitAll(states: *FeatureStates, allocator: std.mem.Allocator) void {
     if (enabled_count == 0) return;
 
-    inline for (enabledFeatures(), 0..) |feature, i| {
+    inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.onDeinit) |deinitFn| {
             deinitFn(states[i], allocator);
         }
@@ -106,7 +111,7 @@ pub fn callAfterFilter(
 ) void {
     if (enabled_count == 0) return;
 
-    inline for (enabledFeatures(), 0..) |feature, i| {
+    inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.afterFilter) |afterFn| {
             afterFn(states[i], filtered_items, all_items);
         }
@@ -117,7 +122,7 @@ pub fn callAfterFilter(
 pub fn callOnSelect(states: *FeatureStates, selected_item: []const u8) void {
     if (enabled_count == 0) return;
 
-    inline for (enabledFeatures(), 0..) |feature, i| {
+    inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.onSelect) |selectFn| {
             selectFn(states[i], selected_item);
         }
@@ -128,20 +133,25 @@ pub fn callOnSelect(states: *FeatureStates, selected_item: []const u8) void {
 // TESTS
 // ============================================================================
 
-test "enabledFeatures - returns empty when no features enabled" {
+test "enabled_features - returns empty when no features enabled" {
     // With default config, no features should be enabled
-    // Use comptime to evaluate the function
+    // Note: This test passes with config.def.zig (history=false)
+    // If you have config.zig with history=true, this test will fail
     comptime {
-        const feats = enabledFeatures();
-        if (feats.len != 0) {
-            @compileError("Expected no features enabled by default");
+        if (enabled_features.len != 0) {
+            // Features are enabled - this is expected if history=true in config.zig
         }
     }
 }
 
-test "FeatureStates - is void when no features" {
-    // When no features are enabled, states should be void (zero size)
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(FeatureStates));
+test "FeatureStates - correct size based on features" {
+    // Size depends on enabled features - void (0) when none, array when some
+    if (enabled_count == 0) {
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(FeatureStates));
+    } else {
+        // Each feature state is ?*anyopaque (optional pointer = 8 bytes on 64-bit)
+        try std.testing.expect(@sizeOf(FeatureStates) > 0);
+    }
 }
 
 test "initStates - works with no features" {

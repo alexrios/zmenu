@@ -122,8 +122,14 @@ pub const features = struct {
     /// Matching algorithm
     pub const match_mode: MatchMode = .fuzzy;
 
+    /// History: track and boost recently selected items
+    /// When enabled, stores history in XDG_DATA_HOME/zmenu/history
+    pub const history: bool = false;
+
+    /// Maximum history entries (only used when history = true)
+    pub const history_max_entries: usize = 100;
+
     // Future features (added via patches):
-    // pub const history: bool = false;
     // pub const multi_select: bool = false;
 };
 

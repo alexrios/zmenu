@@ -32,4 +32,5 @@ test {
     _ = @import("app.zig");
     _ = @import("input.zig");
     _ = @import("features.zig");
+    _ = @import("features/history.zig");
 }
