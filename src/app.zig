@@ -10,6 +10,7 @@ const theme = config.theme;
 const sdl_context = @import("sdl_context.zig");
 const types = @import("types.zig");
 const input = @import("input.zig");
+const features = @import("features.zig");
 
 pub const SdlContext = sdl_context.SdlContext;
 pub const ColorScheme = types.ColorScheme;
@@ -23,6 +24,7 @@ pub const App = struct {
     render_ctx: RenderContext,
     colors: ColorScheme,
     allocator: std.mem.Allocator,
+    feature_states: features.FeatureStates, // Zero-size when no features enabled
 
     pub fn init(allocator: std.mem.Allocator) !App {
         // Initialize SDL
@@ -95,7 +97,11 @@ pub const App = struct {
             },
             .colors = colors,
             .allocator = allocator,
+            .feature_states = features.initStates(),
         };
+
+        // Initialize enabled features
+        try features.initAll(allocator, &app.feature_states);
 
         // Load items from stdin
         try app.loadItemsFromStdin();
@@ -118,6 +124,9 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // Cleanup features first
+        features.deinitAll(&self.feature_states, self.allocator);
+
         sdl.keyboard.stopTextInput(self.sdl.window) catch |err| {
             std.debug.print("Warning: Failed to stop text input: {}\n", .{err});
         };
@@ -219,6 +228,9 @@ pub const App = struct {
             }
         }
 
+        // Let features post-process filtered results (e.g., history boost)
+        features.callAfterFilter(&self.feature_states, &self.state.filtered_items, self.state.items.items);
+
         if (self.state.filtered_items.items.len > 0) {
             if (self.state.selected_index >= self.state.filtered_items.items.len) {
                 self.state.selected_index = self.state.filtered_items.items.len - 1;
@@ -298,6 +310,10 @@ pub const App = struct {
         } else if (key == .return_key or key == .kp_enter) {
             if (self.state.filtered_items.items.len > 0) {
                 const selected = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
+
+                // Notify features of selection (e.g., for history tracking)
+                features.callOnSelect(&self.feature_states, selected);
+
                 const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
                 _ = try stdout_file.write(selected);
                 _ = try stdout_file.write("\n");

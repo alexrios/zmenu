@@ -31,4 +31,5 @@ pub fn main() !void {
 test {
     _ = @import("app.zig");
     _ = @import("input.zig");
+    _ = @import("features.zig");
 }
