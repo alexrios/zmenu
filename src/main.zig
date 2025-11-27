@@ -1,85 +1,14 @@
 const std = @import("std");
 const sdl = @import("sdl3");
-const builtin = @import("builtin");
-const theme = @import("theme.zig");
+const config = @import("config");
+const theme = config.theme;
 
-// Platform-specific default font paths (tried in order)
-const default_font_paths = switch (builtin.os.tag) {
-    .linux => [_][:0]const u8{
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch Linux
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf", // Some distros
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    },
-    .macos => [_][:0]const u8{
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFNSText.ttf",
-        "/Library/Fonts/Arial.ttf",
-    },
-    .windows => [_][:0]const u8{
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\calibri.ttf",
-    },
-    else => [_][:0]const u8{
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    },
-};
-
-const WindowConfig = struct {
-    initial_width: u32 = 800,
-    initial_height: u32 = 300,
-    min_width: u32 = 600,
-    min_height: u32 = 150,
-    max_width: u32 = 1600,
-    max_height: u32 = 800,
-    enable_high_dpi: bool = true, // Request high pixel density when available
-};
-
+// Runtime color scheme (can be overridden by ZMENU_THEME env var)
 const ColorScheme = struct {
-    background: sdl.pixels.Color = theme.default.background,
-    foreground: sdl.pixels.Color = theme.default.foreground,
-    selected: sdl.pixels.Color = theme.default.selected,
-    prompt: sdl.pixels.Color = theme.default.prompt,
-};
-
-const Limits = struct {
-    max_visible_items: usize = 30,
-    max_item_length: usize = 4096,
-    max_input_length: usize = 1024,
-    input_ellipsis_margin: usize = 100, // Show ellipsis when input within this margin of max
-    prompt_buffer_size: usize = 1024 + 16, // max_input_length + prefix + safety
-    item_buffer_size: usize = 4096 + 16, // max_item_length + prefix + safety
-    count_buffer_size: usize = 64,
-    scroll_buffer_size: usize = 64,
-};
-
-const Layout = struct {
-    // Base dimensions (before scaling) - these are in logical coordinates
-    item_line_height: f32 = 20.0,
-    prompt_y: f32 = 5.0,
-    items_start_y: f32 = 30.0,
-    right_margin_offset: f32 = 60.0,
-    bottom_margin: f32 = 10.0, // Bottom margin for height calculation
-    // Width calculation settings
-    width_padding: f32 = 10.0, // Horizontal padding for width calculation
-    width_padding_multiplier: f32 = 4.0, // Accounts for left/right margins + spacing
-    sample_prompt_text: [:0]const u8 = "> Sample Input Text",
-    sample_count_text: [:0]const u8 = "999/999",
-    sample_scroll_text: [:0]const u8 = "[999-999]", // Longest possible scroll indicator
-};
-
-const FontConfig = struct {
-    path: ?[:0]const u8 = null, // null = use platform defaults
-    size: f32 = 22,
-};
-
-const Config = struct {
-    window: WindowConfig = .{},
-    colors: ColorScheme = .{},
-    limits: Limits = .{},
-    layout: Layout = .{},
-    font: FontConfig = .{},
+    background: sdl.pixels.Color,
+    foreground: sdl.pixels.Color,
+    selected: sdl.pixels.Color,
+    prompt: sdl.pixels.Color,
 };
 
 // Text texture cache entry
@@ -133,10 +62,10 @@ const App = struct {
     sdl: SdlContext,
     state: AppState,
     render_ctx: RenderContext,
-    config: Config,
+    colors: ColorScheme, // Runtime colors (may be overridden by ZMENU_THEME)
     allocator: std.mem.Allocator,
 
-    fn tryLoadFont(config: Config) !struct { font: sdl.ttf.Font, path: []const u8 } {
+    fn tryLoadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
         // If user specified a custom font path, try only that
         if (config.font.path) |custom_path| {
             const font = sdl.ttf.Font.init(custom_path, config.font.size) catch |err| {
@@ -147,7 +76,7 @@ const App = struct {
         }
 
         // Try platform-specific default fonts in order
-        for (default_font_paths) |font_path| {
+        for (config.default_font_paths) |font_path| {
             if (sdl.ttf.Font.init(font_path, config.font.size)) |font| {
                 std.debug.print("Successfully loaded font: {s}\n", .{font_path});
                 return .{ .font = font, .path = font_path };
@@ -158,7 +87,7 @@ const App = struct {
 
         // No fonts found
         std.debug.print("Error: Could not find any suitable font. Tried:\n", .{});
-        for (default_font_paths) |font_path| {
+        for (config.default_font_paths) |font_path| {
             std.debug.print("  - {s}\n", .{font_path});
         }
         return error.NoFontFound;
@@ -177,16 +106,22 @@ const App = struct {
         try sdl.ttf.init();
         errdefer sdl.ttf.quit();
 
-        var config = Config{};
+        // Build runtime color scheme (compile-time defaults, overridden by env var)
+        var colors = ColorScheme{
+            .background = config.colors.background,
+            .foreground = config.colors.foreground,
+            .selected = config.colors.selected,
+            .prompt = config.colors.prompt,
+        };
 
         // Apply theme from ZMENU_THEME environment variable (if set)
         if (std.process.getEnvVarOwned(allocator, "ZMENU_THEME")) |theme_name| {
             defer allocator.free(theme_name);
             const selected_theme = theme.getByName(theme_name);
-            config.colors.background = selected_theme.background;
-            config.colors.foreground = selected_theme.foreground;
-            config.colors.selected = selected_theme.selected;
-            config.colors.prompt = selected_theme.prompt;
+            colors.background = selected_theme.background;
+            colors.foreground = selected_theme.foreground;
+            colors.selected = selected_theme.selected;
+            colors.prompt = selected_theme.prompt;
         } else |_| {
             // No env var set, use defaults
         }
@@ -231,7 +166,7 @@ const App = struct {
         errdefer allocator.free(scroll_buffer);
 
         // Load font with platform-specific fallback
-        const font_result = try tryLoadFont(config);
+        const font_result = try tryLoadFont();
         errdefer font_result.font.deinit();
 
         var app = App{
@@ -263,7 +198,7 @@ const App = struct {
                 .current_width = config.window.initial_width,
                 .current_height = config.window.initial_height,
             },
-            .config = config,
+            .colors = colors,
             .allocator = allocator,
         };
 
@@ -348,7 +283,7 @@ const App = struct {
             const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
             if (trimmed.len > 0) {
                 // Validate and truncate if needed (UTF-8 safe)
-                const truncate_len = findUtf8Boundary(trimmed, self.config.limits.max_item_length);
+                const truncate_len = findUtf8Boundary(trimmed, config.limits.max_item_length);
                 const final_line = trimmed[0..truncate_len];
 
                 const owned_line = try self.allocator.dupe(u8, final_line);
@@ -424,8 +359,8 @@ const App = struct {
         // Keep selected item visible
         if (self.state.selected_index < self.state.scroll_offset) {
             self.state.scroll_offset = self.state.selected_index;
-        } else if (self.state.selected_index >= self.state.scroll_offset + self.config.limits.max_visible_items) {
-            self.state.scroll_offset = self.state.selected_index - self.config.limits.max_visible_items + 1;
+        } else if (self.state.selected_index >= self.state.scroll_offset + config.limits.max_visible_items) {
+            self.state.scroll_offset = self.state.selected_index - config.limits.max_visible_items + 1;
         }
     }
 
@@ -461,7 +396,7 @@ const App = struct {
     fn navigatePage(self: *App, direction: isize) void {
         if (self.state.filtered_items.items.len == 0) return;
 
-        const page_size = @as(isize, @intCast(self.config.limits.max_visible_items));
+        const page_size = @as(isize, @intCast(config.limits.max_visible_items));
         const delta = page_size * direction;
         self.navigate(delta);
     }
@@ -573,7 +508,7 @@ const App = struct {
 
     fn handleTextInput(self: *App, text: []const u8) !void {
         // Check if adding this text would exceed max input length
-        if (self.state.input_buffer.items.len + text.len <= self.config.limits.max_input_length) {
+        if (self.state.input_buffer.items.len + text.len <= config.limits.max_input_length) {
             try self.state.input_buffer.appendSlice(self.allocator, text);
             try self.updateFilter();
             self.state.needs_render = true;
@@ -639,7 +574,7 @@ const App = struct {
 
     fn render(self: *App) !void {
         // Clear background
-        try self.sdl.renderer.setDrawColor(self.config.colors.background);
+        try self.sdl.renderer.setDrawColor(self.colors.background);
         try self.sdl.renderer.clear();
 
         // Apply display scale to all coordinates
@@ -648,7 +583,7 @@ const App = struct {
         // Show prompt with input buffer
         const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
             // Truncate display if input is too long, showing last chars with ellipsis
-            const ellipsis_threshold = self.config.limits.max_input_length - self.config.limits.input_ellipsis_margin;
+            const ellipsis_threshold = config.limits.max_input_length - config.limits.input_ellipsis_margin;
             const display_input = if (self.state.input_buffer.items.len > ellipsis_threshold)
                 blk2: {
                     // Find UTF-8 safe starting position
@@ -668,7 +603,7 @@ const App = struct {
         } else
             std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
 
-        try self.renderCachedText(5.0 * scale, self.config.layout.prompt_y * scale, prompt_text, self.config.colors.prompt, &self.render_ctx.prompt_cache);
+        try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, prompt_text, self.colors.prompt, &self.render_ctx.prompt_cache);
 
         // Show filtered items count
         const count_text = std.fmt.bufPrintZ(
@@ -679,17 +614,17 @@ const App = struct {
 
         // Measure actual text width for right-alignment
         const count_text_w, _ = try self.sdl.font.getStringSize(count_text);
-        const count_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(count_text_w)) - self.config.layout.width_padding) * scale;
-        try self.renderCachedText(count_x, self.config.layout.prompt_y * scale, count_text, self.config.colors.foreground, &self.render_ctx.count_cache);
+        const count_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(count_text_w)) - config.layout.width_padding) * scale;
+        try self.renderCachedText(count_x, config.layout.prompt_y * scale, count_text, self.colors.foreground, &self.render_ctx.count_cache);
 
         // Cache length to avoid race conditions
         const filtered_len = self.state.filtered_items.items.len;
 
         // Show multiple items
         if (filtered_len > 0) {
-            const visible_end = @min(self.state.scroll_offset + self.config.limits.max_visible_items, filtered_len);
+            const visible_end = @min(self.state.scroll_offset + config.limits.max_visible_items, filtered_len);
 
-            var y_pos: f32 = self.config.layout.items_start_y * scale;
+            var y_pos: f32 = config.layout.items_start_y * scale;
 
             for (self.state.scroll_offset..visible_end) |i| {
                 // Double check bounds before accessing
@@ -710,14 +645,14 @@ const App = struct {
                 ) catch "  [error]";
 
                 // Use TTF rendering with appropriate color
-                const color = if (is_selected) self.config.colors.selected else self.config.colors.foreground;
+                const color = if (is_selected) self.colors.selected else self.colors.foreground;
                 try self.renderText(5.0 * scale, y_pos, item_text, color);
 
-                y_pos += self.config.layout.item_line_height * scale;
+                y_pos += config.layout.item_line_height * scale;
             }
 
             // Show scroll indicator if needed
-            if (filtered_len > self.config.limits.max_visible_items) {
+            if (filtered_len > config.limits.max_visible_items) {
                 const scroll_text = std.fmt.bufPrintZ(
                     self.render_ctx.scroll_buffer,
                     "[{d}-{d}]",
@@ -726,11 +661,11 @@ const App = struct {
 
                 // Measure actual scroll text width for right-alignment
                 const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
-                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - self.config.layout.width_padding) * scale;
-                try self.renderText(scroll_x, self.config.layout.items_start_y * scale, scroll_text, self.config.colors.foreground);
+                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - config.layout.width_padding) * scale;
+                try self.renderText(scroll_x, config.layout.items_start_y * scale, scroll_text, self.colors.foreground);
             }
         } else {
-            try self.renderCachedText(5.0 * scale, self.config.layout.items_start_y * scale, "No matches", self.config.colors.foreground, &self.render_ctx.no_match_cache);
+            try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, "No matches", self.colors.foreground, &self.render_ctx.no_match_cache);
         }
 
         try self.sdl.renderer.present();
@@ -742,23 +677,23 @@ const App = struct {
 
     fn calculateOptimalWidth(self: *App) !u32 {
         // Start with minimum width
-        var max_width: f32 = @floatFromInt(self.config.window.min_width);
+        var max_width: f32 = @floatFromInt(config.window.min_width);
 
         // Measure sample prompt text width (uses config sample)
-        const prompt_w, _ = try self.sdl.font.getStringSize(self.config.layout.sample_prompt_text);
+        const prompt_w, _ = try self.sdl.font.getStringSize(config.layout.sample_prompt_text);
 
         // Measure count and scroll indicator text width (use the longest one)
-        const count_w, _ = try self.sdl.font.getStringSize(self.config.layout.sample_count_text);
-        const scroll_w, _ = try self.sdl.font.getStringSize(self.config.layout.sample_scroll_text);
+        const count_w, _ = try self.sdl.font.getStringSize(config.layout.sample_count_text);
+        const scroll_w, _ = try self.sdl.font.getStringSize(config.layout.sample_scroll_text);
         const right_side_width = @max(count_w, scroll_w);
 
         // Calculate required width for prompt + right side + margins
-        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (self.config.layout.width_padding * self.config.layout.width_padding_multiplier);
+        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (config.layout.width_padding * config.layout.width_padding_multiplier);
         if (base_width > max_width) max_width = base_width;
 
         // Check widths of visible items
         const filtered_len = self.state.filtered_items.items.len;
-        const visible_end = @min(self.config.limits.max_visible_items, filtered_len);
+        const visible_end = @min(config.limits.max_visible_items, filtered_len);
 
         for (0..visible_end) |i| {
             if (i >= filtered_len) break;
@@ -778,31 +713,31 @@ const App = struct {
             // Use fast text measurement without rendering
             const item_w, _ = self.sdl.font.getStringSize(item_text) catch continue;
 
-            const total_item_width = @as(f32, @floatFromInt(item_w)) + (self.config.layout.width_padding * 2.0);
+            const total_item_width = @as(f32, @floatFromInt(item_w)) + (config.layout.width_padding * 2.0);
             if (total_item_width > max_width) max_width = total_item_width;
         }
 
         // Apply min/max bounds with proper rounding
         const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));
-        const final_width = @max(rounded_width, self.config.window.min_width);
-        return @min(final_width, self.config.window.max_width);
+        const final_width = @max(rounded_width, config.window.min_width);
+        return @min(final_width, config.window.max_width);
     }
 
     fn calculateOptimalHeight(self: *App) u32 {
         // Calculate how many items we'll actually show
         const filtered_len = self.state.filtered_items.items.len;
-        const visible_items = @min(filtered_len, self.config.limits.max_visible_items);
+        const visible_items = @min(filtered_len, config.limits.max_visible_items);
 
         // Calculate required height: prompt area + (items × line height) + bottom margin
-        const prompt_area_height = self.config.layout.items_start_y; // Includes prompt + spacing
-        const items_height = @as(f32, @floatFromInt(visible_items)) * self.config.layout.item_line_height;
+        const prompt_area_height = config.layout.items_start_y; // Includes prompt + spacing
+        const items_height = @as(f32, @floatFromInt(visible_items)) * config.layout.item_line_height;
 
-        const total_height = prompt_area_height + items_height + self.config.layout.bottom_margin;
+        const total_height = prompt_area_height + items_height + config.layout.bottom_margin;
 
         // Apply min/max bounds with proper rounding
         const rounded_height = @as(u32, @intFromFloat(@ceil(total_height)));
-        const final_height = @max(rounded_height, self.config.window.min_height);
-        return @min(final_height, self.config.window.max_height);
+        const final_height = @max(rounded_height, config.window.min_height);
+        return @min(final_height, config.window.max_height);
     }
 
     fn updateWindowSize(self: *App) !void {
@@ -963,8 +898,7 @@ test "colorEquals - different colors" {
     try std.testing.expect(!App.colorEquals(color1, color2));
 }
 
-test "Config - buffer sizes aligned with limits" {
-    const config = Config{};
+test "config - buffer sizes aligned with limits" {
     // Prompt buffer must accommodate max_input_length + prefix + null
     try std.testing.expect(config.limits.prompt_buffer_size >= config.limits.max_input_length + 10);
     // Item buffer must accommodate max_item_length + prefix + null
@@ -1004,7 +938,7 @@ test "deleteLastCodepoint - ASCII" {
             .current_width = 800,
             .current_height = 300,
         },
-        .config = Config{},
+        .colors = .{ .background = config.colors.background, .foreground = config.colors.foreground, .selected = config.colors.selected, .prompt = config.colors.prompt },
         .allocator = allocator,
     };
 
@@ -1046,7 +980,7 @@ test "deleteLastCodepoint - UTF-8 multi-byte" {
             .current_width = 800,
             .current_height = 300,
         },
-        .config = Config{},
+        .colors = .{ .background = config.colors.background, .foreground = config.colors.foreground, .selected = config.colors.selected, .prompt = config.colors.prompt },
         .allocator = allocator,
     };
 
@@ -1092,7 +1026,7 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
             .current_width = 800,
             .current_height = 300,
         },
-        .config = Config{},
+        .colors = .{ .background = config.colors.background, .foreground = config.colors.foreground, .selected = config.colors.selected, .prompt = config.colors.prompt },
         .allocator = allocator,
     };
 
@@ -1138,7 +1072,7 @@ test "deleteLastCodepoint - empty buffer" {
             .current_width = 800,
             .current_height = 300,
         },
-        .config = Config{},
+        .colors = .{ .background = config.colors.background, .foreground = config.colors.foreground, .selected = config.colors.selected, .prompt = config.colors.prompt },
         .allocator = allocator,
     };
 

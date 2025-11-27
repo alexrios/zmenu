@@ -11,6 +11,21 @@ pub fn build(b: *std.Build) void {
         .ext_ttf = true,
     });
 
+    // Check if user config exists, fallback to default
+    // Users can copy config.def.zig to config.zig and customize
+    const config_path: std.Build.LazyPath = blk: {
+        std.fs.cwd().access("config.zig", .{}) catch break :blk b.path("config.def.zig");
+        break :blk b.path("config.zig");
+    };
+
+    // Create config module that can be imported by main.zig
+    const config_module = b.createModule(.{
+        .root_source_file = config_path,
+        .target = target,
+        .optimize = optimize,
+    });
+    config_module.addImport("sdl3", sdl3.module("sdl3"));
+
     const exe = b.addExecutable(.{
         .name = "zmenu",
         .root_module = b.createModule(.{
@@ -20,8 +35,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Import SDL3 module
+    // Import modules
     exe.root_module.addImport("sdl3", sdl3.module("sdl3"));
+    exe.root_module.addImport("config", config_module);
 
     b.installArtifact(exe);
 
@@ -43,8 +59,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Import SDL3 module for tests
+    // Import modules for tests
     unit_tests.root_module.addImport("sdl3", sdl3.module("sdl3"));
+    unit_tests.root_module.addImport("config", config_module);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
