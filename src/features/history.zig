@@ -1,50 +1,52 @@
-//! History feature for zmenu
+//! History feature - tracks and boosts recently selected items
 //!
-//! Tracks recently selected items and boosts them in filter results.
-//! History is stored in XDG_DATA_HOME/zmenu/history (or ~/.local/share/zmenu/history)
-//!
-//! To enable: set `history = true` in config.zig features struct
+//! Storage: XDG_DATA_HOME/zmenu/history (or ~/.local/share/zmenu/history)
+//! Enable: set `history = true` in config.zig
 
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config");
 const features_mod = @import("../features.zig");
 
-/// History configuration
 pub const history_config = struct {
-    /// Maximum number of history entries to keep
     pub const max_entries: usize = if (@hasDecl(config.features, "history_max_entries"))
         config.features.history_max_entries
     else
         100;
 
-    /// History file name
     pub const filename: []const u8 = "history";
 };
 
-/// History state maintained across hooks
 pub const HistoryState = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList([]const u8),
     history_path: []const u8,
+    max_entries: usize,
 
-    /// Load history from disk
     pub fn load(allocator: std.mem.Allocator) !*HistoryState {
+        return loadWithConfig(allocator, null, history_config.max_entries);
+    }
+
+    pub fn loadWithConfig(allocator: std.mem.Allocator, custom_path: ?[]const u8, max_entries: usize) !*HistoryState {
         const state = try allocator.create(HistoryState);
         errdefer allocator.destroy(state);
+
+        const history_path = if (custom_path) |path|
+            try allocator.dupe(u8, path)
+        else
+            try getHistoryPath(allocator);
 
         state.* = .{
             .allocator = allocator,
             .entries = std.ArrayList([]const u8).empty,
-            .history_path = try getHistoryPath(allocator),
+            .history_path = history_path,
+            .max_entries = max_entries,
         };
         errdefer allocator.free(state.history_path);
 
-        // Try to load existing history
         state.loadFromFile() catch |err| {
-            // File not existing is fine, other errors are logged but not fatal
             if (err != error.FileNotFound) {
-                std.debug.print("zmenu: warning: could not load history: {}\n", .{err});
+                std.log.warn("could not load history: {}", .{err});
             }
         };
 
@@ -55,11 +57,9 @@ pub const HistoryState = struct {
         const file = try std.fs.openFileAbsolute(self.history_path, .{});
         defer file.close();
 
-        // Read entire file content
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024); // 1MB max
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         defer self.allocator.free(content);
 
-        // Split into lines
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -68,34 +68,31 @@ pub const HistoryState = struct {
         }
     }
 
-    /// Save history to disk
     pub fn save(self: *HistoryState) void {
-        // Ensure directory exists
         if (std.fs.path.dirname(self.history_path)) |dir| {
             std.fs.makeDirAbsolute(dir) catch |err| {
                 if (err != error.PathAlreadyExists) {
-                    std.debug.print("zmenu: warning: could not create history dir: {}\n", .{err});
+                    std.log.warn("could not create history dir: {}", .{err});
                     return;
                 }
             };
         }
 
         const file = std.fs.createFileAbsolute(self.history_path, .{}) catch |err| {
-            std.debug.print("zmenu: warning: could not save history: {}\n", .{err});
+            std.log.warn("could not save history: {}", .{err});
             return;
         };
         defer file.close();
 
-        // Write each entry followed by newline
         for (self.entries.items) |entry| {
             _ = file.write(entry) catch continue;
             _ = file.write("\n") catch continue;
         }
     }
 
-    /// Add an entry to history (moves to front if exists)
+    /// Add entry (moves to front if exists)
     pub fn addEntry(self: *HistoryState, item: []const u8) void {
-        // Remove if already exists (will re-add at front)
+        // Remove if exists
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry, item)) {
                 self.allocator.free(entry);
@@ -111,15 +108,15 @@ pub const HistoryState = struct {
             return;
         };
 
-        // Trim to max entries
-        while (self.entries.items.len > history_config.max_entries) {
+        // Trim to max (use instance max_entries)
+        while (self.entries.items.len > self.max_entries) {
             const removed = self.entries.items[self.entries.items.len - 1];
             self.entries.shrinkRetainingCapacity(self.entries.items.len - 1);
             self.allocator.free(removed);
         }
     }
 
-    /// Get position in history (0 = most recent, null = not in history)
+    /// Get position (0=most recent, null=not found)
     pub fn getPosition(self: *HistoryState, item: []const u8) ?usize {
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry, item)) {
@@ -139,19 +136,15 @@ pub const HistoryState = struct {
     }
 };
 
-/// Get the history file path
 fn getHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
-    // Try XDG_DATA_HOME first
     if (std.posix.getenv("XDG_DATA_HOME")) |xdg_data| {
         return std.fmt.allocPrint(allocator, "{s}/zmenu/{s}", .{ xdg_data, history_config.filename });
     }
 
-    // Fall back to ~/.local/share
     if (std.posix.getenv("HOME")) |home| {
         return std.fmt.allocPrint(allocator, "{s}/.local/share/zmenu/{s}", .{ home, history_config.filename });
     }
 
-    // Windows fallback
     if (builtin.os.tag == .windows) {
         if (std.posix.getenv("APPDATA")) |appdata| {
             return std.fmt.allocPrint(allocator, "{s}\\zmenu\\{s}", .{ appdata, history_config.filename });
@@ -161,12 +154,24 @@ fn getHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
     return error.NoHomeDirectory;
 }
 
-// ============================================================================
-// HOOK IMPLEMENTATIONS
-// ============================================================================
+fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.FeatureState {
+    const allocator = init_data.allocator;
 
-fn onInit(allocator: std.mem.Allocator) anyerror!?features_mod.FeatureState {
-    const state = try HistoryState.load(allocator);
+    // Extract CLI flag values (in declaration order)
+    const custom_path: ?[]const u8 = if (init_data.cli_values.len > 0 and
+        init_data.cli_values[0] == .string)
+        init_data.cli_values[0].string
+    else
+        null;
+
+    const max_entries: usize = if (init_data.cli_values.len > 1 and
+        init_data.cli_values[1] == .int)
+        @intCast(init_data.cli_values[1].int)
+    else
+        history_config.max_entries;
+
+    // Load or create history state with custom settings
+    const state = try HistoryState.loadWithConfig(allocator, custom_path, max_entries);
     return @ptrCast(state);
 }
 
@@ -191,8 +196,7 @@ fn afterFilter(
     if (filtered_items.items.len <= 1) return;
     if (state.entries.items.len == 0) return;
 
-    // Sort filtered items: history items first (by recency), then non-history items
-    // Use insertion sort to maintain stability for non-history items
+    // Insertion sort: history items first (by recency), then non-history
     const items = filtered_items.items;
 
     var i: usize = 1;
@@ -207,17 +211,15 @@ fn afterFilter(
             const prev_text = all_items[prev_idx];
             const prev_pos = state.getPosition(prev_text);
 
-            // Compare: items with history position come before those without
-            // Among history items, lower position (more recent) comes first
             const should_swap = blk: {
                 if (item_pos) |ip| {
                     if (prev_pos) |pp| {
-                        break :blk ip < pp; // Both in history: more recent first
+                        break :blk ip < pp;
                     } else {
-                        break :blk true; // item in history, prev not: swap
+                        break :blk true;
                     }
                 } else {
-                    break :blk false; // item not in history: don't swap
+                    break :blk false;
                 }
             };
 
@@ -237,11 +239,6 @@ fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: []const u8) vo
     }
 }
 
-// ============================================================================
-// FEATURE DEFINITION
-// ============================================================================
-
-/// Feature registration for the hook system
 pub const feature = features_mod.Feature{
     .name = "history",
     .hooks = .{
@@ -250,20 +247,30 @@ pub const feature = features_mod.Feature{
         .afterFilter = &afterFilter,
         .onSelect = &onSelect,
     },
+    .cli_flags = &[_]features_mod.CliFlag{
+        .{
+            .long = "hist-file",
+            .short = 'H',
+            .description = "Custom history file path",
+            .value_type = .string,
+        },
+        .{
+            .long = "hist-limit",
+            .description = "Maximum history entries",
+            .value_type = .int,
+            .default = features_mod.FlagValue{ .int = 100 },
+        },
+    },
 };
-
-// ============================================================================
-// TESTS
-// ============================================================================
 
 test "HistoryState - add and retrieve entries" {
     const allocator = std.testing.allocator;
 
-    // Create state without file
     var state = HistoryState{
         .allocator = allocator,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/zmenu_test_history"),
+        .max_entries = 100,
     };
     defer {
         for (state.entries.items) |entry| {
@@ -290,6 +297,7 @@ test "HistoryState - re-adding moves to front" {
         .allocator = allocator,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/zmenu_test_history"),
+        .max_entries = 100,
     };
     defer {
         for (state.entries.items) |entry| {
@@ -301,9 +309,135 @@ test "HistoryState - re-adding moves to front" {
 
     state.addEntry("item1");
     state.addEntry("item2");
-    state.addEntry("item1"); // Re-add
+    state.addEntry("item1");
 
     try std.testing.expectEqual(@as(?usize, 0), state.getPosition("item1"));
     try std.testing.expectEqual(@as(?usize, 1), state.getPosition("item2"));
     try std.testing.expectEqual(@as(usize, 2), state.entries.items.len);
+}
+
+test "History afterFilter - basic reordering correctness" {
+    // This test verifies that the afterFilter insertion sort correctly
+    // promotes history items to the front while maintaining order.
+    // Tests the core reordering logic (lines 172-205).
+
+    const allocator = std.testing.allocator;
+
+    // Setup history with 2 entries (most recent first)
+    var state = HistoryState{
+        .allocator = allocator,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, "/tmp/test_history"),
+        .max_entries = 100,
+    };
+    defer {
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    state.addEntry("recent_item"); // Position 1 (older)
+    state.addEntry("very_recent_item"); // Position 0 (most recent)
+
+    // Create items list
+    var all_items = std.ArrayList([]const u8).empty;
+    defer {
+        for (all_items.items) |item| allocator.free(item);
+        all_items.deinit(allocator);
+    }
+
+    try all_items.append(allocator, try allocator.dupe(u8, "other_item"));
+    try all_items.append(allocator, try allocator.dupe(u8, "very_recent_item"));
+    try all_items.append(allocator, try allocator.dupe(u8, "recent_item"));
+    try all_items.append(allocator, try allocator.dupe(u8, "another_item"));
+
+    // Create filtered indices (all items match)
+    var filtered = std.ArrayList(usize).empty;
+    defer filtered.deinit(allocator);
+
+    try filtered.append(allocator, 0); // other_item
+    try filtered.append(allocator, 1); // very_recent_item
+    try filtered.append(allocator, 2); // recent_item
+    try filtered.append(allocator, 3); // another_item
+
+    // Call afterFilter (reorders in-place)
+    const state_ptr: ?features_mod.FeatureState = @ptrCast(&state);
+    afterFilter(state_ptr, &filtered, all_items.items);
+
+    // Verify: history items promoted by recency
+    try std.testing.expectEqual(@as(usize, 1), filtered.items[0]); // very_recent (pos 0)
+    try std.testing.expectEqual(@as(usize, 2), filtered.items[1]); // recent (pos 1)
+
+    // Non-history items follow (order doesn't matter among them)
+    try std.testing.expectEqual(@as(usize, 4), filtered.items.len); // No items lost
+}
+
+
+test "History afterFilter - rapid updates" {
+    // This test simulates rapid filter updates (like user typing quickly).
+    // Verifies that multiple reordering operations maintain correctness.
+
+    const allocator = std.testing.allocator;
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, "/tmp/test_history"),
+        .max_entries = 100,
+    };
+    defer {
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    state.addEntry("history1");
+    state.addEntry("history2");
+    state.addEntry("history3");
+
+    var all_items = std.ArrayList([]const u8).empty;
+    defer {
+        for (all_items.items) |item| allocator.free(item);
+        all_items.deinit(allocator);
+    }
+
+    try all_items.append(allocator, try allocator.dupe(u8, "other1"));
+    try all_items.append(allocator, try allocator.dupe(u8, "history3"));
+    try all_items.append(allocator, try allocator.dupe(u8, "history2"));
+    try all_items.append(allocator, try allocator.dupe(u8, "history1"));
+    try all_items.append(allocator, try allocator.dupe(u8, "other2"));
+
+    // Simulate 10 rapid filter updates
+    var iteration: usize = 0;
+    while (iteration < 10) : (iteration += 1) {
+        var filtered = std.ArrayList(usize).empty;
+        defer filtered.deinit(allocator);
+
+        // Different filter results each time (simulating typing)
+        if (iteration % 2 == 0) {
+            // All items match
+            try filtered.append(allocator, 0);
+            try filtered.append(allocator, 1);
+            try filtered.append(allocator, 2);
+            try filtered.append(allocator, 3);
+            try filtered.append(allocator, 4);
+        } else {
+            // Only some items match
+            try filtered.append(allocator, 1);
+            try filtered.append(allocator, 2);
+            try filtered.append(allocator, 3);
+        }
+
+        const original_len = filtered.items.len;
+        const state_ptr: ?features_mod.FeatureState = @ptrCast(&state);
+        afterFilter(state_ptr, &filtered, all_items.items);
+
+        // Verify correctness after each update
+        try std.testing.expectEqual(original_len, filtered.items.len);
+
+        // Verify all indices valid
+        for (filtered.items) |idx| {
+            try std.testing.expect(idx < all_items.items.len);
+        }
+    }
 }

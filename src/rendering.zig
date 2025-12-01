@@ -1,10 +1,10 @@
-//! Shared type definitions for zmenu
+//! Rendering types and functionality
 
 const std = @import("std");
 const sdl = @import("sdl3");
 const config = @import("config");
 
-/// Runtime color scheme (can be overridden by ZMENU_THEME env var)
+/// Color scheme configured at compile-time
 pub const ColorScheme = struct {
     background: sdl.pixels.Color,
     foreground: sdl.pixels.Color,
@@ -40,27 +40,17 @@ pub const TextureCache = struct {
     }
 };
 
-/// Application state for input, items, and selection
-pub const AppState = struct {
-    input_buffer: std.ArrayList(u8),
-    items: std.ArrayList([]const u8),
-    filtered_items: std.ArrayList(usize),
-    selected_index: usize,
-    scroll_offset: usize,
-    needs_render: bool,
-
-    pub const empty = AppState{
-        .input_buffer = std.ArrayList(u8).empty,
-        .items = std.ArrayList([]const u8).empty,
-        .filtered_items = std.ArrayList(usize).empty,
-        .selected_index = 0,
-        .scroll_offset = 0,
-        .needs_render = true,
-    };
-};
-
 /// Render context with buffers and caches
 pub const RenderContext = struct {
+    /// Window and display properties
+    pub const Window = struct {
+        display_scale: f32,
+        width: u32, // Physical pixels
+        height: u32, // Physical pixels
+        current_width: u32, // Logical coordinates
+        current_height: u32, // Logical coordinates
+    };
+
     // Render buffers (allocated once, reused)
     prompt_buffer: []u8,
     item_buffer: []u8,
@@ -70,13 +60,8 @@ pub const RenderContext = struct {
     prompt_cache: TextureCache,
     count_cache: TextureCache,
     no_match_cache: TextureCache,
-    // High DPI state
-    display_scale: f32,
-    pixel_width: u32,
-    pixel_height: u32,
-    // Current window dimensions (logical coordinates)
-    current_width: u32,
-    current_height: u32,
+    // Window and display state
+    window: Window,
 
     pub fn deinit(self: *RenderContext, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt_buffer);
@@ -88,3 +73,7 @@ pub const RenderContext = struct {
         self.no_match_cache.deinit(allocator);
     }
 };
+
+pub fn colorEquals(a: sdl.pixels.Color, b: sdl.pixels.Color) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+}

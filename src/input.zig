@@ -72,9 +72,6 @@ pub fn deleteWord(buffer: *std.ArrayList(u8)) void {
     }
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
 
 test "fuzzyMatch - basic matching" {
     try std.testing.expect(fuzzyMatch("hello world", "hello"));

@@ -10,7 +10,7 @@ description = "Run the application"
 run = "zig build run"
 
 [tasks.test]
-description = "Run tests"
+description = "Run unit tests"
 run = "zig build test"
 
 [tasks.clean]
@@ -20,3 +20,7 @@ run = "rm -rf zig-cache zig-out"
 [tasks.check]
 description = "Check code without building"
 run = "zig build --summary all"
+
+[tasks."build:release-fast"]
+description = "Build optimized release (ReleaseFast)"
+run = "zig build -Doptimize=ReleaseFast"
