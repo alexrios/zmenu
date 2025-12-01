@@ -5,59 +5,43 @@
 const std = @import("std");
 const sdl = @import("sdl3");
 const config = @import("config");
-const theme = config.theme;
 
 const sdl_context = @import("sdl_context.zig");
-const types = @import("types.zig");
+const state_mod = @import("state.zig");
+const rendering_mod = @import("rendering.zig");
 const input = @import("input.zig");
 const features = @import("features.zig");
 
-pub const SdlContext = sdl_context.SdlContext;
-pub const ColorScheme = types.ColorScheme;
-pub const TextureCache = types.TextureCache;
-pub const AppState = types.AppState;
-pub const RenderContext = types.RenderContext;
+pub const SdlContext = sdl_context.SDLContext;
+pub const ColorScheme = rendering_mod.ColorScheme;
+pub const TextureCache = rendering_mod.TextureCache;
+pub const AppState = state_mod.AppState;
+pub const InputState = state_mod.InputState;
+pub const RenderContext = rendering_mod.RenderContext;
 
 pub const App = struct {
     sdl: SdlContext,
     state: AppState,
     render_ctx: RenderContext,
-    colors: ColorScheme,
+    color_scheme: ColorScheme,
     allocator: std.mem.Allocator,
     feature_states: features.FeatureStates, // Zero-size when no features enabled
 
-    pub fn init(allocator: std.mem.Allocator) !App {
+    pub fn init(allocator: std.mem.Allocator, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
         // Initialize SDL
-        try sdl_context.initSdl();
-        errdefer sdl_context.quitSdl();
+        try sdl_context.initSDL();
+        errdefer sdl_context.quitSDL();
 
-        // Build runtime color scheme (compile-time defaults, overridden by env var)
-        var colors = ColorScheme.fromConfig();
+        // Build color scheme from compile-time configuration
+        const color_scheme = ColorScheme.fromConfig();
 
-        // Apply theme from ZMENU_THEME environment variable (if set)
-        if (std.process.getEnvVarOwned(allocator, "ZMENU_THEME")) |theme_name| {
-            defer allocator.free(theme_name);
-            const selected_theme = theme.getByName(theme_name);
-            colors.background = selected_theme.background;
-            colors.foreground = selected_theme.foreground;
-            colors.selected = selected_theme.selected;
-            colors.prompt = selected_theme.prompt;
-        } else |_| {}
 
         // Create window and renderer
-        const win_result = try sdl_context.createWindow();
-        const window = win_result.window;
-        const renderer = win_result.renderer;
+        const window_result = try sdl_context.createWindow(monitor_index);
+        const window = window_result.window;
+        const renderer = window_result.renderer;
         errdefer renderer.deinit();
         errdefer window.deinit();
-
-        // Query display scale and pixel dimensions for high DPI support
-        const display_scale = try window.getDisplayScale();
-        const pixel_width, const pixel_height = try window.getSizeInPixels();
-
-        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
-            return error.DisplayTooLarge;
-        }
 
         // Allocate render buffers
         const prompt_buffer = try allocator.alloc(u8, config.limits.prompt_buffer_size);
@@ -71,14 +55,24 @@ pub const App = struct {
 
         // Load font with platform-specific fallback
         const font_result = try sdl_context.loadFont();
-        errdefer font_result.font.deinit();
+        const font = font_result.font;
+        const path = font_result.path;
+        errdefer font.deinit();
+
+        // Query display scale and pixel dimensions for high DPI support
+        const display_scale = try window.getDisplayScale();
+        const pixel_width, const pixel_height = try window.getSizeInPixels();
+
+        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
+            return error.DisplayTooLarge;
+        }
 
         var app = App{
             .sdl = .{
                 .window = window,
                 .renderer = renderer,
-                .font = font_result.font,
-                .loaded_font_path = font_result.path,
+                .font = font,
+                .loaded_font_path = path,
             },
             .state = AppState.empty,
             .render_ctx = .{
@@ -89,33 +83,26 @@ pub const App = struct {
                 .prompt_cache = TextureCache.empty,
                 .count_cache = TextureCache.empty,
                 .no_match_cache = TextureCache.empty,
-                .display_scale = display_scale,
-                .pixel_width = @intCast(pixel_width),
-                .pixel_height = @intCast(pixel_height),
-                .current_width = config.window.initial_width,
-                .current_height = config.window.initial_height,
+                .window = .{
+                    .display_scale = display_scale,
+                    .width = @intCast(pixel_width),
+                    .height = @intCast(pixel_height),
+                    .current_width = config.window.initial_width,
+                    .current_height = config.window.initial_height,
+                },
             },
-            .colors = colors,
+            .color_scheme = color_scheme,
             .allocator = allocator,
             .feature_states = features.initStates(),
         };
 
-        // Initialize enabled features
-        try features.initAll(allocator, &app.feature_states);
+        // Initialize enabled features with parsed CLI flags
+        try features.initAll(allocator, &app.feature_states, parsed_flags);
 
-        // Load items from stdin
-        try app.loadItemsFromStdin();
-
-        // Check that we have items to display
-        if (app.state.items.items.len == 0) {
-            app.state.items.deinit(app.allocator);
-            app.state.filtered_items.deinit(app.allocator);
-            app.state.input_buffer.deinit(app.allocator);
-            return error.NoItemsProvided;
-        }
-
-        try app.updateFilter();
         try app.updateWindowSize();
+
+        // Center window on initial creation
+        try window.setPosition(.{ .centered = null }, .{ .centered = null });
 
         // Start text input
         try sdl.keyboard.startTextInput(window);
@@ -128,7 +115,7 @@ pub const App = struct {
         features.deinitAll(&self.feature_states, self.allocator);
 
         sdl.keyboard.stopTextInput(self.sdl.window) catch |err| {
-            std.debug.print("Warning: Failed to stop text input: {}\n", .{err});
+            std.log.warn("Failed to stop text input: {}", .{err});
         };
         self.state.input_buffer.deinit(self.allocator);
         for (self.state.items.items) |item| {
@@ -143,14 +130,67 @@ pub const App = struct {
     pub fn run(self: *App) !void {
         var running = true;
 
-        // Initial render
+        // Check if stdin is a TTY (no piped input)
+        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+            const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+            _ = stderr.write("Error: No items provided on stdin\n") catch {};
+            _ = stderr.write("Usage: echo -e \"Item 1\\nItem 2\" | zmenu\n") catch {};
+            return error.NoItemsProvided;
+        }
+
+        // Start threaded stdin reader (cross-platform)
+        var stdin_reader = ThreadedStdinReader.init(self.allocator);
+        try stdin_reader.startThread(); // Spawn thread after reader is in final memory location
+        defer stdin_reader.deinit();
+
+        // Buffer for lines from reader thread
+        var new_lines = std.ArrayList([]u8).empty;
+        defer {
+            for (new_lines.items) |line| {
+                self.allocator.free(line);
+            }
+            new_lines.deinit(self.allocator);
+        }
+
+        // Initial render (shows loading screen)
         try self.render();
         self.state.needs_render = false;
 
         while (running) {
-            const has_event = sdl.events.waitTimeout(16);
+            // Check for new lines from reader thread (non-blocking)
+            const eof = try stdin_reader.pollLines(&new_lines);
 
-            if (has_event) {
+            // Process any new lines
+            if (new_lines.items.len > 0) {
+                for (new_lines.items) |line| {
+                    try self.processLine(line);
+                    self.allocator.free(line);
+                }
+                new_lines.clearRetainingCapacity();
+                self.state.needs_render = true;
+            }
+
+            // Handle EOF transition
+            if (eof and self.state.input_state == .loading) {
+                // Stdin complete - transition to ready state
+                self.state.input_state = .ready;
+
+                // Handle empty stdin case
+                if (self.state.items.items.len == 0) {
+                    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+                    _ = stderr.write("Error: No items provided on stdin\n") catch {};
+                    return error.NoItemsProvided;
+                }
+
+                // Populate filtered items now that all items are loaded
+                try self.updateFilter();
+                self.state.needs_render = true;
+            }
+
+            // Wait for SDL events with timeout (blocks up to 16ms, returns early on event)
+            // This avoids busy-waiting while still polling stdin regularly
+            if (sdl.events.waitTimeout(16)) {
+                // Process all queued events
                 while (sdl.events.poll()) |event| {
                     switch (event) {
                         .quit => running = false,
@@ -161,7 +201,10 @@ pub const App = struct {
                             }
                         },
                         .text_input => |text_event| {
-                            try self.handleTextInput(text_event.text);
+                            // Only handle text input when ready
+                            if (self.state.input_state == .ready) {
+                                try self.handleTextInput(text_event.text);
+                            }
                         },
                         .window_display_scale_changed => {
                             try self.updateDisplayScale();
@@ -181,35 +224,128 @@ pub const App = struct {
         }
     }
 
-    // ========================================================================
-    // Input Loading
-    // ========================================================================
+    pub const ThreadedStdinReader = struct {
+        thread: std.Thread,
+        thread_started: bool,
+        mutex: std.Thread.Mutex,
+        lines: std.ArrayList([]u8),
+        eof_reached: std.atomic.Value(bool),
+        allocator: std.mem.Allocator,
 
-    fn loadItemsFromStdin(self: *App) !void {
-        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
-            return error.NoItemsProvided;
+        pub fn init(allocator: std.mem.Allocator) ThreadedStdinReader {
+            // GPA is already thread-safe, no wrapper needed
+            return ThreadedStdinReader{
+                .thread = undefined,
+                .thread_started = false,
+                .mutex = .{},
+                .lines = std.ArrayList([]u8).empty,
+                .eof_reached = std.atomic.Value(bool).init(false),
+                .allocator = allocator,
+            };
         }
 
-        const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
-        const max_size = 10 * 1024 * 1024;
-        const content = try stdin_file.readToEndAlloc(self.allocator, max_size);
-        defer self.allocator.free(content);
+        fn startThread(self: *ThreadedStdinReader) !void {
+            // Spawn background reader thread (must be called after reader is in final location)
+            self.thread = try std.Thread.spawn(.{}, readerThreadFn, .{self});
+            self.thread_started = true;
+        }
 
-        var iter = std.mem.splitScalar(u8, content, '\n');
-        while (iter.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-            if (trimmed.len > 0) {
-                const truncate_len = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
-                const final_line = trimmed[0..truncate_len];
-                const owned_line = try self.allocator.dupe(u8, final_line);
-                try self.state.items.append(self.allocator, owned_line);
+        fn readerThreadFn(self: *ThreadedStdinReader) void {
+            const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+            var chunk_buffer: [4096]u8 = undefined;
+            var line_buffer = std.ArrayList(u8).empty;
+            defer line_buffer.deinit(self.allocator);
+
+            while (true) {
+                // Blocking read (OK in background thread)
+                const bytes_read = stdin_file.read(&chunk_buffer) catch {
+                    // Error reading - set EOF and stop
+                    self.eof_reached.store(true, .seq_cst);
+                    break;
+                };
+
+                if (bytes_read == 0) {
+                    // EOF - process any remaining buffered line
+                    if (line_buffer.items.len > 0) {
+                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch break;
+                        self.mutex.lock();
+                        self.lines.append(self.allocator, owned_line) catch {
+                            self.allocator.free(owned_line);
+                        };
+                        self.mutex.unlock();
+                    }
+                    self.eof_reached.store(true, .seq_cst);
+                    break;
+                }
+
+                // Process chunk for complete lines
+                const chunk = chunk_buffer[0..bytes_read];
+                var start: usize = 0;
+                for (chunk, 0..) |byte, i| {
+                    if (byte == '\n') {
+                        // Complete line found
+                        line_buffer.appendSlice(self.allocator, chunk[start..i]) catch break;
+
+                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch break;
+                        self.mutex.lock();
+                        self.lines.append(self.allocator, owned_line) catch {
+                            self.allocator.free(owned_line);
+                        };
+                        self.mutex.unlock();
+
+                        line_buffer.clearRetainingCapacity();
+                        start = i + 1;
+                    }
+                }
+
+                // Buffer remaining partial line
+                if (start < chunk.len) {
+                    line_buffer.appendSlice(self.allocator, chunk[start..]) catch break;
+                }
+            }
+        }
+
+        /// Poll for new lines from the reader thread (non-blocking)
+        /// Returns true if EOF has been reached
+        pub fn pollLines(self: *ThreadedStdinReader, dest: *std.ArrayList([]u8)) !bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Transfer lines from thread buffer to destination
+            try dest.appendSlice(self.allocator, self.lines.items);
+            self.lines.clearRetainingCapacity();
+
+            return self.eof_reached.load(.seq_cst);
+        }
+
+        pub fn deinit(self: *ThreadedStdinReader) void {
+            // Wait for reader thread to finish (only if it was started)
+            if (self.thread_started) {
+                self.thread.join();
+            }
+
+            // Free any remaining lines
+            for (self.lines.items) |line| {
+                self.allocator.free(line);
+            }
+            self.lines.deinit(self.allocator);
+        }
+    };
+
+    fn processLine(self: *App, line: []const u8) !void {
+        const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+        if (trimmed.len > 0) {
+            const truncate_len = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
+            const final_line = trimmed[0..truncate_len];
+            const owned_line = try self.allocator.dupe(u8, final_line);
+            try self.state.items.append(self.allocator, owned_line);
+
+            // Increment items loaded counter if we're in loading state
+            if (self.state.input_state == .loading) {
+                self.state.input_state.loading.items_loaded += 1;
             }
         }
     }
-
-    // ========================================================================
-    // Filtering
-    // ========================================================================
 
     fn updateFilter(self: *App) !void {
         const prev_filtered_count = self.state.filtered_items.items.len;
@@ -245,10 +381,6 @@ pub const App = struct {
             try self.updateWindowSize();
         }
     }
-
-    // ========================================================================
-    // Navigation
-    // ========================================================================
 
     fn adjustScroll(self: *App) void {
         if (self.state.filtered_items.items.len == 0) {
@@ -298,12 +430,18 @@ pub const App = struct {
         self.navigate(page_size * direction);
     }
 
-    // ========================================================================
-    // Input Handling
-    // ========================================================================
-
     fn handleKeyEvent(self: *App, event: sdl.events.Keyboard) !bool {
         const key = event.key orelse return false;
+
+        // During loading, only allow ESC and Ctrl+C for early cancellation
+        if (self.state.input_state == .loading) {
+            if (key == .escape) {
+                return true;
+            } else if (key == .c and (event.mod.left_control or event.mod.right_control)) {
+                return true;
+            }
+            return false;
+        }
 
         if (key == .escape) {
             return true;
@@ -313,6 +451,12 @@ pub const App = struct {
 
                 // Notify features of selection (e.g., for history tracking)
                 features.callOnSelect(&self.feature_states, selected);
+
+                // Allow features to perform pre-shutdown cleanup
+                const all_completed = features.callOnExit(&self.feature_states, config.exit_timeout_ms);
+                if (!all_completed) {
+                    std.log.warn("Some features did not complete onExit within timeout", .{});
+                }
 
                 const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
                 _ = try stdout_file.write(selected);
@@ -366,40 +510,62 @@ pub const App = struct {
         }
     }
 
-    // ========================================================================
-    // Display
-    // ========================================================================
-
     fn updateDisplayScale(self: *App) !void {
-        self.render_ctx.display_scale = try self.sdl.window.getDisplayScale();
-        const pixel_width, const pixel_height = try self.sdl.window.getSizeInPixels();
+        self.render_ctx.window.display_scale = try self.sdl.window.getDisplayScale();
+        const w_width, const w_height = try self.sdl.window.getSizeInPixels();
 
-        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
+        if (w_width > std.math.maxInt(u32) or w_height > std.math.maxInt(u32)) {
             return error.DisplayTooLarge;
         }
 
-        self.render_ctx.pixel_width = @intCast(pixel_width);
-        self.render_ctx.pixel_height = @intCast(pixel_height);
+        self.render_ctx.window.width = @intCast(w_width);
+        self.render_ctx.window.height = @intCast(w_height);
         self.state.needs_render = true;
     }
 
     fn calculateOptimalWidth(self: *App) !u32 {
         var max_width: f32 = @floatFromInt(config.window.min_width);
 
-        const prompt_w, _ = try self.sdl.font.getStringSize(config.layout.sample_prompt_text);
-        const count_w, _ = try self.sdl.font.getStringSize(config.layout.sample_count_text);
-        const scroll_w, _ = try self.sdl.font.getStringSize(config.layout.sample_scroll_text);
+        // Measure actual prompt text (or use sample if empty)
+        const prompt_text = if (self.state.input_buffer.items.len > 0)
+            std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> {s}", .{self.state.input_buffer.items}) catch config.layout.sample_prompt_text
+        else
+            config.layout.sample_prompt_text;
+        const prompt_w, _ = try self.sdl.font.getStringSize(prompt_text);
+
+        // Measure actual count text
+        const count_text = std.fmt.bufPrintZ(
+            self.render_ctx.count_buffer,
+            "{d}/{d}",
+            .{ self.state.filtered_items.items.len, self.state.items.items.len },
+        ) catch config.layout.sample_count_text;
+        const count_w, _ = try self.sdl.font.getStringSize(count_text);
+
+        // Measure scroll indicator if needed
+        const filtered_len = self.state.filtered_items.items.len;
+        const has_scroll = filtered_len > config.limits.max_visible_items;
+        const scroll_w = if (has_scroll) blk: {
+            const visible_end = @min(self.state.scroll_offset + config.limits.max_visible_items, filtered_len);
+            const scroll_text = std.fmt.bufPrintZ(
+                self.render_ctx.scroll_buffer,
+                "[{d}-{d}]",
+                .{ self.state.scroll_offset + 1, visible_end },
+            ) catch config.layout.sample_scroll_text;
+            const w, _ = try self.sdl.font.getStringSize(scroll_text);
+            break :blk w;
+        } else 0;
+
         const right_side_width = @max(count_w, scroll_w);
 
-        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (config.layout.width_padding * config.layout.width_padding_multiplier);
+        // Width needed for prompt on left + right side elements + padding between
+        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (config.layout.width_padding * 3.0);
         if (base_width > max_width) max_width = base_width;
 
-        const filtered_len = self.state.filtered_items.items.len;
-        const visible_end = @min(config.limits.max_visible_items, filtered_len);
+        // Measure currently visible items (accounting for scroll offset)
+        const visible_start = self.state.scroll_offset;
+        const visible_end = @min(visible_start + config.limits.max_visible_items, filtered_len);
 
-        for (0..visible_end) |i| {
-            if (i >= filtered_len) break;
-
+        for (visible_start..visible_end) |i| {
             const item_index = self.state.filtered_items.items[i];
             if (item_index >= self.state.items.items.len) continue;
 
@@ -433,26 +599,48 @@ pub const App = struct {
         const new_width = try self.calculateOptimalWidth();
         const new_height = self.calculateOptimalHeight();
 
-        if (new_width != self.render_ctx.current_width or new_height != self.render_ctx.current_height) {
-            self.render_ctx.current_width = new_width;
-            self.render_ctx.current_height = new_height;
+        if (new_width != self.render_ctx.window.current_width or new_height != self.render_ctx.window.current_height) {
+            self.render_ctx.window.current_width = new_width;
+            self.render_ctx.window.current_height = new_height;
 
             try self.sdl.window.setSize(new_width, new_height);
-            try self.sdl.window.setPosition(.{ .centered = null }, .{ .centered = null });
 
             self.state.needs_render = true;
         }
     }
 
-    // ========================================================================
-    // Rendering
-    // ========================================================================
-
     fn render(self: *App) !void {
-        try self.sdl.renderer.setDrawColor(self.colors.background);
+        try self.sdl.renderer.setDrawColor(self.color_scheme.background);
         try self.sdl.renderer.clear();
 
-        const scale = self.render_ctx.display_scale;
+        const scale = self.render_ctx.window.display_scale;
+
+        // Render based on input state
+        switch (self.state.input_state) {
+            .loading => |data| {
+                // Show loading screen while reading stdin
+                const loading_text = std.fmt.bufPrintZ(
+                    self.render_ctx.prompt_buffer,
+                    "Loading...",
+                    .{},
+                ) catch "Loading...";
+
+                try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, loading_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
+
+                // Show item count
+                const count_text = std.fmt.bufPrintZ(
+                    self.render_ctx.count_buffer,
+                    "Loaded {d} items",
+                    .{data.items_loaded},
+                ) catch "Loading...";
+
+                try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
+
+                try self.sdl.renderer.present();
+                return;
+            },
+            .ready => {},
+        }
 
         // Prompt
         const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
@@ -474,7 +662,7 @@ pub const App = struct {
         } else
             std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
 
-        try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, prompt_text, self.colors.prompt, &self.render_ctx.prompt_cache);
+        try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, prompt_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
 
         // Count
         const count_text = std.fmt.bufPrintZ(
@@ -484,8 +672,8 @@ pub const App = struct {
         ) catch "?/?";
 
         const count_text_w, _ = try self.sdl.font.getStringSize(count_text);
-        const count_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(count_text_w)) - config.layout.width_padding) * scale;
-        try self.renderCachedText(count_x, config.layout.prompt_y * scale, count_text, self.colors.foreground, &self.render_ctx.count_cache);
+        const count_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(count_text_w)) - config.layout.width_padding) * scale;
+        try self.renderCachedText(count_x, config.layout.prompt_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
 
         // Items
         const filtered_len = self.state.filtered_items.items.len;
@@ -506,7 +694,7 @@ pub const App = struct {
 
                 const item_text = std.fmt.bufPrintZ(self.render_ctx.item_buffer, "{s}{s}", .{ prefix, item }) catch "  [error]";
 
-                const color = if (is_selected) self.colors.selected else self.colors.foreground;
+                const color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
                 try self.renderText(5.0 * scale, y_pos, item_text, color);
 
                 y_pos += config.layout.item_line_height * scale;
@@ -521,11 +709,11 @@ pub const App = struct {
                 ) catch "[?]";
 
                 const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
-                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - config.layout.width_padding) * scale;
-                try self.renderText(scroll_x, config.layout.items_start_y * scale, scroll_text, self.colors.foreground);
+                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - config.layout.width_padding) * scale;
+                try self.renderText(scroll_x, config.layout.items_start_y * scale, scroll_text, self.color_scheme.foreground);
             }
         } else {
-            try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, "No matches", self.colors.foreground, &self.render_ctx.no_match_cache);
+            try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, "No matches", self.color_scheme.foreground, &self.render_ctx.no_match_cache);
         }
 
         try self.sdl.renderer.present();
@@ -553,7 +741,7 @@ pub const App = struct {
         cache: *TextureCache,
     ) !void {
         const text_changed = !std.mem.eql(u8, cache.last_text, text);
-        const color_changed = !colorEquals(cache.last_color, color);
+        const color_changed = !rendering_mod.colorEquals(cache.last_color, color);
 
         if (text_changed or color_changed or cache.texture == null) {
             if (cache.texture) |old_tex| old_tex.deinit();
@@ -574,26 +762,18 @@ pub const App = struct {
             try self.sdl.renderer.renderTexture(texture, null, dst);
         }
     }
-
-    fn colorEquals(a: sdl.pixels.Color, b: sdl.pixels.Color) bool {
-        return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
-    }
 };
-
-// ============================================================================
-// TESTS
-// ============================================================================
 
 test "colorEquals - same colors" {
     const color1 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
     const color2 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
-    try std.testing.expect(App.colorEquals(color1, color2));
+    try std.testing.expect(rendering_mod.colorEquals(color1, color2));
 }
 
 test "colorEquals - different colors" {
     const color1 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
     const color2 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 65, .a = 255 };
-    try std.testing.expect(!App.colorEquals(color1, color2));
+    try std.testing.expect(!rendering_mod.colorEquals(color1, color2));
 }
 
 test "config - buffer sizes aligned with limits" {

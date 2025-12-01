@@ -73,8 +73,8 @@ pub const solarized = Theme{
     .prompt = .{ .r = 0x2a, .g = 0xa1, .b = 0x98, .a = 0xff },
 };
 
-/// Default theme (mocha)
-pub const default = mocha;
+/// Default theme (latte)
+pub const default = latte;
 
 /// Compile-time map for theme lookup
 const theme_map = std.StaticStringMap(Theme).initComptime(.{

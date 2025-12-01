@@ -10,6 +10,39 @@ const builtin = @import("builtin");
 const sdl = @import("sdl3");
 pub const theme = @import("src/theme.zig");
 
+/// Feature flags - set to true to enable, false to disable
+/// Disabled features are completely removed from the binary (zero overhead)
+pub const features = struct {
+    /// Case-sensitive matching (default: false = case-insensitive)
+    pub const case_sensitive: bool = false;
+
+    /// Matching algorithm
+    pub const match_mode: MatchMode = .fuzzy;
+
+    /// History: track and boost recently selected items
+    /// When enabled, stores history in XDG_DATA_HOME/zmenu/history
+    pub const history: bool = false;
+
+    /// Maximum history entries (only used when history = true)
+    pub const history_max_entries: usize = 100;
+
+    /// Clipboard: copy selected items to system clipboard
+    /// When enabled, pressing Enter copies to both clipboard AND stdout
+    /// Degrades gracefully in headless/SSH environments (warns but continues)
+    pub const clipboard: bool = false;
+
+};
+
+pub const MatchMode = enum {
+    fuzzy,
+    prefix,
+    exact,
+};
+
+/// Graceful shutdown timeout for onExit hooks (milliseconds)
+/// Features exceeding this timeout will be logged but not blocked
+pub const exit_timeout_ms: u32 = 500;
+
 // ============================================================================
 // WINDOW
 // ============================================================================
@@ -109,32 +142,3 @@ pub const default_font_paths = switch (builtin.os.tag) {
     },
 };
 
-// ============================================================================
-// FEATURES (compile-time toggles)
-// ============================================================================
-
-/// Feature flags - set to true to enable, false to disable
-/// Disabled features are completely removed from the binary (zero overhead)
-pub const features = struct {
-    /// Case-sensitive matching (default: false = case-insensitive)
-    pub const case_sensitive: bool = false;
-
-    /// Matching algorithm
-    pub const match_mode: MatchMode = .fuzzy;
-
-    /// History: track and boost recently selected items
-    /// When enabled, stores history in XDG_DATA_HOME/zmenu/history
-    pub const history: bool = false;
-
-    /// Maximum history entries (only used when history = true)
-    pub const history_max_entries: usize = 100;
-
-    // Future features (added via patches):
-    // pub const multi_select: bool = false;
-};
-
-pub const MatchMode = enum {
-    fuzzy,
-    prefix,
-    exact,
-};

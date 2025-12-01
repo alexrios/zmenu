@@ -4,6 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Log level option (default: err)
+    const log_level = b.option(
+        std.log.Level,
+        "log-level",
+        "Set the log level (err, warn, info, debug)",
+    ) orelse .err;
+
+    // Create build options for compile-time configuration
+    const options = b.addOptions();
+    options.addOption(std.log.Level, "log_level", log_level);
+
     // Add SDL3 dependency
     const sdl3 = b.dependency("sdl3", .{
         .target = target,
@@ -38,6 +49,7 @@ pub fn build(b: *std.Build) void {
     // Import modules
     exe.root_module.addImport("sdl3", sdl3.module("sdl3"));
     exe.root_module.addImport("config", config_module);
+    exe.root_module.addImport("build_options", options.createModule());
 
     b.installArtifact(exe);
 
@@ -62,6 +74,7 @@ pub fn build(b: *std.Build) void {
     // Import modules for tests
     unit_tests.root_module.addImport("sdl3", sdl3.module("sdl3"));
     unit_tests.root_module.addImport("config", config_module);
+    unit_tests.root_module.addImport("build_options", options.createModule());
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

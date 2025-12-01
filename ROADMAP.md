@@ -47,6 +47,7 @@ Aspirational roadmap for zmenu development. Following the suckless philosophy, f
 - [ ] **Lazy rendering** - Only render visible items
 - [ ] **Async input** - Non-blocking stdin for large inputs
 - [ ] **Result caching** - Cache filter results between keystrokes
+- [ ] **Daemon mode** - Server-client architecture for < 10ms repeated launches (120ms → 10ms)
 
 ---
 
@@ -55,6 +56,7 @@ Aspirational roadmap for zmenu development. Following the suckless philosophy, f
 ### Integration Features
 - [ ] **Password mode** - Hide input characters (for dmenu_pass scripts)
 - [ ] **Desktop entry parser** - Parse .desktop files for app launcher
+- [ ] **App launcher examples** - Platform-specific launcher scripts (Linux/Mac/Windows)
 - [ ] **Custom scripts directory** - ~/.config/zmenu/scripts/ auto-discovery
 - [ ] **JSON output mode** - Structured output for scripting
 
@@ -78,6 +80,10 @@ Aspirational roadmap for zmenu development. Following the suckless philosophy, f
 - [ ] **IPC interface** - Control zmenu from external scripts
 
 ### Ecosystem
+- [ ] **zmenu-launcher** - Reference app launcher implementations
+  - Linux: .desktop file parser + gtk-launch integration
+  - macOS: .app bundle detection + `open -a` launcher
+  - Windows: Start Menu .lnk parser + PowerShell integration
 - [ ] **zmenu-scripts** - Curated script collection (wifi, bluetooth, power menu)
 - [ ] **Theme gallery** - Community theme contributions
 - [ ] **Integration guides** - Docs for i3, sway, Hyprland, etc.
