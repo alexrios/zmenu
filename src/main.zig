@@ -2,29 +2,10 @@ const std = @import("std");
 const sdl = @import("sdl3");
 const builtin = @import("builtin");
 const theme = @import("theme.zig");
-
-// Platform-specific default font paths (tried in order)
-const default_font_paths = switch (builtin.os.tag) {
-    .linux => [_][:0]const u8{
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch Linux
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf", // Some distros
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    },
-    .macos => [_][:0]const u8{
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFNSText.ttf",
-        "/Library/Fonts/Arial.ttf",
-    },
-    .windows => [_][:0]const u8{
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\calibri.ttf",
-    },
-    else => [_][:0]const u8{
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    },
-};
+const syntax_mod = @import("syntax");
+const font_mod = @import("font.zig");
+const preview_mod = @import("preview.zig");
+const syntax_highlight = @import("syntax_highlight.zig");
 
 const WindowConfig = struct {
     initial_width: u32 = 800,
@@ -69,30 +50,15 @@ const Layout = struct {
     sample_scroll_text: [:0]const u8 = "[999-999]", // Longest possible scroll indicator
 };
 
-const FontConfig = struct {
-    path: ?[:0]const u8 = null, // null = use platform defaults
-    size: f32 = 22,
-};
-
 const Config = struct {
     window: WindowConfig = .{},
     colors: ColorScheme = .{},
     limits: Limits = .{},
     layout: Layout = .{},
-    font: FontConfig = .{},
+    font: font_mod.FontConfig = .{},
+    preview: preview_mod.PreviewConfig = .{},
 };
 
-// Text texture cache entry
-const TextureCache = struct {
-    texture: ?sdl.render.Texture,
-    last_text: []u8,
-    last_color: sdl.pixels.Color,
-
-    fn deinit(self: *TextureCache, allocator: std.mem.Allocator) void {
-        if (self.texture) |tex| tex.deinit();
-        allocator.free(self.last_text);
-    }
-};
 
 const SdlContext = struct {
     window: sdl.video.Window,
@@ -101,6 +67,7 @@ const SdlContext = struct {
     loaded_font_path: []const u8, // Track which font was actually loaded
 };
 
+
 const AppState = struct {
     input_buffer: std.ArrayList(u8),
     items: std.ArrayList([]const u8),
@@ -108,6 +75,13 @@ const AppState = struct {
     selected_index: usize,
     scroll_offset: usize,
     needs_render: bool,
+    // Preview state
+    preview_enabled: bool, // Current toggle state
+    preview_content: std.ArrayList(u8), // Preview text content
+    preview_state: preview_mod.PreviewState, // Current preview state
+    last_previewed_item: ?[]const u8, // Track which item we last previewed
+    highlight_spans: std.ArrayList(syntax_highlight.HighlightSpan), // Syntax highlight information
+    preview_scroll_offset: usize, // Scroll position in preview (line number)
 };
 
 const RenderContext = struct {
@@ -116,10 +90,10 @@ const RenderContext = struct {
     item_buffer: []u8,
     count_buffer: []u8,
     scroll_buffer: []u8,
-    // Texture caching for text rendering performance
-    prompt_cache: TextureCache,
-    count_cache: TextureCache,
-    no_match_cache: TextureCache,
+    // Texture caching for text rendering performance (using font module)
+    prompt_cache: font_mod.TextureCache,
+    count_cache: font_mod.TextureCache,
+    no_match_cache: font_mod.TextureCache,
     // High DPI state
     display_scale: f32, // Combined scale factor (pixel density × content scale)
     pixel_width: u32, // Actual pixel dimensions
@@ -135,36 +109,14 @@ const App = struct {
     render_ctx: RenderContext,
     config: Config,
     allocator: std.mem.Allocator,
+    query_cache: *syntax_mod.QueryCache,
 
-    fn tryLoadFont(config: Config) !struct { font: sdl.ttf.Font, path: []const u8 } {
-        // If user specified a custom font path, try only that
-        if (config.font.path) |custom_path| {
-            const font = sdl.ttf.Font.init(custom_path, config.font.size) catch |err| {
-                std.debug.print("Error: Failed to load font '{s}': {}\n", .{ custom_path, err });
-                return err;
-            };
-            return .{ .font = font, .path = custom_path };
-        }
-
-        // Try platform-specific default fonts in order
-        for (default_font_paths) |font_path| {
-            if (sdl.ttf.Font.init(font_path, config.font.size)) |font| {
-                std.debug.print("Successfully loaded font: {s}\n", .{font_path});
-                return .{ .font = font, .path = font_path };
-            } else |_| {
-                // Silently continue to next font
-            }
-        }
-
-        // No fonts found
-        std.debug.print("Error: Could not find any suitable font. Tried:\n", .{});
-        for (default_font_paths) |font_path| {
-            std.debug.print("  - {s}\n", .{font_path});
-        }
-        return error.NoFontFound;
-    }
 
     fn init(allocator: std.mem.Allocator) !App {
+        // Initialize QueryCache for syntax highlighting
+        const query_cache = try syntax_mod.QueryCache.create(allocator, .{});
+        errdefer query_cache.deinit();
+
         // Initialize SDL
         const init_flags = sdl.InitFlags{ .video = true, .events = true };
         try sdl.init(init_flags);
@@ -231,8 +183,9 @@ const App = struct {
         errdefer allocator.free(scroll_buffer);
 
         // Load font with platform-specific fallback
-        const font_result = try tryLoadFont(config);
+        const font_result = try font_mod.loadFont(config.font, allocator);
         errdefer font_result.font.deinit();
+        errdefer allocator.free(font_result.path);
 
         var app = App{
             .sdl = .{
@@ -248,15 +201,21 @@ const App = struct {
                 .selected_index = 0,
                 .scroll_offset = 0,
                 .needs_render = true,
+                .preview_enabled = config.preview.enable_preview,
+                .preview_content = std.ArrayList(u8).empty,
+                .preview_state = .none,
+                .last_previewed_item = null,
+                .highlight_spans = std.ArrayList(syntax_highlight.HighlightSpan).empty,
+                .preview_scroll_offset = 0,
             },
             .render_ctx = .{
                 .prompt_buffer = prompt_buffer,
                 .item_buffer = item_buffer,
                 .count_buffer = count_buffer,
                 .scroll_buffer = scroll_buffer,
-                .prompt_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .count_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .no_match_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+                .prompt_cache = font_mod.TextureCache.init(),
+                .count_cache = font_mod.TextureCache.init(),
+                .no_match_cache = font_mod.TextureCache.init(),
                 .display_scale = display_scale,
                 .pixel_width = @intCast(pixel_width),
                 .pixel_height = @intCast(pixel_height),
@@ -265,6 +224,7 @@ const App = struct {
             },
             .config = config,
             .allocator = allocator,
+            .query_cache = query_cache,
         };
 
         // Load items from stdin
@@ -296,6 +256,8 @@ const App = struct {
             std.debug.print("Warning: Failed to stop text input: {}\n", .{err});
         };
         self.state.input_buffer.deinit(self.allocator);
+        self.state.preview_content.deinit(self.allocator);
+        self.state.highlight_spans.deinit(self.allocator);
         for (self.state.items.items) |item| {
             self.allocator.free(item);
         }
@@ -310,11 +272,14 @@ const App = struct {
         self.render_ctx.count_cache.deinit(self.allocator);
         self.render_ctx.no_match_cache.deinit(self.allocator);
         self.sdl.font.deinit();
+        self.allocator.free(self.sdl.loaded_font_path); // Free font path copy
         self.sdl.renderer.deinit();
         self.sdl.window.deinit();
         sdl.ttf.quit();
         const quit_flags = sdl.InitFlags{ .video = true, .events = true };
         sdl.quit(quit_flags);
+        // Clean up query cache last
+        self.query_cache.deinit();
     }
 
     fn findUtf8Boundary(text: []const u8, max_len: usize) usize {
@@ -353,6 +318,215 @@ const App = struct {
 
                 const owned_line = try self.allocator.dupe(u8, final_line);
                 try self.state.items.append(self.allocator, owned_line);
+            }
+        }
+    }
+
+    fn scrollPreviewDown(self: *App) void {
+        const line_count = preview_mod.countLines(self.state.preview_content.items);
+        const max_visible = self.config.limits.max_visible_items;
+
+        // Calculate maximum scroll offset (can't scroll past last page)
+        const max_offset = if (line_count > max_visible)
+            line_count - max_visible
+        else
+            0;
+
+        if (self.state.preview_scroll_offset < max_offset) {
+            self.state.preview_scroll_offset += 1;
+        }
+    }
+
+    fn scrollPreviewDownPage(self: *App) void {
+        const line_count = preview_mod.countLines(self.state.preview_content.items);
+        const max_visible = self.config.limits.max_visible_items;
+
+        const max_offset = if (line_count > max_visible)
+            line_count - max_visible
+        else
+            0;
+
+        // Scroll down by page size
+        self.state.preview_scroll_offset = @min(
+            self.state.preview_scroll_offset + max_visible,
+            max_offset,
+        );
+    }
+
+    fn loadPreview(self: *App, item_path: []const u8) void {
+        // Check if preview is enabled
+        if (!self.state.preview_enabled) {
+            self.state.preview_state = .none;
+            return;
+        }
+
+        // Clear previous preview content and reset scroll
+        self.state.preview_content.clearRetainingCapacity();
+        self.state.preview_scroll_offset = 0;
+        self.state.preview_state = .loading;
+
+        // Check if it's a known binary file
+        if (preview_mod.isBinaryFile(item_path)) {
+            self.state.preview_state = .binary;
+            self.state.last_previewed_item = item_path;
+            return;
+        }
+
+        // Try to open and read the file
+        const file = std.fs.cwd().openFile(item_path, .{}) catch |err| {
+            self.state.preview_state = switch (err) {
+                error.FileNotFound => .not_found,
+                error.AccessDenied => .permission_denied,
+                else => .not_found,
+            };
+            self.state.last_previewed_item = item_path;
+            return;
+        };
+        defer file.close();
+
+        // Check file size
+        const file_size = file.getEndPos() catch {
+            self.state.preview_state = .not_found;
+            self.state.last_previewed_item = item_path;
+            return;
+        };
+
+        if (file_size > self.config.preview.max_preview_bytes) {
+            self.state.preview_state = .too_large;
+            self.state.last_previewed_item = item_path;
+            return;
+        }
+
+        // Read file content
+        const content = file.readToEndAlloc(self.allocator, self.config.preview.max_preview_bytes) catch {
+            self.state.preview_state = .permission_denied;
+            self.state.last_previewed_item = item_path;
+            return;
+        };
+        defer self.allocator.free(content);
+
+        // Check if content is text (no null bytes in first 512 bytes)
+        const check_len = @min(content.len, 512);
+        if (!preview_mod.isTextFile(item_path) and preview_mod.containsNullByte(content[0..check_len])) {
+            self.state.preview_state = .binary;
+            self.state.last_previewed_item = item_path;
+            return;
+        }
+
+        // Copy content to preview buffer (no line limit, only byte limit enforced by file read)
+        self.state.preview_content.appendSlice(self.allocator, content) catch {
+            self.state.preview_state = .too_large;
+            self.state.last_previewed_item = item_path;
+            return;
+        };
+
+        // Apply syntax highlighting
+        self.state.highlight_spans.clearRetainingCapacity();
+
+        const colors = syntax_highlight.ColorScheme{
+            .background = self.config.colors.background,
+            .foreground = self.config.colors.foreground,
+            .selected = self.config.colors.selected,
+            .prompt = self.config.colors.prompt,
+        };
+        var highlighter = syntax_highlight.SyntaxHighlighter.init(self.allocator, self.query_cache, colors);
+        highlighter.highlight(item_path, self.state.preview_content.items, &self.state.highlight_spans) catch |err| {
+            // If highlighting fails, clear spans to prevent stale data
+            self.state.highlight_spans.clearRetainingCapacity();
+            std.debug.print("Warning: Syntax highlighting failed for {s}: {}\n", .{ item_path, err });
+        };
+
+        self.state.preview_state = .text;
+        self.state.last_previewed_item = item_path;
+    }
+
+    fn renderHighlightedLine(self: *App, x: f32, y: f32, line: []const u8, line_start_byte: usize) !void {
+        // If no highlights or line is empty, render normally
+        if (self.state.highlight_spans.items.len == 0 or line.len == 0) {
+            if (line.len > 0) {
+                var line_buffer: [4096]u8 = undefined;
+                const line_z = std.fmt.bufPrintZ(&line_buffer, "{s}", .{line}) catch return;
+                self.renderText(x, y, line_z, self.config.colors.foreground) catch {};
+            }
+            return;
+        }
+
+        const line_end_byte = line_start_byte + line.len;
+        var current_x = x;
+
+        // Simple approach: find highlight spans and render segments
+        var pos: usize = 0;
+        const default_color = self.config.colors.foreground;
+
+        // Create highlighter for color mapping
+        const colors = syntax_highlight.ColorScheme{
+            .background = self.config.colors.background,
+            .foreground = self.config.colors.foreground,
+            .selected = self.config.colors.selected,
+            .prompt = self.config.colors.prompt,
+        };
+        var highlighter = syntax_highlight.SyntaxHighlighter.init(self.allocator, self.query_cache, colors);
+
+        while (pos < line.len) {
+            // Find if current position is in any highlight span
+            var found_span: ?syntax_highlight.HighlightSpan = null;
+            for (self.state.highlight_spans.items) |span| {
+                const byte_pos = line_start_byte + pos;
+                if (byte_pos >= span.start_byte and byte_pos < span.end_byte) {
+                    found_span = span;
+                    break;
+                }
+            }
+
+            if (found_span) |span| {
+                // Calculate segment within this span
+                const start_pos = pos;
+                const span_relative_end = span.end_byte - line_start_byte;
+                const end_pos = @min(span_relative_end, line.len);
+
+                // Render highlighted segment
+                const segment = line[start_pos..end_pos];
+                if (segment.len > 0) {
+                    var buffer: [4096]u8 = undefined;
+                    const text_z = std.fmt.bufPrintZ(&buffer, "{s}", .{segment}) catch {
+                        pos = end_pos;
+                        continue;
+                    };
+                    const color = highlighter.getScopeColor(span.scope);
+                    const w, _ = self.sdl.font.getStringSize(text_z) catch {
+                        pos = end_pos;
+                        continue;
+                    };
+                    self.renderText(current_x, y, text_z, color) catch {};
+                    current_x += @floatFromInt(w);
+                }
+                pos = end_pos;
+            } else {
+                // Find next highlight start or end of line
+                var next_pos = line.len;
+                for (self.state.highlight_spans.items) |span| {
+                    if (span.start_byte > line_start_byte + pos and span.start_byte < line_end_byte) {
+                        const span_start_in_line = span.start_byte - line_start_byte;
+                        next_pos = @min(next_pos, span_start_in_line);
+                    }
+                }
+
+                // Render unhighlighted segment
+                const segment = line[pos..next_pos];
+                if (segment.len > 0) {
+                    var buffer: [4096]u8 = undefined;
+                    const text_z = std.fmt.bufPrintZ(&buffer, "{s}", .{segment}) catch {
+                        pos = next_pos;
+                        continue;
+                    };
+                    const w, _ = self.sdl.font.getStringSize(text_z) catch {
+                        pos = next_pos;
+                        continue;
+                    };
+                    self.renderText(current_x, y, text_z, default_color) catch {};
+                    current_x += @floatFromInt(w);
+                }
+                pos = next_pos;
             }
         }
     }
@@ -429,6 +603,43 @@ const App = struct {
         }
     }
 
+    fn updatePreview(self: *App) void {
+        if (!self.state.preview_enabled) return;
+        if (self.state.filtered_items.items.len == 0) {
+            self.state.preview_state = .none;
+            return;
+        }
+
+        const item_index = self.state.filtered_items.items[self.state.selected_index];
+        const item = self.state.items.items[item_index];
+
+        // Skip if already previewed this item
+        if (self.state.last_previewed_item) |last| {
+            if (std.mem.eql(u8, last, item)) return;
+        }
+
+        const old_line_count = blk: {
+            var count: usize = 0;
+            var iter = std.mem.splitScalar(u8, self.state.preview_content.items, '\n');
+            while (iter.next()) |_| count += 1;
+            break :blk count;
+        };
+
+        self.loadPreview(item);
+
+        // If preview content line count changed, update window size
+        const new_line_count = blk: {
+            var count: usize = 0;
+            var iter = std.mem.splitScalar(u8, self.state.preview_content.items, '\n');
+            while (iter.next()) |_| count += 1;
+            break :blk count;
+        };
+
+        if (old_line_count != new_line_count) {
+            self.updateWindowSize() catch {};
+        }
+    }
+
     fn navigate(self: *App, delta: isize) void {
         if (self.state.filtered_items.items.len == 0) return;
 
@@ -438,6 +649,7 @@ const App = struct {
         if (new_idx >= 0 and new_idx < @as(isize, @intCast(self.state.filtered_items.items.len))) {
             self.state.selected_index = @intCast(new_idx);
             self.adjustScroll();
+            self.updatePreview();
             self.state.needs_render = true;
         }
     }
@@ -446,6 +658,7 @@ const App = struct {
         if (self.state.filtered_items.items.len > 0) {
             self.state.selected_index = 0;
             self.adjustScroll();
+            self.updatePreview();
             self.state.needs_render = true;
         }
     }
@@ -454,6 +667,7 @@ const App = struct {
         if (self.state.filtered_items.items.len > 0) {
             self.state.selected_index = self.state.filtered_items.items.len - 1;
             self.adjustScroll();
+            self.updatePreview();
             self.state.needs_render = true;
         }
     }
@@ -545,6 +759,36 @@ const App = struct {
         } else if (key == .w and (event.mod.left_control or event.mod.right_control)) {
             // Ctrl+W: Delete last word
             try self.deleteWord();
+        } else if (key == .up and (event.mod.left_alt or event.mod.right_alt)) {
+            // Alt+Up: Scroll preview up (check this BEFORE regular up)
+            if (self.state.preview_enabled and self.state.preview_state == .text) {
+                if (self.state.preview_scroll_offset > 0) {
+                    self.state.preview_scroll_offset -= 1;
+                    self.state.needs_render = true;
+                }
+            }
+        } else if (key == .down and (event.mod.left_alt or event.mod.right_alt)) {
+            // Alt+Down: Scroll preview down (check this BEFORE regular down)
+            if (self.state.preview_enabled and self.state.preview_state == .text) {
+                self.scrollPreviewDown();
+                self.state.needs_render = true;
+            }
+        } else if (key == .page_up and (event.mod.left_alt or event.mod.right_alt)) {
+            // Alt+PageUp: Scroll preview up by page (check this BEFORE regular page up)
+            if (self.state.preview_enabled and self.state.preview_state == .text) {
+                if (self.state.preview_scroll_offset >= self.config.limits.max_visible_items) {
+                    self.state.preview_scroll_offset -= self.config.limits.max_visible_items;
+                } else {
+                    self.state.preview_scroll_offset = 0;
+                }
+                self.state.needs_render = true;
+            }
+        } else if (key == .page_down and (event.mod.left_alt or event.mod.right_alt)) {
+            // Alt+PageDown: Scroll preview down by page (check this BEFORE regular page down)
+            if (self.state.preview_enabled and self.state.preview_state == .text) {
+                self.scrollPreviewDownPage();
+                self.state.needs_render = true;
+            }
         } else if (key == .up or key == .k) {
             self.navigate(-1);
         } else if (key == .down or key == .j) {
@@ -566,6 +810,16 @@ const App = struct {
             self.navigatePage(-1);
         } else if (key == .page_down) {
             self.navigatePage(1);
+        } else if (key == .p and (event.mod.left_control or event.mod.right_control)) {
+            // Ctrl+P: Toggle preview pane
+            self.state.preview_enabled = !self.state.preview_enabled;
+            if (self.state.preview_enabled) {
+                // Load preview for current selection
+                self.updatePreview();
+            }
+            // Recalculate window size to fit preview pane
+            try self.updateWindowSize();
+            self.state.needs_render = true;
         }
 
         return false;
@@ -582,6 +836,9 @@ const App = struct {
     }
 
     fn renderText(self: *App, x: f32, y: f32, text: [:0]const u8, color: sdl.pixels.Color) !void {
+        // SDL_ttf cannot render empty strings
+        if (text.len == 0) return;
+
         // Convert sdl.pixels.Color to sdl.ttf.Color
         const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
 
@@ -607,7 +864,7 @@ const App = struct {
         y: f32,
         text: [:0]const u8,
         color: sdl.pixels.Color,
-        cache: *TextureCache,
+        cache: *font_mod.TextureCache,
     ) !void {
         // Check if we can reuse cached texture
         const text_changed = !std.mem.eql(u8, cache.last_text, text);
@@ -645,6 +902,13 @@ const App = struct {
         // Apply display scale to all coordinates
         const scale = self.render_ctx.display_scale;
 
+        // Calculate layout dimensions
+        const window_width = @as(f32, @floatFromInt(self.render_ctx.current_width));
+        const items_pane_width = if (self.state.preview_enabled)
+            window_width * (100.0 - @as(f32, @floatFromInt(self.config.preview.preview_width_percent))) / 100.0
+        else
+            window_width;
+
         // Show prompt with input buffer
         const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
             // Truncate display if input is too long, showing last chars with ellipsis
@@ -670,22 +934,40 @@ const App = struct {
 
         try self.renderCachedText(5.0 * scale, self.config.layout.prompt_y * scale, prompt_text, self.config.colors.prompt, &self.render_ctx.prompt_cache);
 
-        // Show filtered items count
-        const count_text = std.fmt.bufPrintZ(
-            self.render_ctx.count_buffer,
-            "{d}/{d}",
-            .{ self.state.filtered_items.items.len, self.state.items.items.len },
-        ) catch "?/?";
+        // Show filtered items count and preview status
+        const count_text = if (self.state.preview_enabled)
+            std.fmt.bufPrintZ(
+                self.render_ctx.count_buffer,
+                "{d}/{d} Preview: ON",
+                .{ self.state.filtered_items.items.len, self.state.items.items.len },
+            ) catch "?/? Preview: ON"
+        else
+            std.fmt.bufPrintZ(
+                self.render_ctx.count_buffer,
+                "{d}/{d}",
+                .{ self.state.filtered_items.items.len, self.state.items.items.len },
+            ) catch "?/?";
 
         // Measure actual text width for right-alignment
         const count_text_w, _ = try self.sdl.font.getStringSize(count_text);
-        const count_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(count_text_w)) - self.config.layout.width_padding) * scale;
+        const count_x = (window_width - @as(f32, @floatFromInt(count_text_w)) - self.config.layout.width_padding) * scale;
         try self.renderCachedText(count_x, self.config.layout.prompt_y * scale, count_text, self.config.colors.foreground, &self.render_ctx.count_cache);
 
         // Cache length to avoid race conditions
         const filtered_len = self.state.filtered_items.items.len;
 
-        // Show multiple items
+        // Set clipping rectangle for items pane if preview is enabled
+        if (self.state.preview_enabled) {
+            const clip_rect = sdl.rect.IRect{
+                .x = 0,
+                .y = 0,
+                .w = @intFromFloat(items_pane_width * scale),
+                .h = @intCast(self.render_ctx.pixel_height),
+            };
+            try self.sdl.renderer.setClipRect(clip_rect);
+        }
+
+        // Show multiple items (in left pane if preview enabled)
         if (filtered_len > 0) {
             const visible_end = @min(self.state.scroll_offset + self.config.limits.max_visible_items, filtered_len);
 
@@ -716,7 +998,7 @@ const App = struct {
                 y_pos += self.config.layout.item_line_height * scale;
             }
 
-            // Show scroll indicator if needed
+            // Show scroll indicator if needed (only in items pane)
             if (filtered_len > self.config.limits.max_visible_items) {
                 const scroll_text = std.fmt.bufPrintZ(
                     self.render_ctx.scroll_buffer,
@@ -724,13 +1006,122 @@ const App = struct {
                     .{ self.state.scroll_offset + 1, visible_end },
                 ) catch "[?]";
 
-                // Measure actual scroll text width for right-alignment
+                // Measure actual scroll text width for right-alignment within items pane
                 const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
-                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - self.config.layout.width_padding) * scale;
+                const scroll_x = (items_pane_width - @as(f32, @floatFromInt(scroll_text_w)) - self.config.layout.width_padding) * scale;
                 try self.renderText(scroll_x, self.config.layout.items_start_y * scale, scroll_text, self.config.colors.foreground);
             }
         } else {
             try self.renderCachedText(5.0 * scale, self.config.layout.items_start_y * scale, "No matches", self.config.colors.foreground, &self.render_ctx.no_match_cache);
+        }
+
+        // Clear clipping for preview pane
+        if (self.state.preview_enabled) {
+            try self.sdl.renderer.setClipRect(null);
+        }
+
+        // Render preview pane if enabled
+        if (self.state.preview_enabled) {
+            const divider_x = items_pane_width * scale;
+            const preview_x = (items_pane_width + 10.0) * scale; // 10px padding
+            const preview_y = self.config.layout.items_start_y * scale;
+
+            // Draw vertical divider line
+            try self.sdl.renderer.setDrawColor(self.config.colors.foreground);
+            const line_start = sdl.rect.FPoint{ .x = divider_x, .y = 0 };
+            const line_end = sdl.rect.FPoint{ .x = divider_x, .y = @floatFromInt(self.render_ctx.pixel_height) };
+            try self.sdl.renderer.renderLine(line_start, line_end);
+
+            // Render preview content based on state
+            switch (self.state.preview_state) {
+                .none => {
+                    try self.renderText(preview_x, preview_y, "(no preview available)", self.config.colors.foreground);
+                },
+                .loading => {
+                    try self.renderText(preview_x, preview_y, "Loading preview...", self.config.colors.foreground);
+                },
+                .text => {
+                    // Render preview text line by line with syntax highlighting and scrolling
+                    var line_y = preview_y;
+                    var byte_offset: usize = 0;
+                    var line_index: usize = 0;
+                    var visible_lines: usize = 0;
+                    const max_visible = self.config.limits.max_visible_items;
+
+                    var iter = std.mem.splitScalar(u8, self.state.preview_content.items, '\n');
+                    while (iter.next()) |line| {
+                        // Skip lines before scroll offset
+                        if (line_index < self.state.preview_scroll_offset) {
+                            byte_offset += line.len + 1; // +1 for newline
+                            line_index += 1;
+                            continue;
+                        }
+
+                        // Stop if we've rendered max visible lines
+                        if (visible_lines >= max_visible) break;
+
+                        // Skip rendering empty lines but still count them
+                        if (line.len == 0) {
+                            line_y += self.config.layout.item_line_height * scale;
+                            byte_offset += 1; // Account for newline character
+                            line_index += 1;
+                            visible_lines += 1;
+                            continue;
+                        }
+
+                        // Try to render with syntax highlighting
+                        self.renderHighlightedLine(preview_x, line_y, line, byte_offset) catch {
+                            // If rendering fails, show a placeholder
+                            self.renderText(preview_x, line_y, "[line cannot be displayed]", self.config.colors.foreground) catch {};
+                        };
+
+                        line_y += self.config.layout.item_line_height * scale;
+                        byte_offset += line.len + 1; // +1 for newline
+                        line_index += 1;
+                        visible_lines += 1;
+                    }
+                },
+                .binary => {
+                    try self.renderText(preview_x, preview_y, "Binary file (no preview)", self.config.colors.foreground);
+                },
+                .not_found => {
+                    try self.renderText(preview_x, preview_y, "File not found", self.config.colors.foreground);
+                },
+                .permission_denied => {
+                    try self.renderText(preview_x, preview_y, "Permission denied", self.config.colors.foreground);
+                },
+                .too_large => {
+                    try self.renderText(preview_x, preview_y, "File too large", self.config.colors.foreground);
+                },
+            }
+
+            // Show scroll indicator for preview if needed
+            if (self.state.preview_state == .text) {
+                // Count total lines using consistent method
+                const total_lines = preview_mod.countLines(self.state.preview_content.items);
+
+                // Show indicator if there are more lines than visible
+                if (total_lines > self.config.limits.max_visible_items) {
+                    const visible_end = @min(
+                        self.state.preview_scroll_offset + self.config.limits.max_visible_items,
+                        total_lines,
+                    );
+
+                    var scroll_indicator_buffer: [64]u8 = undefined;
+                    const scroll_text = std.fmt.bufPrintZ(
+                        &scroll_indicator_buffer,
+                        "[{d}-{d}/{d}]",
+                        .{ self.state.preview_scroll_offset + 1, visible_end, total_lines },
+                    ) catch "[?]";
+
+                    // Position in top-right of preview pane, below the prompt line to avoid overlap
+                    const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
+                    const preview_pane_width = window_width - items_pane_width;
+                    const scroll_x = ((items_pane_width + preview_pane_width - @as(f32, @floatFromInt(scroll_text_w)) / scale) - self.config.layout.width_padding) * scale;
+                    const scroll_y = (self.config.layout.prompt_y + self.config.layout.item_line_height) * scale;
+                    try self.renderText(scroll_x, scroll_y, scroll_text, self.config.colors.foreground);
+                }
+            }
         }
 
         try self.sdl.renderer.present();
@@ -782,6 +1173,16 @@ const App = struct {
             if (total_item_width > max_width) max_width = total_item_width;
         }
 
+        // If preview is enabled, adjust width calculation
+        // The items pane takes (100 - preview_width_percent)% of the window
+        // So we need to scale up max_width to account for the preview pane
+        if (self.state.preview_enabled) {
+            const items_pane_percent = 100.0 - @as(f32, @floatFromInt(self.config.preview.preview_width_percent));
+            // Scale up the required width: if items need X pixels and take Y% of window,
+            // then total window width = X / (Y / 100)
+            max_width = max_width * (100.0 / items_pane_percent);
+        }
+
         // Apply min/max bounds with proper rounding
         const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));
         const final_width = @max(rounded_width, self.config.window.min_width);
@@ -797,7 +1198,24 @@ const App = struct {
         const prompt_area_height = self.config.layout.items_start_y; // Includes prompt + spacing
         const items_height = @as(f32, @floatFromInt(visible_items)) * self.config.layout.item_line_height;
 
-        const total_height = prompt_area_height + items_height + self.config.layout.bottom_margin;
+        var total_height = prompt_area_height + items_height + self.config.layout.bottom_margin;
+
+        // If preview is enabled and has text content, calculate preview height
+        if (self.state.preview_enabled and self.state.preview_state == .text) {
+            // Count lines using consistent method
+            const line_count = preview_mod.countLines(self.state.preview_content.items);
+
+            // Limit visible preview lines to max_visible_items (for scrolling)
+            const visible_preview_lines = @min(line_count, self.config.limits.max_visible_items);
+
+            // Calculate preview height based on visible lines only
+            const preview_height = prompt_area_height +
+                (@as(f32, @floatFromInt(visible_preview_lines)) * self.config.layout.item_line_height) +
+                self.config.layout.bottom_margin;
+
+            // Use the maximum of items height and preview height
+            total_height = @max(total_height, preview_height);
+        }
 
         // Apply min/max bounds with proper rounding
         const rounded_height = @as(u32, @intFromFloat(@ceil(total_height)));
@@ -989,6 +1407,12 @@ test "deleteLastCodepoint - ASCII" {
             .selected_index = 0,
             .scroll_offset = 0,
             .needs_render = false,
+            .preview_enabled = false,
+            .preview_content = std.ArrayList(u8).empty,
+            .preview_state = .none,
+            .last_previewed_item = null,
+            .highlight_spans = std.ArrayList(syntax_highlight.HighlightSpan).empty,
+            .preview_scroll_offset = 0,
         },
         .render_ctx = .{
             .prompt_buffer = undefined,
@@ -1006,6 +1430,7 @@ test "deleteLastCodepoint - ASCII" {
         },
         .config = Config{},
         .allocator = allocator,
+        .query_cache = undefined,
     };
 
     try app.state.input_buffer.appendSlice(allocator, "hello");
@@ -1031,6 +1456,12 @@ test "deleteLastCodepoint - UTF-8 multi-byte" {
             .selected_index = 0,
             .scroll_offset = 0,
             .needs_render = false,
+            .preview_enabled = false,
+            .preview_content = std.ArrayList(u8).empty,
+            .preview_state = .none,
+            .last_previewed_item = null,
+            .highlight_spans = std.ArrayList(syntax_highlight.HighlightSpan).empty,
+            .preview_scroll_offset = 0,
         },
         .render_ctx = .{
             .prompt_buffer = undefined,
@@ -1048,6 +1479,7 @@ test "deleteLastCodepoint - UTF-8 multi-byte" {
         },
         .config = Config{},
         .allocator = allocator,
+        .query_cache = undefined,
     };
 
     // "café" = c a f é(2 bytes)
@@ -1077,6 +1509,12 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
             .selected_index = 0,
             .scroll_offset = 0,
             .needs_render = false,
+            .preview_enabled = false,
+            .preview_content = std.ArrayList(u8).empty,
+            .preview_state = .none,
+            .last_previewed_item = null,
+            .highlight_spans = std.ArrayList(syntax_highlight.HighlightSpan).empty,
+            .preview_scroll_offset = 0,
         },
         .render_ctx = .{
             .prompt_buffer = undefined,
@@ -1094,6 +1532,7 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
         },
         .config = Config{},
         .allocator = allocator,
+        .query_cache = undefined,
     };
 
     // "日" = 3 bytes
@@ -1123,6 +1562,12 @@ test "deleteLastCodepoint - empty buffer" {
             .selected_index = 0,
             .scroll_offset = 0,
             .needs_render = false,
+            .preview_enabled = false,
+            .preview_content = std.ArrayList(u8).empty,
+            .preview_state = .none,
+            .last_previewed_item = null,
+            .highlight_spans = std.ArrayList(syntax_highlight.HighlightSpan).empty,
+            .preview_scroll_offset = 0,
         },
         .render_ctx = .{
             .prompt_buffer = undefined,
@@ -1140,6 +1585,7 @@ test "deleteLastCodepoint - empty buffer" {
         },
         .config = Config{},
         .allocator = allocator,
+        .query_cache = undefined,
     };
 
     app.deleteLastCodepoint(); // Should not crash

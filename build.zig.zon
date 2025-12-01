@@ -6,6 +6,10 @@
             .url = "git+https://github.com/Gota7/zig-sdl3?ref=v0.1.5#014b7bcb2899f3ed9c945c4abfcfe1b25d75bfeb",
             .hash = "sdl3-0.1.5-NmT1QxARJgAH1Wp0cMBJDAc9vD7weufTkIwVa5rehA2q",
         },
+        .flow_syntax = .{
+            .url = "git+https://github.com/neurocyte/flow-syntax?ref=master#10b92330cf0ecaa39a52d3a8d190f7fb384b7b09",
+            .hash = "flow_syntax-0.1.0-X8jOoU8VAQCOYNTiuB7y2aIBP1V3OXXHa8WvE3eXtpDK",
+        },
     },
     .paths = .{""},
     .fingerprint = 0x2901eafceebebb0a,
