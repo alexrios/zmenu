@@ -233,10 +233,11 @@ fn afterFilter(
     }
 }
 
-fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: []const u8) void {
+fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) void {
     if (state_ptr) |ptr| {
         const state: *HistoryState = @ptrCast(@alignCast(ptr));
-        state.addEntry(selected_item);
+        // Track display field so history matching works correctly
+        state.addEntry(selected_item.display);
     }
 }
 

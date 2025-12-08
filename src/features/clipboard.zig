@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const sdl = @import("sdl3");
 const features_mod = @import("../features.zig");
 const config = @import("config");
+const types = @import("../types.zig");
 
 pub const clipboard_config = struct {
     pub const max_clipboard_length: usize = if (@hasDecl(config.limits, "max_item_length"))
@@ -16,19 +17,22 @@ pub const clipboard_config = struct {
         4096;
 };
 
-fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: []const u8) void {
+fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) void {
     _ = state_ptr; // Stateless feature
 
+    // Copy the value field (what gets output to stdout)
+    const value = selected_item.value;
+
     // Truncate if needed (SDL requires null-terminated string)
-    const copy_len = @min(selected_item.len, clipboard_config.max_clipboard_length);
+    const copy_len = @min(value.len, clipboard_config.max_clipboard_length);
 
     // Stack buffer for null termination (SDL API requirement)
     var buffer: [clipboard_config.max_clipboard_length + 1]u8 = undefined;
-    @memcpy(buffer[0..copy_len], selected_item[0..copy_len]);
+    @memcpy(buffer[0..copy_len], value[0..copy_len]);
     buffer[copy_len] = 0; // Null terminate
 
     // Warn if truncated
-    if (selected_item.len > clipboard_config.max_clipboard_length) {
+    if (value.len > clipboard_config.max_clipboard_length) {
         std.log.warn("clipboard item truncated to {} bytes", .{clipboard_config.max_clipboard_length});
     }
 

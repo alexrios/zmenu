@@ -453,8 +453,8 @@ pub const App = struct {
             if (self.state.filtered_items.items.len > 0) {
                 const selected_item = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
 
-                // Notify features of selection with display field (for history tracking)
-                features.callOnSelect(&self.feature_states, selected_item.display);
+                // Notify features of selection with full Item (features choose display/value)
+                features.callOnSelect(&self.feature_states, selected_item);
 
                 // Allow features to perform pre-shutdown cleanup
                 const all_completed = features.callOnExit(&self.feature_states, config.exit_timeout_ms);

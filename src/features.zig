@@ -79,7 +79,8 @@ pub const Hooks = struct {
     afterFilter: ?*const fn (?FeatureState, *std.ArrayList(usize), []const types.Item) void = null,
 
     /// Called when user selects an item (presses Enter)
-    onSelect: ?*const fn (?FeatureState, []const u8) void = null,
+    /// Receives the full Item so features can choose display or value field
+    onSelect: ?*const fn (?FeatureState, types.Item) void = null,
 
     /// Called after user selects an item (presses Enter), before SDL shutdown
     /// Must complete within global timeout (see config.exit_timeout_ms)
@@ -367,7 +368,7 @@ pub fn callAfterFilter(
 }
 
 /// Call onSelect hooks - called when user presses Enter
-pub fn callOnSelect(states: *FeatureStates, selected_item: []const u8) void {
+pub fn callOnSelect(states: *FeatureStates, selected_item: types.Item) void {
     if (enabled_count == 0) return;
 
     inline for (enabled_features, 0..) |feature, i| {
@@ -433,10 +434,10 @@ test "Feature hooks - execution order matches registration order" {
         var filtered = std.ArrayList(usize).empty;
         defer filtered.deinit(allocator);
 
-        var items = std.ArrayList([]const u8).empty;
+        var items = std.ArrayList(types.Item).empty;
         defer items.deinit(allocator);
 
-        try items.append(allocator, try allocator.dupe(u8, "test"));
+        try items.append(allocator, try types.Item.parse(allocator, "test"));
         try filtered.append(allocator, 0);
 
         var states = initStates();
@@ -445,7 +446,7 @@ test "Feature hooks - execution order matches registration order" {
         callAfterFilter(&states, &filtered, items.items);
 
         // Cleanup
-        for (items.items) |item| allocator.free(item);
+        for (items.items) |item| item.deinit(allocator);
     }
 }
 
