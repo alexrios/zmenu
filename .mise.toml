@@ -24,3 +24,7 @@ run = "zig build --summary all"
 [tasks."build:release-fast"]
 description = "Build optimized release (ReleaseFast)"
 run = "zig build -Doptimize=ReleaseFast"
+
+[tasks."build:release-small"]
+description = "Build optimized release (ReleaseSmall)"
+run = "zig build -Doptimize=ReleaseSmall"
