@@ -10,6 +10,7 @@ pub const ColorScheme = struct {
     foreground: sdl.pixels.Color,
     selected: sdl.pixels.Color,
     prompt: sdl.pixels.Color,
+    value_preview: sdl.pixels.Color,
 
     /// Create color scheme from compile-time config defaults
     pub fn fromConfig() ColorScheme {
@@ -18,6 +19,7 @@ pub const ColorScheme = struct {
             .foreground = config.colors.foreground,
             .selected = config.colors.selected,
             .prompt = config.colors.prompt,
+            .value_preview = config.colors.value_preview,
         };
     }
 };
@@ -56,6 +58,7 @@ pub const RenderContext = struct {
     item_buffer: []u8,
     count_buffer: []u8,
     scroll_buffer: []u8,
+    value_preview_buffer: []u8,
     // Texture caching for text rendering performance
     prompt_cache: TextureCache,
     count_cache: TextureCache,
@@ -68,6 +71,7 @@ pub const RenderContext = struct {
         allocator.free(self.item_buffer);
         allocator.free(self.count_buffer);
         allocator.free(self.scroll_buffer);
+        allocator.free(self.value_preview_buffer);
         self.prompt_cache.deinit(allocator);
         self.count_cache.deinit(allocator);
         self.no_match_cache.deinit(allocator);

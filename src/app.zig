@@ -11,6 +11,7 @@ const state_mod = @import("state.zig");
 const rendering_mod = @import("rendering.zig");
 const input = @import("input.zig");
 const features = @import("features.zig");
+const types = @import("types.zig");
 
 pub const SdlContext = sdl_context.SDLContext;
 pub const ColorScheme = rendering_mod.ColorScheme;
@@ -52,6 +53,8 @@ pub const App = struct {
         errdefer allocator.free(count_buffer);
         const scroll_buffer = try allocator.alloc(u8, config.limits.scroll_buffer_size);
         errdefer allocator.free(scroll_buffer);
+        const value_preview_buffer = try allocator.alloc(u8, config.limits.value_preview_buffer_size);
+        errdefer allocator.free(value_preview_buffer);
 
         // Load font with platform-specific fallback
         const font_result = try sdl_context.loadFont();
@@ -80,6 +83,7 @@ pub const App = struct {
                 .item_buffer = item_buffer,
                 .count_buffer = count_buffer,
                 .scroll_buffer = scroll_buffer,
+                .value_preview_buffer = value_preview_buffer,
                 .prompt_cache = TextureCache.empty,
                 .count_cache = TextureCache.empty,
                 .no_match_cache = TextureCache.empty,
@@ -119,7 +123,7 @@ pub const App = struct {
         };
         self.state.input_buffer.deinit(self.allocator);
         for (self.state.items.items) |item| {
-            self.allocator.free(item);
+            item.deinit(self.allocator);
         }
         self.state.items.deinit(self.allocator);
         self.state.filtered_items.deinit(self.allocator);
@@ -337,8 +341,8 @@ pub const App = struct {
         if (trimmed.len > 0) {
             const truncate_len = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
             const final_line = trimmed[0..truncate_len];
-            const owned_line = try self.allocator.dupe(u8, final_line);
-            try self.state.items.append(self.allocator, owned_line);
+            const item = try types.Item.parse(self.allocator, final_line);
+            try self.state.items.append(self.allocator, item);
 
             // Increment items loaded counter if we're in loading state
             if (self.state.input_state == .loading) {
@@ -358,7 +362,7 @@ pub const App = struct {
         } else {
             const query = self.state.input_buffer.items;
             for (self.state.items.items, 0..) |item, i| {
-                if (input.fuzzyMatch(item, query)) {
+                if (input.fuzzyMatch(item.display, query)) {
                     try self.state.filtered_items.append(self.allocator, i);
                 }
             }
@@ -447,10 +451,10 @@ pub const App = struct {
             return true;
         } else if (key == .return_key or key == .kp_enter) {
             if (self.state.filtered_items.items.len > 0) {
-                const selected = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
+                const selected_item = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
 
-                // Notify features of selection (e.g., for history tracking)
-                features.callOnSelect(&self.feature_states, selected);
+                // Notify features of selection with display field (for history tracking)
+                features.callOnSelect(&self.feature_states, selected_item.display);
 
                 // Allow features to perform pre-shutdown cleanup
                 const all_completed = features.callOnExit(&self.feature_states, config.exit_timeout_ms);
@@ -458,8 +462,9 @@ pub const App = struct {
                     std.log.warn("Some features did not complete onExit within timeout", .{});
                 }
 
+                // Output value field only to stdout
                 const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
-                _ = try stdout_file.write(selected);
+                _ = try stdout_file.write(selected_item.value);
                 _ = try stdout_file.write("\n");
             }
             return true;
@@ -570,10 +575,27 @@ pub const App = struct {
             if (item_index >= self.state.items.items.len) continue;
 
             const item = self.state.items.items[item_index];
-            const item_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item}) catch continue;
-            const item_w, _ = self.sdl.font.getStringSize(item_text) catch continue;
 
-            const total_item_width = @as(f32, @floatFromInt(item_w)) + (config.layout.width_padding * 2.0);
+            // Measure display field width
+            const display_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item.display}) catch continue;
+            const display_w, _ = self.sdl.font.getStringSize(display_text) catch continue;
+
+            var total_item_width = @as(f32, @floatFromInt(display_w));
+
+            // Add value preview width if shown
+            if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
+                const preview_len = if (config.multivalue.preview_max_length > 0)
+                    @min(item.value.len, config.multivalue.preview_max_length)
+                else
+                    item.value.len;
+
+                const preview_text = std.fmt.bufPrint(self.render_ctx.value_preview_buffer, "{s}", .{item.value[0..preview_len]}) catch continue;
+                const preview_w, _ = self.sdl.font.getStringSize(preview_text) catch continue;
+
+                total_item_width += config.multivalue.preview_spacing + @as(f32, @floatFromInt(preview_w));
+            }
+
+            total_item_width += config.layout.width_padding * 2.0;
             if (total_item_width > max_width) max_width = total_item_width;
         }
 
@@ -692,10 +714,26 @@ pub const App = struct {
                 const is_selected = (i == self.state.selected_index);
                 const prefix = if (is_selected) "> " else "  ";
 
-                const item_text = std.fmt.bufPrintZ(self.render_ctx.item_buffer, "{s}{s}", .{ prefix, item }) catch "  [error]";
+                // Render display field with prefix
+                const display_text = std.fmt.bufPrintZ(self.render_ctx.item_buffer, "{s}{s}", .{ prefix, item.display }) catch "  [error]";
+                const display_color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
+                try self.renderText(5.0 * scale, y_pos, display_text, display_color);
 
-                const color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
-                try self.renderText(5.0 * scale, y_pos, item_text, color);
+                // Render value preview if enabled and different from display
+                if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
+                    // Measure display text width for positioning
+                    const display_w, _ = try self.sdl.font.getStringSize(display_text);
+                    const value_x = 5.0 * scale + @as(f32, @floatFromInt(display_w)) + config.multivalue.preview_spacing * scale;
+
+                    // Truncate value preview if needed
+                    const preview_text = if (config.multivalue.preview_max_length > 0 and item.value.len > config.multivalue.preview_max_length) blk: {
+                        const truncate_len = input.findUtf8Boundary(item.value, config.multivalue.preview_max_length);
+                        break :blk std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}...", .{item.value[0..truncate_len]}) catch "...";
+                    } else std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}", .{item.value}) catch "...";
+
+                    // Use dimmed color (never use selected color for preview)
+                    try self.renderText(value_x, y_pos, preview_text, self.color_scheme.value_preview);
+                }
 
                 y_pos += config.layout.item_line_height * scale;
             }

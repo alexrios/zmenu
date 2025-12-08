@@ -29,7 +29,7 @@ pub const features = struct {
     /// Clipboard: copy selected items to system clipboard
     /// When enabled, pressing Enter copies to both clipboard AND stdout
     /// Degrades gracefully in headless/SSH environments (warns but continues)
-    pub const clipboard: bool = false;
+    pub const clipboard: bool = true;
 
 };
 
@@ -42,6 +42,22 @@ pub const MatchMode = enum {
 /// Graceful shutdown timeout for onExit hooks (milliseconds)
 /// Features exceeding this timeout will be logged but not blocked
 pub const exit_timeout_ms: u32 = 500;
+
+// ============================================================================
+// MULTI-VALUE ITEMS
+// ============================================================================
+
+/// Multi-value item configuration for display|value format
+pub const multivalue = struct {
+    /// Show value field as preview (dimmed text after display)
+    pub const show_preview: bool = true;
+
+    /// Maximum characters to show in value preview (0 = unlimited)
+    pub const preview_max_length: usize = 50;
+
+    /// Spacing between display and value preview (logical pixels)
+    pub const preview_spacing: f32 = 10.0;
+};
 
 // ============================================================================
 // WINDOW
@@ -68,6 +84,7 @@ pub const colors = struct {
     pub const foreground: sdl.pixels.Color = theme.default.foreground;
     pub const selected: sdl.pixels.Color = theme.default.selected;
     pub const prompt: sdl.pixels.Color = theme.default.prompt;
+    pub const value_preview: sdl.pixels.Color = theme.default.value_preview;
 };
 
 // ============================================================================
@@ -85,6 +102,7 @@ pub const limits = struct {
     pub const item_buffer_size: usize = max_item_length + 16;
     pub const count_buffer_size: usize = 64;
     pub const scroll_buffer_size: usize = 64;
+    pub const value_preview_buffer_size: usize = 128;
 };
 
 // ============================================================================

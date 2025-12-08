@@ -1,6 +1,7 @@
 //! Application state definitions
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// Input loading state (tagged union for type-safe state management)
 pub const InputState = union(enum) {
@@ -15,7 +16,7 @@ pub const InputState = union(enum) {
 /// Application state for input, items, and selection
 pub const AppState = struct {
     input_buffer: std.ArrayList(u8),
-    items: std.ArrayList([]const u8),
+    items: std.ArrayList(types.Item),
     filtered_items: std.ArrayList(usize),
     selected_index: usize,
     scroll_offset: usize,
@@ -25,7 +26,7 @@ pub const AppState = struct {
 
     pub const empty = AppState{
         .input_buffer = std.ArrayList(u8).empty,
-        .items = std.ArrayList([]const u8).empty,
+        .items = std.ArrayList(types.Item).empty,
         .filtered_items = std.ArrayList(usize).empty,
         .selected_index = 0,
         .scroll_offset = 0,
@@ -45,7 +46,7 @@ test "AppState - text input respects loading state" {
     var state = AppState.empty;
     defer {
         state.input_buffer.deinit(allocator);
-        for (state.items.items) |item| allocator.free(item);
+        for (state.items.items) |item| item.deinit(allocator);
         state.items.deinit(allocator);
         state.filtered_items.deinit(allocator);
     }
@@ -75,7 +76,7 @@ test "AppState - loading counter accuracy during transitions" {
     var state = AppState.empty;
     defer {
         state.input_buffer.deinit(allocator);
-        for (state.items.items) |item| allocator.free(item);
+        for (state.items.items) |item| item.deinit(allocator);
         state.items.deinit(allocator);
         state.filtered_items.deinit(allocator);
     }
@@ -84,13 +85,13 @@ test "AppState - loading counter accuracy during transitions" {
     try std.testing.expectEqual(@as(usize, 0), state.input_state.loading.items_loaded);
 
     // Simulate item loading (as in app.zig:351)
-    try state.items.append(allocator, try allocator.dupe(u8, "item1"));
+    try state.items.append(allocator, try types.Item.parse(allocator, "item1"));
     state.input_state.loading.items_loaded += 1;
 
-    try state.items.append(allocator, try allocator.dupe(u8, "item2"));
+    try state.items.append(allocator, try types.Item.parse(allocator, "item2"));
     state.input_state.loading.items_loaded += 1;
 
-    try state.items.append(allocator, try allocator.dupe(u8, "item3"));
+    try state.items.append(allocator, try types.Item.parse(allocator, "item3"));
     state.input_state.loading.items_loaded += 1;
 
     // Verify counter matches actual items
@@ -102,9 +103,9 @@ test "AppState - loading counter accuracy during transitions" {
 
     // Verify data integrity preserved across transition
     try std.testing.expectEqual(@as(usize, 3), state.items.items.len);
-    try std.testing.expectEqualStrings("item1", state.items.items[0]);
-    try std.testing.expectEqualStrings("item2", state.items.items[1]);
-    try std.testing.expectEqualStrings("item3", state.items.items[2]);
+    try std.testing.expectEqualStrings("item1", state.items.items[0].display);
+    try std.testing.expectEqualStrings("item2", state.items.items[1].display);
+    try std.testing.expectEqualStrings("item3", state.items.items[2].display);
 }
 
 test "AppState - state machine invariants" {
@@ -118,7 +119,7 @@ test "AppState - state machine invariants" {
     var state = AppState.empty;
     defer {
         state.input_buffer.deinit(allocator);
-        for (state.items.items) |item| allocator.free(item);
+        for (state.items.items) |item| item.deinit(allocator);
         state.items.deinit(allocator);
         state.filtered_items.deinit(allocator);
     }
@@ -129,7 +130,7 @@ test "AppState - state machine invariants" {
     try std.testing.expectEqual(@as(usize, 0), state.items.items.len);
 
     // Simulate loading process
-    try state.items.append(allocator, try allocator.dupe(u8, "test"));
+    try state.items.append(allocator, try types.Item.parse(allocator, "test"));
     state.input_state.loading.items_loaded = 1;
 
     // Invariant 2: Counter matches reality

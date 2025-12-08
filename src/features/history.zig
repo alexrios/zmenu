@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config");
 const features_mod = @import("../features.zig");
+const types = @import("../types.zig");
 
 pub const history_config = struct {
     pub const max_entries: usize = if (@hasDecl(config.features, "history_max_entries"))
@@ -186,7 +187,7 @@ fn onDeinit(state_ptr: ?features_mod.FeatureState, _: std.mem.Allocator) void {
 fn afterFilter(
     state_ptr: ?features_mod.FeatureState,
     filtered_items: *std.ArrayList(usize),
-    all_items: []const []const u8,
+    all_items: []const types.Item,
 ) void {
     const state: *HistoryState = if (state_ptr) |ptr|
         @ptrCast(@alignCast(ptr))
@@ -202,13 +203,13 @@ fn afterFilter(
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         const idx = items[i];
-        const item_text = all_items[idx];
+        const item_text = all_items[idx].display;
         const item_pos = state.getPosition(item_text);
 
         var j = i;
         while (j > 0) {
             const prev_idx = items[j - 1];
-            const prev_text = all_items[prev_idx];
+            const prev_text = all_items[prev_idx].display;
             const prev_pos = state.getPosition(prev_text);
 
             const should_swap = blk: {
@@ -340,16 +341,16 @@ test "History afterFilter - basic reordering correctness" {
     state.addEntry("very_recent_item"); // Position 0 (most recent)
 
     // Create items list
-    var all_items = std.ArrayList([]const u8).empty;
+    var all_items = std.ArrayList(types.Item).empty;
     defer {
-        for (all_items.items) |item| allocator.free(item);
+        for (all_items.items) |item| item.deinit(allocator);
         all_items.deinit(allocator);
     }
 
-    try all_items.append(allocator, try allocator.dupe(u8, "other_item"));
-    try all_items.append(allocator, try allocator.dupe(u8, "very_recent_item"));
-    try all_items.append(allocator, try allocator.dupe(u8, "recent_item"));
-    try all_items.append(allocator, try allocator.dupe(u8, "another_item"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "other_item"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "very_recent_item"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "recent_item"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "another_item"));
 
     // Create filtered indices (all items match)
     var filtered = std.ArrayList(usize).empty;
@@ -395,17 +396,17 @@ test "History afterFilter - rapid updates" {
     state.addEntry("history2");
     state.addEntry("history3");
 
-    var all_items = std.ArrayList([]const u8).empty;
+    var all_items = std.ArrayList(types.Item).empty;
     defer {
-        for (all_items.items) |item| allocator.free(item);
+        for (all_items.items) |item| item.deinit(allocator);
         all_items.deinit(allocator);
     }
 
-    try all_items.append(allocator, try allocator.dupe(u8, "other1"));
-    try all_items.append(allocator, try allocator.dupe(u8, "history3"));
-    try all_items.append(allocator, try allocator.dupe(u8, "history2"));
-    try all_items.append(allocator, try allocator.dupe(u8, "history1"));
-    try all_items.append(allocator, try allocator.dupe(u8, "other2"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "other1"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "history3"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "history2"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "history1"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "other2"));
 
     // Simulate 10 rapid filter updates
     var iteration: usize = 0;

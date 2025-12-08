@@ -6,6 +6,7 @@
 const std = @import("std");
 const sdl = @import("sdl3");
 const config = @import("config");
+const types = @import("types.zig");
 
 /// Feature state handle (opaque pointer to feature-specific state)
 pub const FeatureState = *anyopaque;
@@ -75,7 +76,7 @@ pub const Hooks = struct {
     onDeinit: ?*const fn (?FeatureState, std.mem.Allocator) void = null,
 
     /// Called after filtering - can reorder filtered_items
-    afterFilter: ?*const fn (?FeatureState, *std.ArrayList(usize), []const []const u8) void = null,
+    afterFilter: ?*const fn (?FeatureState, *std.ArrayList(usize), []const types.Item) void = null,
 
     /// Called when user selects an item (presses Enter)
     onSelect: ?*const fn (?FeatureState, []const u8) void = null,
@@ -354,7 +355,7 @@ pub fn deinitAll(states: *FeatureStates, allocator: std.mem.Allocator) void {
 pub fn callAfterFilter(
     states: *FeatureStates,
     filtered_items: *std.ArrayList(usize),
-    all_items: []const []const u8,
+    all_items: []const types.Item,
 ) void {
     if (enabled_count == 0) return;
 
@@ -480,7 +481,7 @@ test "Feature hooks - handle empty filtered items gracefully" {
     var filtered = std.ArrayList(usize).empty;
     defer filtered.deinit(allocator);
 
-    var items = std.ArrayList([]const u8).empty;
+    var items = std.ArrayList(types.Item).empty;
     defer items.deinit(allocator);
 
     var states = initStates();
@@ -489,12 +490,12 @@ test "Feature hooks - handle empty filtered items gracefully" {
     callAfterFilter(&states, &filtered, items.items);
 
     // Test 2: Add one item
-    try items.append(allocator, try allocator.dupe(u8, "single"));
+    try items.append(allocator, try types.Item.parse(allocator, "single"));
     try filtered.append(allocator, 0);
 
     callAfterFilter(&states, &filtered, items.items);
 
     // Cleanup
-    for (items.items) |item| allocator.free(item);
+    for (items.items) |item| item.deinit(allocator);
     deinitAll(&states, allocator);
 }
