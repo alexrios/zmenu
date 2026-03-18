@@ -6,6 +6,7 @@
 //!   - Copy config.def.zig to config.zig and customize, then rebuild
 
 const std = @import("std");
+const builtin = @import("builtin");
 const app = @import("app.zig");
 const features = @import("features.zig");
 const config = @import("config");
@@ -29,7 +30,7 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
     inline for (features.enabled_features, 0..) |feature, feat_idx| {
         if (feature.cli_flags) |flags| {
             for (flags) |flag| {
-                const value = try parseFlag(args, flag, allocator);
+                const value = try parseFlag(args, flag);
                 if (value) |v| {
                     try result.values.items[feat_idx].append(allocator, v);
                 } else if (flag.default) |default_val| {
@@ -54,16 +55,13 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
 }
 
 /// Parse a single flag from args
-fn parseFlag(args: []const []const u8, flag: features.CliFlag, allocator: std.mem.Allocator) !?features.FlagValue {
+fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagValue {
     var i: usize = 1; // Skip program name
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
-        // Check long flag
-        const long_flag = std.fmt.allocPrint(allocator, "--{s}", .{flag.long}) catch unreachable;
-        defer allocator.free(long_flag);
-
-        if (std.mem.eql(u8, arg, long_flag)) {
+        // Check long flag (no allocation: match "--" prefix then compare suffix)
+        if (std.mem.startsWith(u8, arg, "--") and std.mem.eql(u8, arg[2..], flag.long)) {
             return switch (flag.value_type) {
                 .bool => features.FlagValue{ .bool = true },
                 .string => blk: {
@@ -120,9 +118,16 @@ fn parseFlag(args: []const []const u8, flag: features.CliFlag, allocator: std.me
 }
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Use DebugAllocator in debug builds for leak detection,
+    // SmpAllocator in release builds for production performance
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = if (builtin.mode == .Debug)
+        debug_alloc.allocator()
+    else
+        std.heap.smp_allocator;
+    defer if (builtin.mode == .Debug) {
+        _ = debug_alloc.deinit();
+    };
 
     // Check for --version or --features flag
     const args = try std.process.argsAlloc(allocator);
@@ -255,6 +260,34 @@ fn printHelp() void {
     ) catch {};
 
     stdout.flush() catch {};
+}
+
+test "parseFlag - uses no heap allocation for flag matching" {
+    // Bug: parseFlag used allocPrint + catch unreachable to build "--flagname"
+    // for comparison. This is UB in release on OOM. The fix should use
+    // std.mem.startsWith which requires zero allocation.
+
+    const test_flag = features.CliFlag{
+        .long = "test-flag",
+        .short = 't',
+        .description = "A test flag",
+        .value_type = .bool,
+    };
+
+    // This should work without any allocator — zero allocations needed
+    const args = &[_][]const u8{ "zmenu", "--test-flag" };
+    const result = parseFlag(args, test_flag) catch |err| {
+        std.debug.print("BUG: parseFlag failed with allocator error: {}\n", .{err});
+        return error.TestExpectedEqual;
+    };
+
+    // Should find the flag
+    if (result) |val| {
+        try std.testing.expect(val.bool == true);
+    } else {
+        std.debug.print("BUG: parseFlag didn't find --test-flag\n", .{});
+        return error.TestExpectedEqual;
+    }
 }
 
 // Re-export tests from modules

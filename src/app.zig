@@ -38,7 +38,7 @@ pub const App = struct {
 
 
         // Create window and renderer
-        const window_result = try sdl_context.createWindow(monitor_index);
+        const window_result = try sdl_context.createWindow(allocator, monitor_index);
         const window = window_result.window;
         const renderer = window_result.renderer;
         errdefer renderer.deinit();
@@ -135,8 +135,8 @@ pub const App = struct {
         var running = true;
 
         // Check if stdin is a TTY (no piped input)
-        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
-            const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+        if (std.posix.isatty(std.fs.File.stdin().handle)) {
+            const stderr = std.fs.File.stderr();
             _ = stderr.write("Error: No items provided on stdin\n") catch {};
             _ = stderr.write("Usage: echo -e \"Item 1\\nItem 2\" | zmenu\n") catch {};
             return error.NoItemsProvided;
@@ -181,7 +181,7 @@ pub const App = struct {
 
                 // Handle empty stdin case
                 if (self.state.items.items.len == 0) {
-                    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+                    const stderr = std.fs.File.stderr();
                     _ = stderr.write("Error: No items provided on stdin\n") catch {};
                     return error.NoItemsProvided;
                 }
@@ -255,7 +255,7 @@ pub const App = struct {
         }
 
         fn readerThreadFn(self: *ThreadedStdinReader) void {
-            const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+            const stdin_file = std.fs.File.stdin();
             var chunk_buffer: [4096]u8 = undefined;
             var line_buffer = std.ArrayList(u8).empty;
             defer line_buffer.deinit(self.allocator);
@@ -471,7 +471,7 @@ pub const App = struct {
                 }
 
                 // Output value field only to stdout
-                const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+                const stdout_file = std.fs.File.stdout();
                 _ = try stdout_file.write(selected_item.value);
                 _ = try stdout_file.write("\n");
             }

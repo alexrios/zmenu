@@ -66,11 +66,10 @@ pub fn getDisplayBounds(display: sdl.video.Display) !struct { x: i32, y: i32, w:
 }
 
 /// Create window and renderer with configured settings
-pub fn createWindow(monitor_index: ?usize) !struct { window: sdl.video.Window, renderer: sdl.render.Renderer } {
+pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct { window: sdl.video.Window, renderer: sdl.render.Renderer } {
     // Validate monitor if specified
     var target_display: ?sdl.video.Display = null;
     if (monitor_index) |idx| {
-        const allocator = std.heap.page_allocator;
         const displays = getDisplays(allocator) catch |err| {
             std.log.err("Failed to enumerate displays: {}", .{err});
             return error.FailedToEnumerateDisplays;
@@ -148,11 +147,11 @@ pub fn loadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
     }
 
     // No fonts found
-    const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const stderr = std.fs.File.stderr();
     _ = stderr.write("Error: Could not find any suitable font. Tried:\n") catch {};
     for (config.default_font_paths) |font_path| {
-        const msg = std.fmt.allocPrint(std.heap.page_allocator, "  - {s}\n", .{font_path}) catch continue;
-        defer std.heap.page_allocator.free(msg);
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "  - {s}\n", .{font_path}) catch continue;
         _ = stderr.write(msg) catch {};
     }
     return error.NoFontFound;
