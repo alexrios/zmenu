@@ -360,7 +360,7 @@ pub const App = struct {
         } else {
             const query = self.state.input_buffer.items;
             for (self.state.items.items, 0..) |item, i| {
-                if (input.fuzzyMatch(item.display, query)) {
+                if (input.matchItem(item.display, query)) {
                     try self.state.filtered_items.append(self.allocator, i);
                 }
             }

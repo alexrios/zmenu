@@ -136,21 +136,39 @@ pub const HistoryState = struct {
 };
 
 fn getHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.posix.getenv("XDG_DATA_HOME")) |xdg_data| {
-        return std.fmt.allocPrint(allocator, "{s}/zmenu/{s}", .{ xdg_data, history_config.filename });
-    }
+    const sep = std.fs.path.sep_str;
 
-    if (std.posix.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(allocator, "{s}/.local/share/zmenu/{s}", .{ home, history_config.filename });
-    }
-
-    if (builtin.os.tag == .windows) {
-        if (std.posix.getenv("APPDATA")) |appdata| {
-            return std.fmt.allocPrint(allocator, "{s}\\zmenu\\{s}", .{ appdata, history_config.filename });
+    if (comptime builtin.os.tag == .windows) {
+        // Windows: use APPDATA
+        const appdata = std.process.getEnvVarOwned(allocator, "APPDATA") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return error.NoHomeDirectory,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer allocator.free(appdata);
+        return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ appdata, history_config.filename });
+    } else if (comptime builtin.os.tag == .macos) {
+        // macOS: ~/Library/Application Support/zmenu/ (XDG override respected)
+        if (std.posix.getenv("XDG_DATA_HOME")) |xdg_data| {
+            return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ xdg_data, history_config.filename });
         }
-    }
 
-    return error.NoHomeDirectory;
+        if (std.posix.getenv("HOME")) |home| {
+            return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "Library" ++ sep ++ "Application Support" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ home, history_config.filename });
+        }
+
+        return error.NoHomeDirectory;
+    } else {
+        // Linux/other Unix: XDG_DATA_HOME or ~/.local/share/zmenu/
+        if (std.posix.getenv("XDG_DATA_HOME")) |xdg_data| {
+            return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ xdg_data, history_config.filename });
+        }
+
+        if (std.posix.getenv("HOME")) |home| {
+            return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ ".local" ++ sep ++ "share" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ home, history_config.filename });
+        }
+
+        return error.NoHomeDirectory;
+    }
 }
 
 fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.FeatureState {
@@ -170,7 +188,11 @@ fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.Featur
         history_config.max_entries;
 
     // Load or create history state with custom settings
-    const state = try HistoryState.loadWithConfig(allocator, custom_path, max_entries);
+    // Degrade gracefully if history path can't be resolved (e.g., missing HOME)
+    const state = HistoryState.loadWithConfig(allocator, custom_path, max_entries) catch |err| {
+        std.log.warn("history feature unavailable: {}", .{err});
+        return null;
+    };
     return @ptrCast(state);
 }
 
@@ -195,32 +217,30 @@ fn afterFilter(
     if (filtered_items.items.len <= 1) return;
     if (state.entries.items.len == 0) return;
 
-    // Insertion sort: history items first (by recency), then non-history
+    // Build a lookup map: display text → history position (O(N) where N = history entries)
+    var position_map = std.StringHashMap(usize).init(state.allocator);
+    defer position_map.deinit();
+    position_map.ensureTotalCapacity(@intCast(state.entries.items.len)) catch return;
+    for (state.entries.items, 0..) |entry, pos| {
+        position_map.put(entry, pos) catch return;
+    }
+
+    // Insertion sort using O(1) lookups instead of O(N) getPosition scans
     const items = filtered_items.items;
 
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         const idx = items[i];
-        const item_text = all_items[idx].display;
-        const item_pos = state.getPosition(item_text);
+        const item_pos = position_map.get(all_items[idx].display);
 
         var j = i;
         while (j > 0) {
-            const prev_idx = items[j - 1];
-            const prev_text = all_items[prev_idx].display;
-            const prev_pos = state.getPosition(prev_text);
+            const prev_pos = position_map.get(all_items[items[j - 1]].display);
 
-            const should_swap = blk: {
-                if (item_pos) |ip| {
-                    if (prev_pos) |pp| {
-                        break :blk ip < pp;
-                    } else {
-                        break :blk true;
-                    }
-                } else {
-                    break :blk false;
-                }
-            };
+            const should_swap = if (item_pos) |ip|
+                if (prev_pos) |pp| ip < pp else true
+            else
+                false;
 
             if (!should_swap) break;
 
@@ -408,6 +428,56 @@ test "HistoryState - save creates nested directories" {
 
     // Clean up
     std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+}
+
+test "History afterFilter - matches on display field not value" {
+    // History tracks display text. When items have display|value format,
+    // afterFilter should boost items based on display match, not value.
+
+    const allocator = std.testing.allocator;
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, "/tmp/test_history"),
+        .max_entries = 100,
+    };
+    defer {
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    // History tracks "Firefox" (display text, not value "/usr/bin/firefox")
+    state.addEntry("Firefox");
+
+    var all_items = std.ArrayList(types.Item).empty;
+    defer {
+        for (all_items.items) |item| item.deinit(allocator);
+        all_items.deinit(allocator);
+    }
+
+    // Items with display|value format
+    try all_items.append(allocator, try types.Item.parse(allocator, "Chrome|/usr/bin/chrome"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "Firefox|/usr/bin/firefox"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "Terminal|/usr/bin/terminal"));
+
+    var filtered = std.ArrayList(usize).empty;
+    defer filtered.deinit(allocator);
+    try filtered.append(allocator, 0); // Chrome
+    try filtered.append(allocator, 1); // Firefox
+    try filtered.append(allocator, 2); // Terminal
+
+    const state_ptr: ?features_mod.FeatureState = @ptrCast(&state);
+    afterFilter(state_ptr, &filtered, all_items.items);
+
+    // Firefox should be boosted to first position (matched by display "Firefox")
+    try std.testing.expectEqual(@as(usize, 1), filtered.items[0]);
+    // All items preserved
+    try std.testing.expectEqual(@as(usize, 3), filtered.items.len);
+
+    // Verify: an item whose VALUE matches history but DISPLAY doesn't should NOT be boosted
+    // (none of our items have value="Firefox", so this is implicitly tested)
 }
 
 test "History afterFilter - rapid updates" {

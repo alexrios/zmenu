@@ -1,25 +1,57 @@
 //! Input handling and text matching utilities for zmenu
 
 const std = @import("std");
+const config = @import("config");
+
+/// Normalize a character for comparison based on config.features.case_sensitive
+inline fn normalizeChar(ch: u8) u8 {
+    if (config.features.case_sensitive) return ch;
+    return if (ch < 128) std.ascii.toLower(ch) else ch;
+}
+
+/// Match items against a query using the configured match mode and case sensitivity.
+/// Dispatches to fuzzy, prefix, or exact matching based on config.features.match_mode.
+pub fn matchItem(haystack: []const u8, needle: []const u8) bool {
+    return switch (config.features.match_mode) {
+        .fuzzy => fuzzyMatch(haystack, needle),
+        .prefix => prefixMatch(haystack, needle),
+        .exact => exactMatch(haystack, needle),
+    };
+}
 
 /// Fuzzy match: check if all characters in needle appear in haystack (in order)
-/// Case-insensitive for ASCII, exact match for UTF-8 non-ASCII
 pub fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
     var h_idx: usize = 0;
     for (needle) |n_char| {
-        // Handle UTF-8 gracefully - only process valid ASCII for case-insensitive match
-        const n_lower = if (n_char < 128) std.ascii.toLower(n_char) else n_char;
+        const n_norm = normalizeChar(n_char);
         var found = false;
         while (h_idx < haystack.len) : (h_idx += 1) {
-            const h_char = haystack[h_idx];
-            const h_lower = if (h_char < 128) std.ascii.toLower(h_char) else h_char;
-            if (h_lower == n_lower) {
+            const h_norm = normalizeChar(haystack[h_idx]);
+            if (h_norm == n_norm) {
                 h_idx += 1;
                 found = true;
                 break;
             }
         }
         if (!found) return false;
+    }
+    return true;
+}
+
+/// Prefix match: haystack must start with needle
+pub fn prefixMatch(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    for (haystack[0..needle.len], needle) |h, n| {
+        if (normalizeChar(h) != normalizeChar(n)) return false;
+    }
+    return true;
+}
+
+/// Exact match: haystack must equal needle
+pub fn exactMatch(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len != needle.len) return false;
+    for (haystack, needle) |h, n| {
+        if (normalizeChar(h) != normalizeChar(n)) return false;
     }
     return true;
 }
@@ -82,10 +114,50 @@ test "fuzzyMatch - basic matching" {
     try std.testing.expect(!fuzzyMatch("hello world", "dlrow"));
 }
 
-test "fuzzyMatch - case insensitive" {
-    try std.testing.expect(fuzzyMatch("Hello World", "hello"));
-    try std.testing.expect(fuzzyMatch("HELLO WORLD", "hello"));
-    try std.testing.expect(fuzzyMatch("HeLLo WoRLD", "hw"));
+test "fuzzyMatch - case behavior follows config" {
+    // With default config (case_sensitive=false), these should match
+    if (!config.features.case_sensitive) {
+        try std.testing.expect(fuzzyMatch("Hello World", "hello"));
+        try std.testing.expect(fuzzyMatch("HELLO WORLD", "hello"));
+        try std.testing.expect(fuzzyMatch("HeLLo WoRLD", "hw"));
+    }
+}
+
+test "prefixMatch - basic" {
+    try std.testing.expect(prefixMatch("hello world", "hello"));
+    try std.testing.expect(prefixMatch("hello", "hello"));
+    try std.testing.expect(prefixMatch("hello", ""));
+    try std.testing.expect(!prefixMatch("hello", "world"));
+    try std.testing.expect(!prefixMatch("hello", "hello world"));
+}
+
+test "prefixMatch - case behavior follows config" {
+    if (!config.features.case_sensitive) {
+        try std.testing.expect(prefixMatch("Hello World", "hello"));
+        try std.testing.expect(prefixMatch("HELLO", "hello"));
+    }
+}
+
+test "exactMatch - basic" {
+    try std.testing.expect(exactMatch("hello", "hello"));
+    try std.testing.expect(exactMatch("", ""));
+    try std.testing.expect(!exactMatch("hello", "hell"));
+    try std.testing.expect(!exactMatch("hello", "hello world"));
+}
+
+test "exactMatch - case behavior follows config" {
+    if (!config.features.case_sensitive) {
+        try std.testing.expect(exactMatch("Hello", "hello"));
+        try std.testing.expect(exactMatch("HELLO", "hello"));
+    }
+}
+
+test "matchItem - dispatches to configured mode" {
+    // With default config (match_mode=fuzzy), matchItem should do fuzzy matching
+    if (config.features.match_mode == .fuzzy) {
+        try std.testing.expect(matchItem("hello world", "hw"));
+        try std.testing.expect(!matchItem("hello world", "xyz"));
+    }
 }
 
 test "fuzzyMatch - UTF-8 safe" {
@@ -100,6 +172,13 @@ test "findUtf8Boundary - no truncation needed" {
     const text = "hello";
     try std.testing.expectEqual(@as(usize, 5), findUtf8Boundary(text, 10));
     try std.testing.expectEqual(@as(usize, 5), findUtf8Boundary(text, 5));
+}
+
+test "findUtf8Boundary - max_len zero" {
+    try std.testing.expectEqual(@as(usize, 0), findUtf8Boundary("hello", 0));
+    try std.testing.expectEqual(@as(usize, 0), findUtf8Boundary("café", 0));
+    try std.testing.expectEqual(@as(usize, 0), findUtf8Boundary("日本語", 0));
+    try std.testing.expectEqual(@as(usize, 0), findUtf8Boundary("", 0));
 }
 
 test "findUtf8Boundary - ASCII truncation" {
