@@ -23,6 +23,7 @@ pub const HistoryState = struct {
     entries: std.ArrayList([]const u8),
     history_path: []const u8,
     max_entries: usize,
+    dirty: bool = false,
 
     pub fn load(allocator: std.mem.Allocator) !*HistoryState {
         return loadWithConfig(allocator, null, history_config.max_entries);
@@ -70,6 +71,8 @@ pub const HistoryState = struct {
     }
 
     pub fn save(self: *HistoryState) void {
+        if (!self.dirty) return;
+
         if (std.fs.path.dirname(self.history_path)) |dir| {
             std.fs.cwd().makePath(dir) catch |err| {
                 std.log.warn("could not create history dir: {}", .{err});
@@ -89,13 +92,14 @@ pub const HistoryState = struct {
         }
     }
 
-    /// Add entry (moves to front if exists)
+    /// Add entry (moves to front if exists). Marks state as dirty.
     pub fn addEntry(self: *HistoryState, item: []const u8) void {
-        // Remove if exists
+        // Remove if exists (modifies state, so mark dirty)
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry, item)) {
                 self.allocator.free(entry);
                 _ = self.entries.orderedRemove(i);
+                self.dirty = true;
                 break;
             }
         }
@@ -106,6 +110,7 @@ pub const HistoryState = struct {
             self.allocator.free(new_entry);
             return;
         };
+        self.dirty = true;
 
         // Trim to max (use instance max_entries)
         while (self.entries.items.len > self.max_entries) {
@@ -478,6 +483,63 @@ test "History afterFilter - matches on display field not value" {
 
     // Verify: an item whose VALUE matches history but DISPLAY doesn't should NOT be boosted
     // (none of our items have value="Firefox", so this is implicitly tested)
+}
+
+test "HistoryState - save skipped when no changes made" {
+    // Reproduces: onDeinit always calls save(), rewriting the history file even
+    // when the user pressed Escape (no selection, nothing changed). A dirty flag
+    // should prevent unnecessary file I/O.
+
+    const allocator = std.testing.allocator;
+
+    const test_path = "/tmp/zmenu_test_dirty_flag_history";
+
+    // Clean up any previous artifacts
+    std.fs.deleteFileAbsolute(test_path) catch {};
+
+    // Create state and add entries (simulates loading from file)
+    var state = HistoryState{
+        .allocator = allocator,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, test_path),
+        .max_entries = 100,
+        .dirty = false,
+    };
+    defer {
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    // No addEntry called — dirty should remain false
+    try std.testing.expect(!state.dirty);
+
+    // Save should be a no-op when not dirty
+    state.save();
+
+    // File should NOT exist (save was skipped)
+    const file_exists = blk: {
+        std.fs.accessAbsolute(test_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(!file_exists);
+
+    // Now add an entry — dirty should become true
+    state.addEntry("test_item");
+    try std.testing.expect(state.dirty);
+
+    // Save should write the file now
+    state.save();
+
+    // File should exist
+    const file_exists2 = blk: {
+        std.fs.accessAbsolute(test_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    try std.testing.expect(file_exists2);
+
+    // Clean up
+    std.fs.deleteFileAbsolute(test_path) catch {};
 }
 
 test "History afterFilter - rapid updates" {

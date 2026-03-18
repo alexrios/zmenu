@@ -30,7 +30,14 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
     inline for (features.enabled_features, 0..) |feature, feat_idx| {
         if (feature.cli_flags) |flags| {
             for (flags) |flag| {
-                const value = try parseFlag(args, flag);
+                const value = parseFlag(args, flag) catch |err| {
+                    switch (err) {
+                        error.MissingFlagValue => std.log.err("--{s} requires a value", .{flag.long}),
+                        error.InvalidFlagValue => std.log.err("--{s} requires a valid value", .{flag.long}),
+                        else => std.log.err("unexpected error parsing --{s}: {}", .{ flag.long, err }),
+                    }
+                    return err;
+                };
                 if (value) |v| {
                     try result.values.items[feat_idx].append(allocator, v);
                 } else if (flag.default) |default_val| {
@@ -54,7 +61,14 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
     return result;
 }
 
-/// Parse a single flag from args
+/// Check if a value argument looks like a flag (starts with "-")
+fn looksLikeFlag(value: []const u8) bool {
+    return value.len > 0 and value[0] == '-';
+}
+
+/// Parse a single flag from args.
+/// Returns the parsed value, null if not found, or an error.
+/// Caller is responsible for user-facing error messages.
 fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagValue {
     var i: usize = 1; // Skip program name
     while (i < args.len) : (i += 1) {
@@ -62,59 +76,42 @@ fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagVa
 
         // Check long flag (no allocation: match "--" prefix then compare suffix)
         if (std.mem.startsWith(u8, arg, "--") and std.mem.eql(u8, arg[2..], flag.long)) {
-            return switch (flag.value_type) {
-                .bool => features.FlagValue{ .bool = true },
-                .string => blk: {
-                    if (i + 1 >= args.len) {
-                        std.log.err("--{s} requires a value", .{flag.long});
-                        return error.MissingFlagValue;
-                    }
-                    break :blk features.FlagValue{ .string = args[i + 1] };
-                },
-                .int => blk: {
-                    if (i + 1 >= args.len) {
-                        std.log.err("--{s} requires a numeric value", .{flag.long});
-                        return error.MissingFlagValue;
-                    }
-                    const value = std.fmt.parseInt(i64, args[i + 1], 10) catch {
-                        std.log.err("--{s} requires a valid integer (got: '{s}')", .{ flag.long, args[i + 1] });
-                        return error.InvalidFlagValue;
-                    };
-                    break :blk features.FlagValue{ .int = value };
-                },
-            };
+            return try parseFlagValue(args, i, flag);
         }
 
         // Check short flag
         if (flag.short) |short_char| {
             const short_flag = &[_]u8{ '-', short_char };
             if (std.mem.eql(u8, arg, short_flag)) {
-                return switch (flag.value_type) {
-                    .bool => features.FlagValue{ .bool = true },
-                    .string => blk: {
-                        if (i + 1 >= args.len) {
-                            std.log.err("-{c} requires a value", .{short_char});
-                            return error.MissingFlagValue;
-                        }
-                        break :blk features.FlagValue{ .string = args[i + 1] };
-                    },
-                    .int => blk: {
-                        if (i + 1 >= args.len) {
-                            std.log.err("-{c} requires a numeric value", .{short_char});
-                            return error.MissingFlagValue;
-                        }
-                        const value = std.fmt.parseInt(i64, args[i + 1], 10) catch {
-                            std.log.err("-{c} requires a valid integer (got: '{s}')", .{ short_char, args[i + 1] });
-                            return error.InvalidFlagValue;
-                        };
-                        break :blk features.FlagValue{ .int = value };
-                    },
-                };
+                return try parseFlagValue(args, i, flag);
             }
         }
     }
 
     return null; // Flag not found
+}
+
+/// Extract the value for a matched flag at position i in args.
+fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !features.FlagValue {
+    return switch (flag.value_type) {
+        .bool => features.FlagValue{ .bool = true },
+        .string => blk: {
+            if (i + 1 >= args.len or looksLikeFlag(args[i + 1])) {
+                return error.MissingFlagValue;
+            }
+            break :blk features.FlagValue{ .string = args[i + 1] };
+        },
+        .int => blk: {
+            // Int flags don't check looksLikeFlag — negative numbers start with "-"
+            if (i + 1 >= args.len) {
+                return error.MissingFlagValue;
+            }
+            const value = std.fmt.parseInt(i64, args[i + 1], 10) catch {
+                return error.InvalidFlagValue;
+            };
+            break :blk features.FlagValue{ .int = value };
+        },
+    };
 }
 
 pub fn main() !void {
@@ -260,6 +257,81 @@ fn printHelp() void {
     ) catch {};
 
     stdout.flush() catch {};
+}
+
+test "parseFlag - string flag rejects value that looks like another flag" {
+    // --hist-file --hist-limit (user forgot the path argument).
+    // parseFlag should reject values starting with "-" for string/int flags.
+
+    const string_flag = features.CliFlag{
+        .long = "hist-file",
+        .short = 'H',
+        .description = "Custom history file path",
+        .value_type = .string,
+    };
+
+    // Missing value: next arg is another flag
+    const args = &[_][]const u8{ "zmenu", "--hist-file", "--hist-limit" };
+    const result = parseFlag(args, string_flag);
+    try std.testing.expectError(error.MissingFlagValue, result);
+}
+
+test "parseFlag - short flag rejects value that looks like a flag" {
+    const string_flag = features.CliFlag{
+        .long = "hist-file",
+        .short = 'H',
+        .description = "Custom history file path",
+        .value_type = .string,
+    };
+
+    const args = &[_][]const u8{ "zmenu", "-H", "--something" };
+    const result = parseFlag(args, string_flag);
+    try std.testing.expectError(error.MissingFlagValue, result);
+}
+
+test "parseFlag - int flag accepts negative values" {
+    const int_flag = features.CliFlag{
+        .long = "offset",
+        .description = "An offset value",
+        .value_type = .int,
+    };
+
+    const args = &[_][]const u8{ "zmenu", "--offset", "-5" };
+    const result = try parseFlag(args, int_flag);
+    if (result) |val| {
+        try std.testing.expectEqual(@as(i64, -5), val.int);
+    } else {
+        return error.TestExpectedEqual;
+    }
+}
+
+test "parseFlag - int flag rejects non-numeric value" {
+    const int_flag = features.CliFlag{
+        .long = "offset",
+        .description = "An offset value",
+        .value_type = .int,
+    };
+
+    const args = &[_][]const u8{ "zmenu", "--offset", "--other-flag" };
+    const result = parseFlag(args, int_flag);
+    try std.testing.expectError(error.InvalidFlagValue, result);
+}
+
+test "parseFlag - string flag accepts normal value" {
+    const string_flag = features.CliFlag{
+        .long = "hist-file",
+        .short = 'H',
+        .description = "Custom history file path",
+        .value_type = .string,
+    };
+
+    const args = &[_][]const u8{ "zmenu", "--hist-file", "/tmp/history" };
+    const result = try parseFlag(args, string_flag);
+    if (result) |val| {
+        try std.testing.expectEqualStrings("/tmp/history", val.string);
+    } else {
+        return error.TestExpectedEqual;
+    }
 }
 
 test "parseFlag - uses no heap allocation for flag matching" {

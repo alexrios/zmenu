@@ -240,6 +240,62 @@ test "deleteLastCodepoint - UTF-8 three-byte character" {
     try std.testing.expectEqual(@as(usize, 1), buffer.items.len);
 }
 
+test "deleteWord - ASCII whitespace then word" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, "hello world");
+    deleteWord(&buffer);
+    try std.testing.expectEqualStrings("hello ", buffer.items);
+}
+
+test "deleteWord - UTF-8 word with trailing spaces" {
+    // Verifies that pop() for whitespace stripping is safe:
+    // pop() only runs when getLast() matches ' ' or '\t' (single-byte ASCII).
+    // UTF-8 continuation bytes (0x80-0xBF) never match these values.
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, "hello café  ");
+    deleteWord(&buffer);
+    // Should strip trailing spaces, then delete "café" via deleteLastCodepoint
+    try std.testing.expectEqualStrings("hello ", buffer.items);
+}
+
+test "deleteWord - UTF-8 only word" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, "日本語");
+    deleteWord(&buffer);
+    try std.testing.expectEqualStrings("", buffer.items);
+}
+
+test "deleteWord - mixed ASCII then multi-byte" {
+    // Verifies deleteLastCodepoint correctly removes trailing multi-byte
+    // characters without stomping ASCII prefix bytes.
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, "abc日本");
+    deleteWord(&buffer);
+    try std.testing.expectEqualStrings("", buffer.items);
+}
+
+test "deleteWord - word boundary between ASCII and UTF-8" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator, "hello 日本語");
+    deleteWord(&buffer);
+    try std.testing.expectEqualStrings("hello ", buffer.items);
+}
+
 test "deleteLastCodepoint - empty buffer" {
     const allocator = std.testing.allocator;
     var buffer = std.ArrayList(u8).empty;
