@@ -71,11 +71,9 @@ pub const HistoryState = struct {
 
     pub fn save(self: *HistoryState) void {
         if (std.fs.path.dirname(self.history_path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| {
-                if (err != error.PathAlreadyExists) {
-                    std.log.warn("could not create history dir: {}", .{err});
-                    return;
-                }
+            std.fs.cwd().makePath(dir) catch |err| {
+                std.log.warn("could not create history dir: {}", .{err});
+                return;
             };
         }
 
@@ -374,6 +372,43 @@ test "History afterFilter - basic reordering correctness" {
     try std.testing.expectEqual(@as(usize, 4), filtered.items.len); // No items lost
 }
 
+
+test "HistoryState - save creates nested directories" {
+    const allocator = std.testing.allocator;
+
+    // Use a deeply nested path where intermediate dirs don't exist
+    const nested_path = "/tmp/zmenu_test_nested/level1/level2/level3/history";
+
+    // Clean up any previous test artifacts
+    std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, nested_path),
+        .max_entries = 100,
+    };
+    defer {
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    state.addEntry("test_item");
+    state.save();
+
+    // Verify the file was actually created
+    const file = std.fs.openFileAbsolute(nested_path, .{}) catch |err| {
+        std.debug.print("BUG: save() failed to create file with nested dirs: {}\n", .{err});
+        // Clean up
+        std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+        return error.TestExpectedEqual;
+    };
+    file.close();
+
+    // Clean up
+    std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+}
 
 test "History afterFilter - rapid updates" {
     // This test simulates rapid filter updates (like user typing quickly).

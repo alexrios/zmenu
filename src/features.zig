@@ -327,8 +327,11 @@ pub fn initStates() FeatureStates {
 }
 
 /// Initialize all enabled features - called from App.init()
+/// On failure, cleans up any features that were already initialized.
 pub fn initAll(allocator: std.mem.Allocator, states: *FeatureStates, parsed_flags: *const ParsedFlags) !void {
     if (enabled_count == 0) return;
+
+    errdefer deinitAll(states, allocator);
 
     inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.onInit) |initFn| {

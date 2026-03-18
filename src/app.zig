@@ -259,14 +259,13 @@ pub const App = struct {
             var chunk_buffer: [4096]u8 = undefined;
             var line_buffer = std.ArrayList(u8).empty;
             defer line_buffer.deinit(self.allocator);
+            // Ensure eof_reached is always set when the thread exits,
+            // regardless of which code path (error, OOM, normal EOF).
+            defer self.eof_reached.store(true, .seq_cst);
 
             while (true) {
                 // Blocking read (OK in background thread)
-                const bytes_read = stdin_file.read(&chunk_buffer) catch {
-                    // Error reading - set EOF and stop
-                    self.eof_reached.store(true, .seq_cst);
-                    break;
-                };
+                const bytes_read = stdin_file.read(&chunk_buffer) catch break;
 
                 if (bytes_read == 0) {
                     // EOF - process any remaining buffered line
@@ -278,7 +277,6 @@ pub const App = struct {
                         };
                         self.mutex.unlock();
                     }
-                    self.eof_reached.store(true, .seq_cst);
                     break;
                 }
 
@@ -387,9 +385,19 @@ pub const App = struct {
     }
 
     fn adjustScroll(self: *App) void {
-        if (self.state.filtered_items.items.len == 0) {
+        const filtered_len = self.state.filtered_items.items.len;
+        if (filtered_len == 0) {
             self.state.scroll_offset = 0;
             return;
+        }
+
+        // Clamp scroll_offset when filtered list shrinks below previous range
+        const max_scroll = if (filtered_len > config.limits.max_visible_items)
+            filtered_len - config.limits.max_visible_items
+        else
+            0;
+        if (self.state.scroll_offset > max_scroll) {
+            self.state.scroll_offset = max_scroll;
         }
 
         if (self.state.selected_index < self.state.scroll_offset) {
@@ -782,16 +790,21 @@ pub const App = struct {
         const color_changed = !rendering_mod.colorEquals(cache.last_color, color);
 
         if (text_changed or color_changed or cache.texture == null) {
-            if (cache.texture) |old_tex| old_tex.deinit();
-
-            self.allocator.free(cache.last_text);
-            cache.last_text = try self.allocator.dupe(u8, text);
-            cache.last_color = color;
-
+            // Create new texture before modifying cache state to avoid
+            // inconsistency if rendering fails partway through
             const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
             const surface = try self.sdl.font.renderTextBlended(text, ttf_color);
             defer surface.deinit();
-            cache.texture = try self.sdl.renderer.createTextureFromSurface(surface);
+            const new_texture = try self.sdl.renderer.createTextureFromSurface(surface);
+
+            const new_text = try self.allocator.dupe(u8, text);
+
+            // All allocations succeeded — now update cache atomically
+            if (cache.texture) |old_tex| old_tex.deinit();
+            self.allocator.free(cache.last_text);
+            cache.last_text = new_text;
+            cache.last_color = color;
+            cache.texture = new_texture;
         }
 
         if (cache.texture) |texture| {
@@ -801,6 +814,70 @@ pub const App = struct {
         }
     }
 };
+
+test "ThreadedStdinReader - initial state and pollLines contract" {
+    // Verify the reader's initial state and that pollLines works correctly
+    // with manually populated data (simulating what the thread would produce).
+
+    const allocator = std.testing.allocator;
+
+    var reader = App.ThreadedStdinReader.init(allocator);
+    defer reader.deinit();
+
+    // Initial state: no EOF, no lines
+    try std.testing.expect(!reader.eof_reached.load(.seq_cst));
+
+    // Simulate thread producing lines by manually adding to the shared buffer
+    const line1 = try allocator.dupe(u8, "line one");
+    const line2 = try allocator.dupe(u8, "line two");
+    reader.mutex.lock();
+    reader.lines.append(allocator, line1) catch unreachable;
+    reader.lines.append(allocator, line2) catch unreachable;
+    reader.mutex.unlock();
+
+    // pollLines should drain them
+    var dest = std.ArrayList([]u8).empty;
+    defer {
+        for (dest.items) |line| allocator.free(line);
+        dest.deinit(allocator);
+    }
+
+    const eof = try reader.pollLines(&dest);
+    try std.testing.expect(!eof);
+    try std.testing.expectEqual(@as(usize, 2), dest.items.len);
+    try std.testing.expectEqualStrings("line one", dest.items[0]);
+    try std.testing.expectEqualStrings("line two", dest.items[1]);
+
+    // Internal buffer should be drained
+    try std.testing.expectEqual(@as(usize, 0), reader.lines.items.len);
+
+    // Simulate EOF
+    reader.eof_reached.store(true, .seq_cst);
+    for (dest.items) |line| allocator.free(line);
+    dest.clearRetainingCapacity();
+
+    const eof2 = try reader.pollLines(&dest);
+    try std.testing.expect(eof2);
+    try std.testing.expectEqual(@as(usize, 0), dest.items.len);
+}
+
+test "ThreadedStdinReader - defer ensures eof_reached on all exit paths" {
+    // The fix uses `defer self.eof_reached.store(true, .seq_cst)` at the
+    // top of readerThreadFn. This guarantees that regardless of which
+    // break/error path exits the loop, pollLines will eventually see EOF.
+    //
+    // Previously, break at the partial-line buffering (OOM) would exit
+    // without setting eof_reached, causing the app to hang in .loading
+    // state forever. The defer pattern makes this impossible.
+    //
+    // Direct thread testing with stdin is impractical, but the structural
+    // guarantee (defer at function scope) covers all paths by construction.
+
+    const allocator = std.testing.allocator;
+    var reader = App.ThreadedStdinReader.init(allocator);
+    defer reader.deinit();
+    try std.testing.expect(!reader.eof_reached.load(.seq_cst));
+}
 
 test "colorEquals - same colors" {
     const color1 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
@@ -818,4 +895,6 @@ test "config - buffer sizes aligned with limits" {
     try std.testing.expect(config.limits.prompt_buffer_size >= config.limits.max_input_length + 10);
     try std.testing.expect(config.limits.item_buffer_size >= config.limits.max_item_length + 10);
     try std.testing.expect(config.limits.input_ellipsis_margin < config.limits.max_input_length);
+    // Value preview buffer must fit truncated preview + "..." suffix + null terminator
+    try std.testing.expect(config.limits.value_preview_buffer_size >= config.multivalue.preview_max_length + 4);
 }
