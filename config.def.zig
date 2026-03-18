@@ -132,7 +132,9 @@ pub const layout = struct {
 // ============================================================================
 
 pub const font = struct {
-    /// Custom font path (null = use platform defaults)
+    /// Use embedded Crimson Pro font (true = embedded, false = system fonts)
+    pub const use_embedded: bool = true;
+    /// Custom font path (null = use embedded or platform defaults)
     pub const path: ?[:0]const u8 = null;
     pub const size: f32 = 22;
 };

@@ -6,6 +6,9 @@ const std = @import("std");
 const sdl = @import("sdl3");
 const config = @import("config");
 
+/// Embedded Crimson Pro font (compiled into binary)
+const embedded_font_data = @embedFile("assets/fonts/CrimsonPro-Regular.ttf");
+
 /// SDL context holding window, renderer, and font
 pub const SDLContext = struct {
     window: sdl.video.Window,
@@ -125,9 +128,9 @@ pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct
     return .{ .window = window, .renderer = renderer };
 }
 
-/// Load font with platform-specific fallback
+/// Load font with embedded/custom/system fallback
 pub fn loadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
-    // If user specified a custom font path, try only that
+    // Priority 1: User specified a custom font path
     if (config.font.path) |custom_path| {
         const font = sdl.ttf.Font.init(custom_path, config.font.size) catch |err| {
             std.log.err("Failed to load font '{s}': {}", .{ custom_path, err });
@@ -136,7 +139,17 @@ pub fn loadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
         return .{ .font = font, .path = custom_path };
     }
 
-    // Try platform-specific default fonts in order
+    // Priority 2: Try embedded font if enabled
+    if (config.font.use_embedded) {
+        if (loadEmbeddedFont()) |font| {
+            std.log.info("Loaded embedded font: Crimson Pro Regular", .{});
+            return .{ .font = font, .path = "(embedded: Crimson Pro)" };
+        } else |err| {
+            std.log.warn("Failed to load embedded font: {}, trying system fonts", .{err});
+        }
+    }
+
+    // Priority 3: Try platform-specific default fonts in order
     for (config.default_font_paths) |font_path| {
         if (sdl.ttf.Font.init(font_path, config.font.size)) |font| {
             std.log.info("Successfully loaded font: {s}", .{font_path});
@@ -149,10 +162,23 @@ pub fn loadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
     // No fonts found
     const stderr = std.fs.File.stderr();
     _ = stderr.write("Error: Could not find any suitable font. Tried:\n") catch {};
+    if (config.font.use_embedded) {
+        _ = stderr.write("  - (embedded: Crimson Pro)\n") catch {};
+    }
     for (config.default_font_paths) |font_path| {
         var buf: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "  - {s}\n", .{font_path}) catch continue;
         _ = stderr.write(msg) catch {};
     }
     return error.NoFontFound;
+}
+
+/// Load font from embedded binary data.
+/// Safety: close_io=true only frees the SDL_IOStream struct, not the underlying
+/// memory. embedded_font_data lives in the binary's read-only segment via @embedFile
+/// and is never freed by SDL_CloseIO. Verified against SDL3 source.
+fn loadEmbeddedFont() !sdl.ttf.Font {
+    const stream = try sdl.io_stream.Stream.initFromConstMem(embedded_font_data);
+    errdefer stream.deinit() catch {};
+    return try sdl.ttf.Font.initFromIO(stream, true, config.font.size);
 }
