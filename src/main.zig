@@ -129,6 +129,13 @@ const RenderContext = struct {
     current_height: u32,
 };
 
+const EventAction = enum {
+    none,
+    quit,
+    confirm,
+    state_changed,
+};
+
 const App = struct {
     sdl: SdlContext,
     state: AppState,
@@ -358,8 +365,6 @@ const App = struct {
     }
 
     fn updateFilter(self: *App) !void {
-        const prev_filtered_count = self.state.filtered_items.items.len;
-
         self.state.filtered_items.clearRetainingCapacity();
 
         if (self.state.input_buffer.items.len == 0) {
@@ -389,10 +394,7 @@ const App = struct {
         // Adjust scroll to keep selection visible
         self.adjustScroll();
 
-        // Update window size if filtered count changed
-        if (prev_filtered_count != self.state.filtered_items.items.len) {
-            try self.updateWindowSize();
-        }
+        self.state.needs_render = true;
     }
 
     fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
@@ -498,7 +500,6 @@ const App = struct {
         }
 
         try self.updateFilter();
-        self.state.needs_render = true;
     }
 
     fn updateDisplayScale(self: *App) !void {
@@ -516,42 +517,35 @@ const App = struct {
         self.state.needs_render = true;
     }
 
-    fn handleKeyEvent(self: *App, event: sdl.events.Keyboard) !bool {
-        const key = event.key orelse return false;
+    fn processKeyEvent(self: *App, event: sdl.events.Keyboard) !EventAction {
+        const key = event.key orelse return .none;
 
         if (key == .escape) {
-            return true; // Quit without selection
+            return .quit;
         } else if (key == .return_key or key == .kp_enter) {
-            // Output selected item and quit
-            if (self.state.filtered_items.items.len > 0) {
-                const selected = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
-                // Cross-platform: std.posix maps to Windows/POSIX appropriately
-                const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
-                _ = try stdout_file.write(selected);
-                _ = try stdout_file.write("\n");
-            }
-            return true;
+            return .confirm;
         } else if (key == .backspace) {
             if (self.state.input_buffer.items.len > 0) {
                 self.deleteLastCodepoint();
                 try self.updateFilter();
-                self.state.needs_render = true;
+                return .state_changed;
             }
         } else if (key == .u and (event.mod.left_control or event.mod.right_control)) {
             // Ctrl+U: Clear input
             self.state.input_buffer.clearRetainingCapacity();
             try self.updateFilter();
-            self.state.needs_render = true;
+            return .state_changed;
         } else if (key == .w and (event.mod.left_control or event.mod.right_control)) {
             // Ctrl+W: Delete last word
             try self.deleteWord();
+            return .state_changed;
         } else if (key == .up or key == .k) {
             self.navigate(-1);
         } else if (key == .down or key == .j) {
             self.navigate(1);
         } else if (key == .c and (event.mod.left_control or event.mod.right_control)) {
             // Ctrl+C: Quit without selection
-            return true;
+            return .quit;
         } else if (key == .tab) {
             if (event.mod.left_shift or event.mod.right_shift) {
                 self.navigate(-1); // Shift+Tab: previous
@@ -568,17 +562,25 @@ const App = struct {
             self.navigatePage(1);
         }
 
-        return false;
+        return .none;
     }
 
-    fn handleTextInput(self: *App, text: []const u8) !void {
+    fn processTextInput(self: *App, text: []const u8) !EventAction {
         // Check if adding this text would exceed max input length
         if (self.state.input_buffer.items.len + text.len <= self.config.limits.max_input_length) {
             try self.state.input_buffer.appendSlice(self.allocator, text);
             try self.updateFilter();
-            self.state.needs_render = true;
+            return .state_changed;
         }
         // Silently ignore input that would exceed the limit
+        return .none;
+    }
+
+    fn getSelectedItem(self: *App) ?[]const u8 {
+        if (self.state.filtered_items.items.len == 0) return null;
+        const item_index = self.state.filtered_items.items[self.state.selected_index];
+        if (item_index >= self.state.items.items.len) return null;
+        return self.state.items.items[item_index];
     }
 
     fn renderText(self: *App, x: f32, y: f32, text: [:0]const u8, color: sdl.pixels.Color) !void {
@@ -823,6 +825,23 @@ const App = struct {
         }
     }
 
+    fn handleAction(self: *App, action: EventAction) !bool {
+        switch (action) {
+            .quit => return true,
+            .confirm => {
+                if (self.getSelectedItem()) |selected| {
+                    const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+                    _ = try stdout_file.write(selected);
+                    _ = try stdout_file.write("\n");
+                }
+                return true;
+            },
+            .state_changed => try self.updateWindowSize(),
+            .none => {},
+        }
+        return false;
+    }
+
     fn run(self: *App) !void {
         var running = true;
 
@@ -841,12 +860,12 @@ const App = struct {
                         .quit => running = false,
                         .terminating => running = false,
                         .key_down => |key_event| {
-                            if (try self.handleKeyEvent(key_event)) {
-                                running = false;
-                            }
+                            const action = try self.processKeyEvent(key_event);
+                            if (try self.handleAction(action)) running = false;
                         },
                         .text_input => |text_event| {
-                            try self.handleTextInput(text_event.text);
+                            const action = try self.processTextInput(text_event.text);
+                            if (try self.handleAction(action)) running = false;
                         },
                         .window_display_scale_changed => {
                             // Display DPI/scale changed - update our scale factor
@@ -1165,4 +1184,271 @@ test "NoItemsProvided error propagates correctly" {
     // when stdin is a TTY (interactive terminal)
     const err = error.NoItemsProvided;
     try std.testing.expectEqual(error.NoItemsProvided, err);
+}
+
+// ============================================================================
+// TEST HELPERS
+// ============================================================================
+
+fn createTestApp(allocator: std.mem.Allocator, items: []const []const u8) !App {
+    var app = App{
+        .sdl = .{
+            .window = undefined,
+            .renderer = undefined,
+            .font = undefined,
+            .loaded_font_path = undefined,
+        },
+        .state = .{
+            .input_buffer = std.ArrayList(u8).empty,
+            .items = std.ArrayList([]const u8).empty,
+            .filtered_items = std.ArrayList(usize).empty,
+            .selected_index = 0,
+            .scroll_offset = 0,
+            .needs_render = false,
+        },
+        .render_ctx = .{
+            .prompt_buffer = undefined,
+            .item_buffer = undefined,
+            .count_buffer = undefined,
+            .scroll_buffer = undefined,
+            .prompt_cache = undefined,
+            .count_cache = undefined,
+            .no_match_cache = undefined,
+            .display_scale = 1.0,
+            .pixel_width = 800,
+            .pixel_height = 300,
+            .current_width = 800,
+            .current_height = 300,
+        },
+        .config = Config{},
+        .allocator = allocator,
+    };
+
+    for (items) |item| {
+        try app.state.items.append(allocator, item);
+    }
+    try app.updateFilter();
+
+    return app;
+}
+
+fn deinitTestApp(app: *App) void {
+    app.state.input_buffer.deinit(app.allocator);
+    app.state.items.deinit(app.allocator);
+    app.state.filtered_items.deinit(app.allocator);
+}
+
+fn makeKeyEvent(key: sdl.keycode.Keycode, mod: sdl.keycode.KeyModifier) sdl.events.Keyboard {
+    return .{
+        .key = key,
+        .scancode = null,
+        .mod = mod,
+        .down = true,
+        .repeat = false,
+        .raw = 0,
+        .id = null,
+        .window_id = null,
+        .common = .{ .timestamp = 0 },
+    };
+}
+
+fn makeKey(key: sdl.keycode.Keycode) sdl.events.Keyboard {
+    return makeKeyEvent(key, .{});
+}
+
+fn makeCtrlKey(key: sdl.keycode.Keycode) sdl.events.Keyboard {
+    return makeKeyEvent(key, .{ .left_control = true });
+}
+
+// ============================================================================
+// EVENT PROCESSING INTEGRATION TESTS
+// ============================================================================
+
+test "processKeyEvent - escape returns quit" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana" });
+    defer deinitTestApp(&app);
+
+    const action = try app.processKeyEvent(makeKey(.escape));
+    try std.testing.expectEqual(EventAction.quit, action);
+}
+
+test "processKeyEvent - enter returns confirm" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana" });
+    defer deinitTestApp(&app);
+
+    const action = try app.processKeyEvent(makeKey(.return_key));
+    try std.testing.expectEqual(EventAction.confirm, action);
+}
+
+test "processKeyEvent - ctrl+c returns quit" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana" });
+    defer deinitTestApp(&app);
+
+    const action = try app.processKeyEvent(makeCtrlKey(.c));
+    try std.testing.expectEqual(EventAction.quit, action);
+}
+
+test "processKeyEvent - navigation changes selected index" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.selected_index);
+
+    _ = try app.processKeyEvent(makeKey(.down));
+    try std.testing.expectEqual(@as(usize, 1), app.state.selected_index);
+
+    _ = try app.processKeyEvent(makeKey(.down));
+    try std.testing.expectEqual(@as(usize, 2), app.state.selected_index);
+
+    // Can't go past the end
+    _ = try app.processKeyEvent(makeKey(.down));
+    try std.testing.expectEqual(@as(usize, 2), app.state.selected_index);
+
+    _ = try app.processKeyEvent(makeKey(.up));
+    try std.testing.expectEqual(@as(usize, 1), app.state.selected_index);
+}
+
+test "processKeyEvent - vim navigation (j/k)" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processKeyEvent(makeKey(.j));
+    try std.testing.expectEqual(@as(usize, 1), app.state.selected_index);
+
+    _ = try app.processKeyEvent(makeKey(.k));
+    try std.testing.expectEqual(@as(usize, 0), app.state.selected_index);
+}
+
+test "processKeyEvent - home and end" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processKeyEvent(makeKey(.end));
+    try std.testing.expectEqual(@as(usize, 2), app.state.selected_index);
+
+    _ = try app.processKeyEvent(makeKey(.home));
+    try std.testing.expectEqual(@as(usize, 0), app.state.selected_index);
+}
+
+test "getSelectedItem - returns correct item after navigation" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    try std.testing.expectEqualStrings("Apple", app.getSelectedItem().?);
+
+    _ = try app.processKeyEvent(makeKey(.down));
+    try std.testing.expectEqualStrings("Banana", app.getSelectedItem().?);
+
+    _ = try app.processKeyEvent(makeKey(.end));
+    try std.testing.expectEqualStrings("Cherry", app.getSelectedItem().?);
+}
+
+test "processTextInput - filters items" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    try std.testing.expectEqual(@as(usize, 3), app.state.filtered_items.items.len);
+
+    const action = try app.processTextInput("ban");
+    try std.testing.expectEqual(EventAction.state_changed, action);
+    try std.testing.expectEqual(@as(usize, 1), app.state.filtered_items.items.len);
+    try std.testing.expectEqualStrings("Banana", app.getSelectedItem().?);
+}
+
+test "processTextInput - no matches" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processTextInput("xyz");
+    try std.testing.expectEqual(@as(usize, 0), app.state.filtered_items.items.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), app.getSelectedItem());
+}
+
+test "processKeyEvent - backspace clears filter" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processTextInput("ban");
+    try std.testing.expectEqual(@as(usize, 1), app.state.filtered_items.items.len);
+
+    // Backspace removes last char, filter updates
+    const action = try app.processKeyEvent(makeKey(.backspace));
+    try std.testing.expectEqual(EventAction.state_changed, action);
+    try std.testing.expectEqualStrings("ba", app.state.input_buffer.items);
+    try std.testing.expectEqual(@as(usize, 1), app.state.filtered_items.items.len);
+}
+
+test "processKeyEvent - ctrl+u clears input" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processTextInput("ban");
+    try std.testing.expectEqual(@as(usize, 1), app.state.filtered_items.items.len);
+
+    const action = try app.processKeyEvent(makeCtrlKey(.u));
+    try std.testing.expectEqual(EventAction.state_changed, action);
+    try std.testing.expectEqual(@as(usize, 0), app.state.input_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.state.filtered_items.items.len);
+}
+
+test "full flow - type to filter, navigate, confirm" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Avocado", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    // Type "av" to filter to Avocado only
+    _ = try app.processTextInput("av");
+    try std.testing.expectEqual(@as(usize, 1), app.state.filtered_items.items.len);
+    try std.testing.expectEqualStrings("Avocado", app.getSelectedItem().?);
+
+    // Clear filter and navigate to Cherry
+    _ = try app.processKeyEvent(makeCtrlKey(.u));
+    try std.testing.expectEqual(@as(usize, 4), app.state.filtered_items.items.len);
+    _ = try app.processKeyEvent(makeKey(.end));
+    try std.testing.expectEqualStrings("Cherry", app.getSelectedItem().?);
+
+    // Confirm selection
+    const action = try app.processKeyEvent(makeKey(.return_key));
+    try std.testing.expectEqual(EventAction.confirm, action);
+    try std.testing.expectEqualStrings("Cherry", app.getSelectedItem().?);
+}
+
+test "full flow - clear filter restores all items" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana", "Cherry" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processTextInput("ch");
+    try std.testing.expectEqual(@as(usize, 1), app.state.filtered_items.items.len);
+
+    _ = try app.processKeyEvent(makeCtrlKey(.u));
+    try std.testing.expectEqual(@as(usize, 3), app.state.filtered_items.items.len);
+}
+
+test "full flow - tab navigation wraps not" {
+    const allocator = std.testing.allocator;
+    var app = try createTestApp(allocator, &.{ "Apple", "Banana" });
+    defer deinitTestApp(&app);
+
+    _ = try app.processKeyEvent(makeKey(.tab));
+    try std.testing.expectEqual(@as(usize, 1), app.state.selected_index);
+
+    // Tab at the end stays at end (no wrapping)
+    _ = try app.processKeyEvent(makeKey(.tab));
+    try std.testing.expectEqual(@as(usize, 1), app.state.selected_index);
+
+    // Shift+Tab goes back
+    _ = try app.processKeyEvent(makeKeyEvent(.tab, .{ .left_shift = true }));
+    try std.testing.expectEqual(@as(usize, 0), app.state.selected_index);
 }
