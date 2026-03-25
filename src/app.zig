@@ -237,7 +237,6 @@ pub const App = struct {
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) ThreadedStdinReader {
-            // GPA is already thread-safe, no wrapper needed
             return ThreadedStdinReader{
                 .thread = undefined,
                 .thread_started = false,
@@ -342,11 +341,40 @@ pub const App = struct {
             const item = try types.Item.parse(self.allocator, final_line);
             try self.state.items.append(self.allocator, item);
 
+            // Update cached max item width (measure once on ingest, not per frame)
+            const item_width = self.measureItemWidth(item);
+            if (item_width > self.render_ctx.cached_max_item_width) {
+                self.render_ctx.cached_max_item_width = item_width;
+            }
+
             // Increment items loaded counter if we're in loading state
             if (self.state.input_state == .loading) {
                 self.state.input_state.loading.items_loaded += 1;
             }
         }
+    }
+
+    /// Measure the rendered width of an item (display + optional value preview).
+    /// Used once per item on ingest to maintain the cached max width.
+    fn measureItemWidth(self: *App, item: types.Item) f32 {
+        const display_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item.display}) catch return 0;
+        const display_w, _ = self.sdl.font.getStringSize(display_text) catch return 0;
+        var total: f32 = @floatFromInt(display_w);
+
+        if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
+            const preview_len = if (config.multivalue.preview_max_length > 0)
+                @min(item.value.len, config.multivalue.preview_max_length)
+            else
+                item.value.len;
+
+            const preview_text = std.fmt.bufPrint(self.render_ctx.value_preview_buffer, "{s}", .{item.value[0..preview_len]}) catch return total;
+            const preview_w, _ = self.sdl.font.getStringSize(preview_text) catch return total;
+
+            total += config.multivalue.preview_spacing + @as(f32, @floatFromInt(preview_w));
+        }
+
+        total += config.layout.width_padding * 2.0;
+        return total;
     }
 
     fn updateFilter(self: *App) !void {
@@ -574,37 +602,10 @@ pub const App = struct {
         const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (config.layout.width_padding * 3.0);
         if (base_width > max_width) max_width = base_width;
 
-        // Measure currently visible items (accounting for scroll offset)
-        const visible_start = self.state.scroll_offset;
-        const visible_end = @min(visible_start + config.limits.max_visible_items, filtered_len);
-
-        for (visible_start..visible_end) |i| {
-            const item_index = self.state.filtered_items.items[i];
-            if (item_index >= self.state.items.items.len) continue;
-
-            const item = self.state.items.items[item_index];
-
-            // Measure display field width
-            const display_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item.display}) catch continue;
-            const display_w, _ = self.sdl.font.getStringSize(display_text) catch continue;
-
-            var total_item_width = @as(f32, @floatFromInt(display_w));
-
-            // Add value preview width if shown
-            if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
-                const preview_len = if (config.multivalue.preview_max_length > 0)
-                    @min(item.value.len, config.multivalue.preview_max_length)
-                else
-                    item.value.len;
-
-                const preview_text = std.fmt.bufPrint(self.render_ctx.value_preview_buffer, "{s}", .{item.value[0..preview_len]}) catch continue;
-                const preview_w, _ = self.sdl.font.getStringSize(preview_text) catch continue;
-
-                total_item_width += config.multivalue.preview_spacing + @as(f32, @floatFromInt(preview_w));
-            }
-
-            total_item_width += config.layout.width_padding * 2.0;
-            if (total_item_width > max_width) max_width = total_item_width;
+        // Use cached max item width (measured once per item on ingest)
+        // instead of re-measuring visible items every frame
+        if (self.render_ctx.cached_max_item_width > max_width) {
+            max_width = self.render_ctx.cached_max_item_width;
         }
 
         const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));

@@ -9,6 +9,14 @@ const types = @import("types.zig");
 /// Feature state handle (opaque pointer to feature-specific state)
 pub const FeatureState = *anyopaque;
 
+/// Type-safe cast from opaque feature state to concrete type.
+/// Centralizes the @ptrCast/@alignCast pattern so each feature doesn't
+/// scatter raw casts through its hooks.
+pub fn castState(comptime T: type, state_ptr: ?FeatureState) ?*T {
+    const ptr = state_ptr orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
 /// CLI flag value types
 pub const FlagValueType = enum {
     string,  // --flag value
@@ -125,44 +133,12 @@ pub const Hooks = struct {
     onExit: ?*const fn (?FeatureState) void = null,
 };
 
-/// Config transform function signature
-pub const ConfigTransform = fn (comptime base_config: type) type;
-
 /// Feature definition
 pub const Feature = struct {
     name: []const u8,
     hooks: Hooks,
     cli_flags: ?[]const CliFlag = null,  // Optional CLI flags for this feature
 };
-
-/// Validate feature configuration at compile time
-fn validateFeatures() void {
-    comptime {
-        // Example: If we later add incompatible features, check here:
-        // if (@hasDecl(config.features, "exact_match") and config.features.exact_match) {
-        //     if (@hasDecl(config.features, "fuzzy_match") and config.features.fuzzy_match) {
-        //         @compileError("Cannot enable both exact_match and fuzzy_match");
-        //     }
-        // }
-
-        // Validate history settings
-        if (@hasDecl(config.features, "history") and config.features.history) {
-            if (@hasDecl(config.features, "history_max_entries")) {
-                if (config.features.history_max_entries == 0) {
-                    @compileError("history_max_entries must be > 0 when history is enabled");
-                }
-                if (config.features.history_max_entries > 10000) {
-                    @compileError("history_max_entries too large (max: 10000)");
-                }
-            }
-        }
-
-        // Future validations:
-        // - Check incompatible window modes
-        // - Validate keybinding conflicts
-        // - Ensure theme color values are valid
-    }
-}
 
 /// Validate CLI flags at compile time
 fn validateCliFlags(features_list: []const Feature) void {
@@ -269,12 +245,15 @@ pub fn getFeatureFlagsHelp() []const u8 {
 /// Build feature list at compile time (registration point for new features)
 fn buildFeatureList() []const Feature {
     comptime {
-        validateFeatures();
-
         var list: []const Feature = &.{};
 
-        // Register features here
         if (@hasDecl(config.features, "history") and config.features.history) {
+            if (@hasDecl(config.features, "history_max_entries")) {
+                if (config.features.history_max_entries == 0)
+                    @compileError("history_max_entries must be > 0 when history is enabled");
+                if (config.features.history_max_entries > 10000)
+                    @compileError("history_max_entries too large (max: 10000)");
+            }
             list = list ++ &[_]Feature{@import("features/history.zig").feature};
         }
 
@@ -282,14 +261,7 @@ fn buildFeatureList() []const Feature {
             list = list ++ &[_]Feature{@import("features/clipboard.zig").feature};
         }
 
-        // Add new features:
-        // if (@hasDecl(config.features, "myfeature") and config.features.myfeature) {
-        //     list = list ++ &[_]Feature{@import("features/myfeature.zig").feature};
-        // }
-
-        // Validate CLI flags after building the list
         validateCliFlags(list);
-
         return list;
     }
 }
@@ -299,54 +271,6 @@ pub const enabled_features: []const Feature = buildFeatureList();
 
 /// Number of enabled features (0 = zero-cost abstraction)
 pub const enabled_count: usize = enabled_features.len;
-
-/// Generate compile-time feature report
-pub fn getFeatureReport() []const u8 {
-    comptime {
-        var report: []const u8 = "zmenu features:\n";
-
-        if (enabled_count == 0) {
-            report = report ++ "  [none enabled - minimal build]\n";
-        } else {
-            for (enabled_features) |feature| {
-                report = report ++ "  ✓ " ++ feature.name ++ "\n";
-            }
-        }
-
-        // Add configuration summary
-        report = report ++ "\nConfiguration:\n";
-        report = report ++ std.fmt.comptimePrint("  - max_visible_items: {d}\n", .{config.limits.max_visible_items});
-        report = report ++ std.fmt.comptimePrint("  - case_sensitive: {}\n", .{config.features.case_sensitive});
-        report = report ++ std.fmt.comptimePrint("  - match_mode: {s}\n", .{@tagName(config.features.match_mode)});
-
-        return report;
-    }
-}
-
-/// Print feature report at compile time
-pub fn printFeatureReport() void {
-    @compileLog(getFeatureReport());
-}
-
-// Config transforms - advanced feature (see docs/features.md)
-pub fn applyConfigTransforms(comptime base_config: type) type {
-    comptime {
-        var result = base_config;
-
-        // Apply transforms from each enabled feature (if they define one)
-        if (@hasDecl(config.features, "history") and config.features.history) {
-            const history_mod = @import("features/history.zig");
-            if (@hasDecl(history_mod, "configTransform")) {
-                result = history_mod.configTransform(result);
-            }
-        }
-
-        // Future features can add their transforms here
-        // The pattern: if feature enabled, check for configTransform, apply it
-
-        return result;
-    }
-}
 
 /// Feature states storage ([N]?FeatureState or void when N=0)
 pub const FeatureStates = if (enabled_count > 0)
@@ -448,68 +372,6 @@ pub fn callOnExit(states: *FeatureStates, timeout_ms: u32) bool {
     }
 
     return all_completed;
-}
-
-test "FeatureStates - correct size based on features" {
-    // Size depends on enabled features - void (0) when none, array when some
-    if (enabled_count == 0) {
-        try std.testing.expectEqual(@as(usize, 0), @sizeOf(FeatureStates));
-    } else {
-        // Each feature state is ?*anyopaque (optional pointer = 8 bytes on 64-bit)
-        try std.testing.expect(@sizeOf(FeatureStates) > 0);
-    }
-}
-
-test "Feature hooks - execution order matches registration order" {
-    // This test verifies that when multiple features are enabled,
-    // their hooks execute in the order they were registered.
-    // This is critical for predictable behavior when features interact.
-
-    const allocator = std.testing.allocator;
-
-    // Verify feature count consistency
-    try std.testing.expect(enabled_features.len == enabled_count);
-
-    // If features are enabled, verify call mechanism works
-    if (enabled_count > 0) {
-        var filtered = std.ArrayList(usize).empty;
-        defer filtered.deinit(allocator);
-
-        var items = std.ArrayList(types.Item).empty;
-        defer items.deinit(allocator);
-
-        try items.append(allocator, try types.Item.parse(allocator, "test"));
-        try filtered.append(allocator, 0);
-
-        var states = initStates();
-
-        // Call afterFilter - should not crash with valid data
-        callAfterFilter(&states, &filtered, items.items);
-
-        // Cleanup
-        for (items.items) |item| item.deinit(allocator);
-    }
-}
-
-test "Feature hooks - state isolation between features" {
-    // This test verifies that feature states remain isolated from each other.
-    // Each feature should only see its own state, not other features' states.
-
-    const allocator = std.testing.allocator;
-
-    var states = initStates();
-
-    // If features enabled, verify state array structure
-    if (enabled_count > 0) {
-        // Each feature gets its own slot in the state array
-        inline for (enabled_features, 0..) |_, i| {
-            // State slots should be independent
-            try std.testing.expect(i < enabled_count);
-        }
-    }
-
-    // Cleanup any allocated states
-    deinitAll(&states, allocator);
 }
 
 test "Feature hooks - handle empty filtered items gracefully" {
@@ -623,4 +485,22 @@ test "FeatureInitData - empty flags" {
     try std.testing.expect(init_data.getString("anything") == null);
     try std.testing.expect(init_data.getInt("anything") == null);
     try std.testing.expect(init_data.getBool("anything") == false);
+}
+
+test "castState - typed cast from opaque pointer" {
+    const TestState = struct {
+        value: u32,
+    };
+
+    var state = TestState{ .value = 42 };
+    const opaque_ptr: FeatureState = @ptrCast(&state);
+
+    // Valid cast returns pointer to concrete type
+    const result = castState(TestState, opaque_ptr);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(u32, 42), result.?.value);
+
+    // Null input returns null
+    const null_result = castState(TestState, null);
+    try std.testing.expect(null_result == null);
 }

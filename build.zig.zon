@@ -1,6 +1,6 @@
 .{
     .name = .zmenu,
-    .version = "0.15.2",
+    .version = "0.2.0",
     .dependencies = .{
         .sdl3 = .{
             .url = "git+https://github.com/Gota7/zig-sdl3?ref=v0.1.5#014b7bcb2899f3ed9c945c4abfcfe1b25d75bfeb",

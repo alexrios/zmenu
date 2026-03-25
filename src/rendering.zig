@@ -63,6 +63,8 @@ pub const RenderContext = struct {
     prompt_cache: TextureCache,
     count_cache: TextureCache,
     no_match_cache: TextureCache,
+    // Cached max item width (updated on item ingest, avoids per-frame measurement)
+    cached_max_item_width: f32 = 0,
     // Window and display state
     window: Window,
 

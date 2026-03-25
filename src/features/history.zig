@@ -196,11 +196,9 @@ fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.Featur
 }
 
 fn onDeinit(state_ptr: ?features_mod.FeatureState, _: std.mem.Allocator) void {
-    if (state_ptr) |ptr| {
-        const state: *HistoryState = @ptrCast(@alignCast(ptr));
-        state.save();
-        state.deinit();
-    }
+    const state = features_mod.castState(HistoryState, state_ptr) orelse return;
+    state.save();
+    state.deinit();
 }
 
 fn afterFilter(
@@ -208,10 +206,7 @@ fn afterFilter(
     filtered_items: *std.ArrayList(usize),
     all_items: []const types.Item,
 ) void {
-    const state: *HistoryState = if (state_ptr) |ptr|
-        @ptrCast(@alignCast(ptr))
-    else
-        return;
+    const state = features_mod.castState(HistoryState, state_ptr) orelse return;
 
     if (filtered_items.items.len <= 1) return;
     if (state.entries.items.len == 0) return;
@@ -251,11 +246,8 @@ fn afterFilter(
 }
 
 fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) void {
-    if (state_ptr) |ptr| {
-        const state: *HistoryState = @ptrCast(@alignCast(ptr));
-        // Track display field so history matching works correctly
-        state.addEntry(selected_item.display);
-    }
+    const state = features_mod.castState(HistoryState, state_ptr) orelse return;
+    state.addEntry(selected_item.display);
 }
 
 pub const feature = features_mod.Feature{

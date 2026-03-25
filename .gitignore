@@ -6,3 +6,6 @@ CLAUDE.md
 
 # User configuration (copy config.def.zig to config.zig and customize)
 config.zig
+
+# Interactive test scripts (not part of the build)
+test_history_interactive.sh
