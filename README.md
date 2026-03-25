@@ -2,17 +2,6 @@
 
 A cross-platform dmenu-like application launcher built with Zig and SDL3.
 
-## Features
-
-- **Fast and lightweight** menu selection interface
-- **Fuzzy matching** - Type letters and they can match anywhere (e.g., "abc" matches "a_b_c")
-- **Case-insensitive filtering** - Search without worrying about caps (ASCII only)
-- **UTF-8 safe** - Handles multi-byte characters correctly in input and items
-- **Multi-line display** - See up to 10 items at once with scrolling
-- **Keyboard-driven navigation** with vim-style keybindings
-- **Cross-platform** - Runs on Linux, Windows, and macOS without code changes
-- **Zero configuration** - Works out of the box with sensible defaults
-
 ## Usage
 
 zmenu reads items from stdin and displays them in a menu:
@@ -35,6 +24,66 @@ selected=$(find ~/projects -maxdepth 1 -type d | zmenu)
 cd "$selected"
 ```
 
+### Monitor/Display Selection
+
+To launch zmenu on a specific monitor, use the `--monitor` flag:
+
+```bash
+# Primary monitor (default)
+echo -e "Item1\nItem2" | zmenu
+
+# Second monitor
+echo -e "Item1\nItem2" | zmenu --monitor 1
+
+# Third monitor
+echo -e "Item1\nItem2" | zmenu --monitor 2
+
+# Short flag
+seq 1 100 | zmenu -m 1
+```
+
+Monitor indices are 0-based where 0 is the primary display. If the specified monitor is not available, zmenu will exit with an error message showing the number of available displays.
+
+### Feature-Specific Flags
+
+When features are enabled, they may provide additional command-line flags for runtime configuration. Use `--help` to see available flags:
+
+```bash
+zmenu --help
+```
+
+**History Feature** (when enabled):
+```bash
+# Use custom history file
+echo -e "Item1\nItem2\nItem3" | zmenu --hist-file /tmp/my_history
+
+# Override history limit
+seq 1 1000 | zmenu --hist-limit 50
+
+# Combine flags
+echo -e "Item1\nItem2" | zmenu -H /tmp/history --hist-limit 100
+```
+
+The history feature tracks your selections and reorders items based on recency, with most recently selected items appearing first.
+
+### Responsiveness
+
+zmenu reads stdin **non-blocking** - the window appears immediately and shows a loading indicator while items are being read:
+
+- **Instant feedback** - Window appears right away, even for slow stdin sources.
+- **Real-time progress** - Shows "Loaded N items" counter as items arrive.
+- **Early cancellation** - Press `Escape` or `Ctrl+C` to exit anytime, even during loading.
+- **Batch display** - Items appear all at once after stdin completes (prevents UI jumpiness).
+
+This is especially useful for slow commands:
+```bash
+# Window appears instantly, shows loading progress
+find /large/directory -type f | zmenu
+
+# Can cancel immediately if it takes too long
+(echo "Item1"; sleep 10; echo "Item2") | zmenu  # Press Escape to exit early
+```
+
 ### Keyboard Controls
 
 **Navigation:**
@@ -42,8 +91,8 @@ cd "$selected"
 - `↓` / `j` - Move selection down
 - `Tab` - Move to next item
 - `Shift+Tab` - Move to previous item
-- `Page Up` - Jump up one page (10 items)
-- `Page Down` - Jump down one page (10 items)
+- `Page Up` - Jump up one page
+- `Page Down` - Jump down one page
 - `Home` - Jump to first item
 - `End` - Jump to last item
 
@@ -55,56 +104,54 @@ cd "$selected"
 
 **Actions:**
 - `Enter` - Select current item and output to stdout
-- `Escape` / `Ctrl+C` - Cancel without selection
+- `Escape` / `Ctrl+C` - Cancel without selection (works anytime, even during loading)
 
-### Display
+### Clipboard Support
 
-- Top left: Input prompt with your query
-- Top right: Filtered count / Total items
-- Bottom right (if needed): Scroll indicator showing visible range
-- Selected item has `>` prefix and highlighted color
+When enabled via `config.zig` (`clipboard = true`), zmenu automatically copies your selection to the system clipboard when you press Enter. The selection is sent to **both** stdout (normal behavior) and clipboard.
+
+The clipboard feature gracefully handles cases where clipboard access fails, printing a warning but still outputting to stdout.
 
 ## Themes
 
-zmenu supports multiple color themes via the `ZMENU_THEME` environment variable:
+zmenu's theme is configured at compile-time via `config.zig`. Colors are set individually, using one of the built-in theme presets:
 
 ```bash
-# Use a specific theme (note: env var must be set for zmenu, not the input command)
-echo -e "Apple\nBanana\nCherry" | ZMENU_THEME=dracula zmenu
+# Copy the default config
+cp config.def.zig config.zig
 
-# Works with any command
-find . -type f | ZMENU_THEME=nord zmenu
+# Edit the colors section in config.zig to use a different theme, e.g.:
+#   pub const background: sdl.pixels.Color = theme.dracula.background;
+#   pub const foreground: sdl.pixels.Color = theme.dracula.foreground;
+#   ... (all 5 color fields)
+#
+# Or replace all colors at once by changing the theme import:
+#   pub const background: sdl.pixels.Color = theme.nord.background;
 
-# Or export first, then use normally
-export ZMENU_THEME=gruvbox
-seq 1 100 | zmenu
-
-# Set as default in your shell config (~/.bashrc, ~/.zshrc, etc.)
-export ZMENU_THEME=gruvbox
+# Rebuild
+zig build
 ```
 
 ### Available Themes
 
 **Catppuccin Family** (pastel themes):
-- **mocha** (default) - Dark pastel with purple-gray background
-- **latte** - Light pastel with lavender background
-- **frappe** - Medium-dark pastel
-- **macchiato** - Dark-medium pastel
+- **latte** (default) - Light pastel with lavender background.
+- **mocha** - Dark pastel with purple-gray background.
+- **frappe** - Medium-dark pastel.
+- **macchiato** - Dark-medium pastel.
 
 **Classic Themes**:
-- **dracula** - Popular dark theme with vibrant pink/cyan accents
-- **gruvbox** - Retro warm dark theme with earthy tones
-- **nord** - Cool arctic-inspired theme with blue accents
-- **solarized** - Low-contrast dark theme
-
-If `ZMENU_THEME` is not set or contains an invalid name, zmenu defaults to **mocha**.
+- **dracula** - Popular dark theme with vibrant pink/cyan accents.
+- **gruvbox** - Retro warm dark theme with earthy tones.
+- **nord** - Cool arctic-inspired theme with blue accents.
+- **solarized** - Low-contrast dark theme.
 
 Theme names are case-insensitive (`NORD`, `nord`, and `NoRd` all work).
 
 ## Development
 
-- [mise](https://mise.jdx.dev/) for version management
-- **No SDL3 system libraries required!** - zig-sdl3 bundles everything
+- [mise](https://mise.jdx.dev/) for version management.
+- **No SDL3 system libraries required!** - `zig-sdl3` bundles everything.
 
 ### Setup
 
@@ -113,7 +160,7 @@ Theme names are case-insensitive (`NORD`, `nord`, and `NoRd` all work).
 curl https://mise.run | sh
 ```
 
-2. Install Zig via mise:
+2. Install Zig via mise (if you don't have it yet):
 ```bash
 mise install
 ```
@@ -125,11 +172,11 @@ mise run build
 
 ### Available mise Tasks
 
-- `mise run build` - Build the project
-- `mise run run` - Run the application
-- `mise run test` - Run tests
-- `mise run clean` - Clean build artifacts
-- `mise run check` - Check code without building
+- `mise run build` - Build the project.
+- `mise run run` - Run the application.
+- `mise run test` - Run tests.
+- `mise run clean` - Clean build artifacts.
+- `mise run check` - Check code without building.
 
 ### Project Structure
 
@@ -138,15 +185,23 @@ zmenu/
 ├── .mise.toml          # Mise configuration and tasks
 ├── build.zig           # Build configuration
 ├── build.zig.zon       # Dependencies (zig-sdl3)
+├── config.def.zig      # Default configuration (copy to config.zig to customize)
 ├── src/
-│   ├── main.zig        # Main application (~740 lines)
-│   └── theme.zig       # Theme definitions (8 color themes)
-└── README.md
+│   ├── main.zig        # Entry point and CLI
+│   ├── app.zig         # Core application logic
+│   ├── state.zig       # State management (tagged unions)
+│   ├── rendering.zig   # Rendering types and color schemes
+│   ├── input.zig       # Input handling and UTF-8 utilities
+│   ├── sdl_context.zig # SDL initialization and management
+│   ├── theme.zig       # Theme definitions (8 color schemes)
+│   ├── features.zig    # Compile-time feature hook system
+│   └── features/       # Pluggable features
+│       ├── history.zig    # History tracking (optional)
+│       └── clipboard.zig  # Clipboard integration (optional)
+└── docs/               # Documentation
 ```
 
-## Implementation Details
-
-### Fuzzy Matching Algorithm
+## Opinionated Fuzzy Matching Algorithm
 
 The fuzzy matcher allows characters to appear in order but not necessarily consecutively:
 
@@ -163,81 +218,41 @@ No Match: "cba", "acb"
 
 This design choice ensures UTF-8 safety without complex Unicode normalization.
 
-
 ## Design Philosophy
 
-This project follows a pragmatic approach:
+zmenu embraces pragmatic software engineering.
 
-- **Simple, maintainable code** - Single ~500-line file, easy to understand
-- **Minimal dependencies** - Just zig-sdl3 (which bundles SDL3)
-- **Clear separation of concerns** - Init, event handling, rendering, filtering
-- **Performance-conscious but readable** - Optimized where it matters, clear elsewhere
-- **Helper methods** - Navigation, text editing extracted to focused functions
+**Architecture:**
+- **Modular structure** - Clean separation into focused modules (app, state, rendering, input, features).
+- **Type-safe state management** - Tagged unions for compile-time guarantees (no invalid states).
+- **Compile-time features** - Zig's answer to dmenu patches: zero-cost abstractions via comptime.
+- **Hook-based extensibility** - Features integrate through well-defined lifecycle hooks.
+
+**Performance:**
+- **Event-driven rendering** - Only renders when needed, sleeps when idle.
+- **Texture caching** - Reuses rendered text to minimize GPU uploads.
+- **Smart allocation** - Buffers allocated once, reused every frame.
+- **Zero overhead** - Disabled features completely removed from binary.
+
+**Philosophy:**
+Like dmenu's patch system, but better: features are enabled at compile-time via `config.zig`, type-checked by the compiler, and auto-update when APIs change. No merge conflicts, no runtime cost, pure Zig.
 
 ## Testing
 
-The project includes automated tests covering critical functionality:
-
 ```bash
-mise run test  # Run all tests
+mise run test
 ```
-
-**Test Coverage:**
-- Fuzzy matching (basic, case-insensitive, UTF-8 handling)
-- UTF-8 boundary detection for safe truncation
-- UTF-8 aware character deletion (backspace, word deletion)
-- Color comparison
-- Configuration validation
-
-All tests use Zig's built-in testing framework and run on every build.
 
 ## Cross-Platform
 
-**Supported Platforms**: Linux, macOS, Windows
-
-**Building for different platforms:**
-
-```bash
-# Native build
-mise run build
-
-# Cross-compile to Windows
-zig build -Dtarget=x86_64-windows
-
-# Cross-compile to macOS
-zig build -Dtarget=x86_64-macos
-
-# Cross-compile to Linux
-zig build -Dtarget=x86_64-linux
-```
-
-## Known limitations
-
-- No configuration file support yet
-- No history/frecency tracking
-- Window size is fixed (800x300)
-
-## Future Enhancements
-
-**Planned:**
-- [ ] Configuration file support (`~/.config/zmenu/config.toml`)
-- [ ] History tracking with frecency scoring
-- [ ] Multi-column layout option
-- [ ] Preview pane for file paths
-- [ ] Custom keybinding support
-
-**Maybe:**
-- [ ] Plugin system for custom filters
-- [ ] Custom theme support (user-defined colors)
-- [ ] Desktop file integration (.desktop files)
-- [ ] Icon support
+**Supported Platforms**: Linux, macOS, Windows.
 
 ## Contributing
 
-This is a learning project exploring Zig + SDL3.
+Discussions, issues and PRs are welcome.
 
-Discussions, issues and PRs are welcomed!
+To add a new feature, see [docs/features.md](docs/features.md) for the compile-time feature system and hook API.
 
 ## License
 
-This project is open source. Use it however you'd like.
+AGPL-3.0. See [LICENSE](LICENSE) for details.

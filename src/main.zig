@@ -1,1168 +1,366 @@
+//! zmenu - A cross-platform dmenu-like application launcher
+//!
+//! Usage: echo -e "Item 1\nItem 2" | zmenu
+//!
+//! Configuration:
+//!   - Copy config.def.zig to config.zig and customize, then rebuild
+
 const std = @import("std");
-const sdl = @import("sdl3");
 const builtin = @import("builtin");
-const theme = @import("theme.zig");
+const app = @import("app.zig");
+const features = @import("features.zig");
+const config = @import("config");
+const build_options = @import("build_options");
 
-// Platform-specific default font paths (tried in order)
-const default_font_paths = switch (builtin.os.tag) {
-    .linux => [_][:0]const u8{
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf", // Arch Linux
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf", // Some distros
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    },
-    .macos => [_][:0]const u8{
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFNSText.ttf",
-        "/Library/Fonts/Arial.ttf",
-    },
-    .windows => [_][:0]const u8{
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\calibri.ttf",
-    },
-    else => [_][:0]const u8{
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    },
+pub const std_options: std.Options = .{
+    .log_level = @enumFromInt(@intFromEnum(build_options.log_level)),
 };
 
-const WindowConfig = struct {
-    initial_width: u32 = 800,
-    initial_height: u32 = 300,
-    min_width: u32 = 600,
-    min_height: u32 = 150,
-    max_width: u32 = 1600,
-    max_height: u32 = 800,
-    enable_high_dpi: bool = true, // Request high pixel density when available
-};
+/// Parse feature CLI flags from command-line arguments
+fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !features.ParsedFlags {
+    var result = features.ParsedFlags.init(allocator);
+    errdefer result.deinit();
 
-const ColorScheme = struct {
-    background: sdl.pixels.Color = theme.default.background,
-    foreground: sdl.pixels.Color = theme.default.foreground,
-    selected: sdl.pixels.Color = theme.default.selected,
-    prompt: sdl.pixels.Color = theme.default.prompt,
-};
-
-const Limits = struct {
-    max_visible_items: usize = 30,
-    max_item_length: usize = 4096,
-    max_input_length: usize = 1024,
-    input_ellipsis_margin: usize = 100, // Show ellipsis when input within this margin of max
-    prompt_buffer_size: usize = 1024 + 16, // max_input_length + prefix + safety
-    item_buffer_size: usize = 4096 + 16, // max_item_length + prefix + safety
-    count_buffer_size: usize = 64,
-    scroll_buffer_size: usize = 64,
-};
-
-const Layout = struct {
-    // Base dimensions (before scaling) - these are in logical coordinates
-    item_line_height: f32 = 20.0,
-    prompt_y: f32 = 5.0,
-    items_start_y: f32 = 30.0,
-    right_margin_offset: f32 = 60.0,
-    bottom_margin: f32 = 10.0, // Bottom margin for height calculation
-    // Width calculation settings
-    width_padding: f32 = 10.0, // Horizontal padding for width calculation
-    width_padding_multiplier: f32 = 4.0, // Accounts for left/right margins + spacing
-    sample_prompt_text: [:0]const u8 = "> Sample Input Text",
-    sample_count_text: [:0]const u8 = "999/999",
-    sample_scroll_text: [:0]const u8 = "[999-999]", // Longest possible scroll indicator
-};
-
-const FontConfig = struct {
-    path: ?[:0]const u8 = null, // null = use platform defaults
-    size: f32 = 22,
-};
-
-const Config = struct {
-    window: WindowConfig = .{},
-    colors: ColorScheme = .{},
-    limits: Limits = .{},
-    layout: Layout = .{},
-    font: FontConfig = .{},
-};
-
-// Text texture cache entry
-const TextureCache = struct {
-    texture: ?sdl.render.Texture,
-    last_text: []u8,
-    last_color: sdl.pixels.Color,
-
-    fn deinit(self: *TextureCache, allocator: std.mem.Allocator) void {
-        if (self.texture) |tex| tex.deinit();
-        allocator.free(self.last_text);
+    // Initialize storage for each feature
+    inline for (features.enabled_features) |_| {
+        try result.values.append(allocator, std.ArrayList(?features.FlagValue).empty);
     }
-};
 
-const SdlContext = struct {
-    window: sdl.video.Window,
-    renderer: sdl.render.Renderer,
-    font: sdl.ttf.Font,
-    loaded_font_path: []const u8, // Track which font was actually loaded
-};
+    // Parse flags for each enabled feature
+    inline for (features.enabled_features, 0..) |feature, feat_idx| {
+        if (feature.cli_flags) |flags| {
+            for (flags) |flag| {
+                const value = parseFlag(args, flag) catch |err| {
+                    switch (err) {
+                        error.MissingFlagValue => std.log.err("--{s} requires a value", .{flag.long}),
+                        error.InvalidFlagValue => std.log.err("--{s} requires a valid value", .{flag.long}),
+                        else => std.log.err("unexpected error parsing --{s}: {}", .{ flag.long, err }),
+                    }
+                    return err;
+                };
+                if (value) |v| {
+                    try result.values.items[feat_idx].append(allocator, v);
+                } else if (flag.default) |default_val| {
+                    try result.values.items[feat_idx].append(allocator, default_val);
+                } else if (flag.required) {
+                    std.log.err("required flag --{s} not provided", .{flag.long});
+                    return error.MissingRequiredFlag;
+                } else {
+                    // Optional flag not provided — store null (distinguishable from zero)
+                    try result.values.items[feat_idx].append(allocator, null);
+                }
+            }
+        }
+    }
 
-const AppState = struct {
-    input_buffer: std.ArrayList(u8),
-    items: std.ArrayList([]const u8),
-    filtered_items: std.ArrayList(usize),
-    selected_index: usize,
-    scroll_offset: usize,
-    needs_render: bool,
-};
+    return result;
+}
 
-const RenderContext = struct {
-    // Render buffers (allocated once, reused)
-    prompt_buffer: []u8,
-    item_buffer: []u8,
-    count_buffer: []u8,
-    scroll_buffer: []u8,
-    // Texture caching for text rendering performance
-    prompt_cache: TextureCache,
-    count_cache: TextureCache,
-    no_match_cache: TextureCache,
-    // High DPI state
-    display_scale: f32, // Combined scale factor (pixel density × content scale)
-    pixel_width: u32, // Actual pixel dimensions
-    pixel_height: u32,
-    // Current window dimensions (logical coordinates)
-    current_width: u32,
-    current_height: u32,
-};
+/// Check if a value argument looks like a flag (starts with "-")
+fn looksLikeFlag(value: []const u8) bool {
+    return value.len > 0 and value[0] == '-';
+}
 
-const App = struct {
-    sdl: SdlContext,
-    state: AppState,
-    render_ctx: RenderContext,
-    config: Config,
-    allocator: std.mem.Allocator,
+/// Parse a single flag from args.
+/// Returns the parsed value, null if not found, or an error.
+/// Caller is responsible for user-facing error messages.
+fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagValue {
+    var i: usize = 1; // Skip program name
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
 
-    fn tryLoadFont(config: Config) !struct { font: sdl.ttf.Font, path: []const u8 } {
-        // If user specified a custom font path, try only that
-        if (config.font.path) |custom_path| {
-            const font = sdl.ttf.Font.init(custom_path, config.font.size) catch |err| {
-                std.debug.print("Error: Failed to load font '{s}': {}\n", .{ custom_path, err });
-                return err;
+        // Check long flag (no allocation: match "--" prefix then compare suffix)
+        if (std.mem.startsWith(u8, arg, "--") and std.mem.eql(u8, arg[2..], flag.long)) {
+            return try parseFlagValue(args, i, flag);
+        }
+
+        // Check short flag
+        if (flag.short) |short_char| {
+            const short_flag = &[_]u8{ '-', short_char };
+            if (std.mem.eql(u8, arg, short_flag)) {
+                return try parseFlagValue(args, i, flag);
+            }
+        }
+    }
+
+    return null; // Flag not found
+}
+
+/// Extract the value for a matched flag at position i in args.
+fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !features.FlagValue {
+    return switch (flag.value_type) {
+        .bool => features.FlagValue{ .bool = true },
+        .string => blk: {
+            if (i + 1 >= args.len or looksLikeFlag(args[i + 1])) {
+                return error.MissingFlagValue;
+            }
+            break :blk features.FlagValue{ .string = args[i + 1] };
+        },
+        .int => blk: {
+            // Int flags don't check looksLikeFlag — negative numbers start with "-"
+            if (i + 1 >= args.len) {
+                return error.MissingFlagValue;
+            }
+            const value = std.fmt.parseInt(i64, args[i + 1], 10) catch {
+                return error.InvalidFlagValue;
             };
-            return .{ .font = font, .path = custom_path };
-        }
-
-        // Try platform-specific default fonts in order
-        for (default_font_paths) |font_path| {
-            if (sdl.ttf.Font.init(font_path, config.font.size)) |font| {
-                std.debug.print("Successfully loaded font: {s}\n", .{font_path});
-                return .{ .font = font, .path = font_path };
-            } else |_| {
-                // Silently continue to next font
-            }
-        }
-
-        // No fonts found
-        std.debug.print("Error: Could not find any suitable font. Tried:\n", .{});
-        for (default_font_paths) |font_path| {
-            std.debug.print("  - {s}\n", .{font_path});
-        }
-        return error.NoFontFound;
-    }
-
-    fn init(allocator: std.mem.Allocator) !App {
-        // Initialize SDL
-        const init_flags = sdl.InitFlags{ .video = true, .events = true };
-        try sdl.init(init_flags);
-        errdefer {
-            const quit_flags = sdl.InitFlags{ .video = true, .events = true };
-            sdl.quit(quit_flags);
-        }
-
-        // Initialize SDL_ttf
-        try sdl.ttf.init();
-        errdefer sdl.ttf.quit();
-
-        var config = Config{};
-
-        // Apply theme from ZMENU_THEME environment variable (if set)
-        if (std.process.getEnvVarOwned(allocator, "ZMENU_THEME")) |theme_name| {
-            defer allocator.free(theme_name);
-            const selected_theme = theme.getByName(theme_name);
-            config.colors.background = selected_theme.background;
-            config.colors.foreground = selected_theme.foreground;
-            config.colors.selected = selected_theme.selected;
-            config.colors.prompt = selected_theme.prompt;
-        } else |_| {
-            // No env var set, use defaults
-        }
-
-        // Create window and renderer with high DPI support
-        const window_flags = if (config.window.enable_high_dpi)
-            sdl.video.Window.Flags{ .borderless = true, .always_on_top = true, .high_pixel_density = true }
-        else
-            sdl.video.Window.Flags{ .borderless = true, .always_on_top = true };
-
-        const window, const renderer = try sdl.render.Renderer.initWithWindow(
-            "zmenu",
-            config.window.initial_width,
-            config.window.initial_height,
-            window_flags,
-        );
-        errdefer renderer.deinit();
-        errdefer window.deinit();
-
-        // Position window at center of screen (both X and Y)
-        window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |err| {
-            std.debug.print("Warning: Failed to position window: {}\n", .{err});
-        };
-
-        // Query display scale and pixel dimensions for high DPI support
-        const display_scale = try window.getDisplayScale();
-        const pixel_width, const pixel_height = try window.getSizeInPixels();
-
-        // Validate pixel dimensions fit in u32
-        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
-            return error.DisplayTooLarge;
-        }
-
-        // Allocate render buffers
-        const prompt_buffer = try allocator.alloc(u8, config.limits.prompt_buffer_size);
-        errdefer allocator.free(prompt_buffer);
-        const item_buffer = try allocator.alloc(u8, config.limits.item_buffer_size);
-        errdefer allocator.free(item_buffer);
-        const count_buffer = try allocator.alloc(u8, config.limits.count_buffer_size);
-        errdefer allocator.free(count_buffer);
-        const scroll_buffer = try allocator.alloc(u8, config.limits.scroll_buffer_size);
-        errdefer allocator.free(scroll_buffer);
-
-        // Load font with platform-specific fallback
-        const font_result = try tryLoadFont(config);
-        errdefer font_result.font.deinit();
-
-        var app = App{
-            .sdl = .{
-                .window = window,
-                .renderer = renderer,
-                .font = font_result.font,
-                .loaded_font_path = font_result.path,
-            },
-            .state = .{
-                .input_buffer = std.ArrayList(u8).empty,
-                .items = std.ArrayList([]const u8).empty,
-                .filtered_items = std.ArrayList(usize).empty,
-                .selected_index = 0,
-                .scroll_offset = 0,
-                .needs_render = true,
-            },
-            .render_ctx = .{
-                .prompt_buffer = prompt_buffer,
-                .item_buffer = item_buffer,
-                .count_buffer = count_buffer,
-                .scroll_buffer = scroll_buffer,
-                .prompt_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .count_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .no_match_cache = .{ .texture = null, .last_text = &[_]u8{}, .last_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .display_scale = display_scale,
-                .pixel_width = @intCast(pixel_width),
-                .pixel_height = @intCast(pixel_height),
-                .current_width = config.window.initial_width,
-                .current_height = config.window.initial_height,
-            },
-            .config = config,
-            .allocator = allocator,
-        };
-
-        // Load items from stdin
-        try app.loadItemsFromStdin();
-
-        // Check that we have items to display
-        if (app.state.items.items.len == 0) {
-            // Clean up ArrayLists before returning error
-            // The buffers will be cleaned up by errdefer
-            app.state.items.deinit(app.allocator);
-            app.state.filtered_items.deinit(app.allocator);
-            app.state.input_buffer.deinit(app.allocator);
-            return error.NoItemsProvided;
-        }
-
-        try app.updateFilter();
-
-        // Calculate and set initial window size based on content
-        try app.updateWindowSize();
-
-        // Start text input
-        try sdl.keyboard.startTextInput(window);
-
-        return app;
-    }
-
-    fn deinit(self: *App) void {
-        sdl.keyboard.stopTextInput(self.sdl.window) catch |err| {
-            std.debug.print("Warning: Failed to stop text input: {}\n", .{err});
-        };
-        self.state.input_buffer.deinit(self.allocator);
-        for (self.state.items.items) |item| {
-            self.allocator.free(item);
-        }
-        self.state.items.deinit(self.allocator);
-        self.state.filtered_items.deinit(self.allocator);
-        self.allocator.free(self.render_ctx.prompt_buffer);
-        self.allocator.free(self.render_ctx.item_buffer);
-        self.allocator.free(self.render_ctx.count_buffer);
-        self.allocator.free(self.render_ctx.scroll_buffer);
-        // Clean up texture caches
-        self.render_ctx.prompt_cache.deinit(self.allocator);
-        self.render_ctx.count_cache.deinit(self.allocator);
-        self.render_ctx.no_match_cache.deinit(self.allocator);
-        self.sdl.font.deinit();
-        self.sdl.renderer.deinit();
-        self.sdl.window.deinit();
-        sdl.ttf.quit();
-        const quit_flags = sdl.InitFlags{ .video = true, .events = true };
-        sdl.quit(quit_flags);
-    }
-
-    fn findUtf8Boundary(text: []const u8, max_len: usize) usize {
-        // Find the last valid UTF-8 character boundary at or before max_len
-        if (text.len <= max_len) return text.len;
-
-        var pos = max_len;
-        // Walk backwards to find a non-continuation byte
-        // UTF-8 continuation bytes have the pattern 10xxxxxx (0x80-0xBF)
-        while (pos > 0 and (text[pos] & 0xC0) == 0x80) {
-            pos -= 1;
-        }
-        return pos;
-    }
-
-    fn loadItemsFromStdin(self: *App) !void {
-        // Check if stdin is a TTY (interactive terminal)
-        // If so, user forgot to pipe input - fail immediately instead of blocking
-        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
-            return error.NoItemsProvided;
-        }
-
-        const stdin_file = std.fs.File{ .handle = std.posix.STDIN_FILENO };
-        const max_size = 10 * 1024 * 1024; // 10MB max
-        const content = try stdin_file.readToEndAlloc(self.allocator, max_size);
-        defer self.allocator.free(content);
-
-        var iter = std.mem.splitScalar(u8, content, '\n');
-        while (iter.next()) |line| {
-            // Trim whitespace and skip empty lines
-            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-            if (trimmed.len > 0) {
-                // Validate and truncate if needed (UTF-8 safe)
-                const truncate_len = findUtf8Boundary(trimmed, self.config.limits.max_item_length);
-                const final_line = trimmed[0..truncate_len];
-
-                const owned_line = try self.allocator.dupe(u8, final_line);
-                try self.state.items.append(self.allocator, owned_line);
-            }
-        }
-    }
-
-    fn updateFilter(self: *App) !void {
-        const prev_filtered_count = self.state.filtered_items.items.len;
-
-        self.state.filtered_items.clearRetainingCapacity();
-
-        if (self.state.input_buffer.items.len == 0) {
-            // No filter, show all items
-            for (self.state.items.items, 0..) |_, i| {
-                try self.state.filtered_items.append(self.allocator, i);
-            }
-        } else {
-            // Fuzzy matching with case-insensitive search
-            const query = self.state.input_buffer.items;
-            for (self.state.items.items, 0..) |item, i| {
-                if (fuzzyMatch(item, query)) {
-                    try self.state.filtered_items.append(self.allocator, i);
-                }
-            }
-        }
-
-        // Reset selection if out of bounds
-        if (self.state.filtered_items.items.len > 0) {
-            if (self.state.selected_index >= self.state.filtered_items.items.len) {
-                self.state.selected_index = self.state.filtered_items.items.len - 1;
-            }
-        } else {
-            self.state.selected_index = 0;
-        }
-
-        // Adjust scroll to keep selection visible
-        self.adjustScroll();
-
-        // Update window size if filtered count changed
-        if (prev_filtered_count != self.state.filtered_items.items.len) {
-            try self.updateWindowSize();
-        }
-    }
-
-    fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
-        var h_idx: usize = 0;
-        for (needle) |n_char| {
-            // Handle UTF-8 gracefully - only process valid ASCII for case-insensitive match
-            const n_lower = if (n_char < 128) std.ascii.toLower(n_char) else n_char;
-            var found = false;
-            while (h_idx < haystack.len) : (h_idx += 1) {
-                const h_char = haystack[h_idx];
-                const h_lower = if (h_char < 128) std.ascii.toLower(h_char) else h_char;
-                if (h_lower == n_lower) {
-                    h_idx += 1;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        return true;
-    }
-
-    fn adjustScroll(self: *App) void {
-        if (self.state.filtered_items.items.len == 0) {
-            self.state.scroll_offset = 0;
-            return;
-        }
-
-        // Keep selected item visible
-        if (self.state.selected_index < self.state.scroll_offset) {
-            self.state.scroll_offset = self.state.selected_index;
-        } else if (self.state.selected_index >= self.state.scroll_offset + self.config.limits.max_visible_items) {
-            self.state.scroll_offset = self.state.selected_index - self.config.limits.max_visible_items + 1;
-        }
-    }
-
-    fn navigate(self: *App, delta: isize) void {
-        if (self.state.filtered_items.items.len == 0) return;
-
-        const current = @as(isize, @intCast(self.state.selected_index));
-        const new_idx = current + delta;
-
-        if (new_idx >= 0 and new_idx < @as(isize, @intCast(self.state.filtered_items.items.len))) {
-            self.state.selected_index = @intCast(new_idx);
-            self.adjustScroll();
-            self.state.needs_render = true;
-        }
-    }
-
-    fn navigateToFirst(self: *App) void {
-        if (self.state.filtered_items.items.len > 0) {
-            self.state.selected_index = 0;
-            self.adjustScroll();
-            self.state.needs_render = true;
-        }
-    }
-
-    fn navigateToLast(self: *App) void {
-        if (self.state.filtered_items.items.len > 0) {
-            self.state.selected_index = self.state.filtered_items.items.len - 1;
-            self.adjustScroll();
-            self.state.needs_render = true;
-        }
-    }
-
-    fn navigatePage(self: *App, direction: isize) void {
-        if (self.state.filtered_items.items.len == 0) return;
-
-        const page_size = @as(isize, @intCast(self.config.limits.max_visible_items));
-        const delta = page_size * direction;
-        self.navigate(delta);
-    }
-
-    fn deleteLastCodepoint(self: *App) void {
-        // Remove the last UTF-8 codepoint from input buffer
-        if (self.state.input_buffer.items.len == 0) return;
-
-        var i = self.state.input_buffer.items.len - 1;
-
-        // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF)
-        // We need to backtrack to find the start of the codepoint
-        while (i > 0 and (self.state.input_buffer.items[i] & 0xC0) == 0x80) {
-            i -= 1;
-        }
-
-        // Resize to remove the entire codepoint
-        self.state.input_buffer.shrinkRetainingCapacity(i);
-    }
-
-    fn deleteWord(self: *App) !void {
-        // Skip trailing whitespace first (UTF-8 safe: space and tab are single bytes)
-        while (self.state.input_buffer.items.len > 0) {
-            const ch = self.state.input_buffer.getLast();
-            if (ch != ' ' and ch != '\t') break;
-            _ = self.state.input_buffer.pop();
-        }
-
-        // Delete word characters (UTF-8 aware)
-        while (self.state.input_buffer.items.len > 0) {
-            const ch = self.state.input_buffer.getLast();
-            if (ch == ' ' or ch == '\t') break;
-            self.deleteLastCodepoint();
-        }
-
-        try self.updateFilter();
-        self.state.needs_render = true;
-    }
-
-    fn updateDisplayScale(self: *App) !void {
-        // Query updated display scale and pixel dimensions
-        self.render_ctx.display_scale = try self.sdl.window.getDisplayScale();
-        const pixel_width, const pixel_height = try self.sdl.window.getSizeInPixels();
-
-        // Validate pixel dimensions fit in u32
-        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
-            return error.DisplayTooLarge;
-        }
-
-        self.render_ctx.pixel_width = @intCast(pixel_width);
-        self.render_ctx.pixel_height = @intCast(pixel_height);
-        self.state.needs_render = true;
-    }
-
-    fn handleKeyEvent(self: *App, event: sdl.events.Keyboard) !bool {
-        const key = event.key orelse return false;
-
-        if (key == .escape) {
-            return true; // Quit without selection
-        } else if (key == .return_key or key == .kp_enter) {
-            // Output selected item and quit
-            if (self.state.filtered_items.items.len > 0) {
-                const selected = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
-                // Cross-platform: std.posix maps to Windows/POSIX appropriately
-                const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
-                _ = try stdout_file.write(selected);
-                _ = try stdout_file.write("\n");
-            }
-            return true;
-        } else if (key == .backspace) {
-            if (self.state.input_buffer.items.len > 0) {
-                self.deleteLastCodepoint();
-                try self.updateFilter();
-                self.state.needs_render = true;
-            }
-        } else if (key == .u and (event.mod.left_control or event.mod.right_control)) {
-            // Ctrl+U: Clear input
-            self.state.input_buffer.clearRetainingCapacity();
-            try self.updateFilter();
-            self.state.needs_render = true;
-        } else if (key == .w and (event.mod.left_control or event.mod.right_control)) {
-            // Ctrl+W: Delete last word
-            try self.deleteWord();
-        } else if (key == .up or key == .k) {
-            self.navigate(-1);
-        } else if (key == .down or key == .j) {
-            self.navigate(1);
-        } else if (key == .c and (event.mod.left_control or event.mod.right_control)) {
-            // Ctrl+C: Quit without selection
-            return true;
-        } else if (key == .tab) {
-            if (event.mod.left_shift or event.mod.right_shift) {
-                self.navigate(-1); // Shift+Tab: previous
-            } else {
-                self.navigate(1); // Tab: next
-            }
-        } else if (key == .home) {
-            self.navigateToFirst();
-        } else if (key == .end) {
-            self.navigateToLast();
-        } else if (key == .page_up) {
-            self.navigatePage(-1);
-        } else if (key == .page_down) {
-            self.navigatePage(1);
-        }
-
-        return false;
-    }
-
-    fn handleTextInput(self: *App, text: []const u8) !void {
-        // Check if adding this text would exceed max input length
-        if (self.state.input_buffer.items.len + text.len <= self.config.limits.max_input_length) {
-            try self.state.input_buffer.appendSlice(self.allocator, text);
-            try self.updateFilter();
-            self.state.needs_render = true;
-        }
-        // Silently ignore input that would exceed the limit
-    }
-
-    fn renderText(self: *App, x: f32, y: f32, text: [:0]const u8, color: sdl.pixels.Color) !void {
-        // Convert sdl.pixels.Color to sdl.ttf.Color
-        const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
-
-        // Render text to surface with anti-aliasing
-        const surface = try self.sdl.font.renderTextBlended(text, ttf_color);
-        defer surface.deinit();
-
-        // Create texture from surface
-        const texture = try self.sdl.renderer.createTextureFromSurface(surface);
-        defer texture.deinit();
-
-        // Get texture size
-        const width, const height = try texture.getSize();
-
-        // Render texture at position
-        const dst = sdl.rect.FRect{ .x = x, .y = y, .w = width, .h = height };
-        try self.sdl.renderer.renderTexture(texture, null, dst);
-    }
-
-    fn renderCachedText(
-        self: *App,
-        x: f32,
-        y: f32,
-        text: [:0]const u8,
-        color: sdl.pixels.Color,
-        cache: *TextureCache,
-    ) !void {
-        // Check if we can reuse cached texture
-        const text_changed = !std.mem.eql(u8, cache.last_text, text);
-        const color_changed = !colorEquals(cache.last_color, color);
-
-        if (text_changed or color_changed or cache.texture == null) {
-            // Invalidate old texture
-            if (cache.texture) |old_tex| old_tex.deinit();
-
-            // Update cache metadata
-            self.allocator.free(cache.last_text);
-            cache.last_text = try self.allocator.dupe(u8, text);
-            cache.last_color = color;
-
-            // Render new texture with anti-aliasing
-            const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
-            const surface = try self.sdl.font.renderTextBlended(text, ttf_color);
-            defer surface.deinit();
-            cache.texture = try self.sdl.renderer.createTextureFromSurface(surface);
-        }
-
-        // Render cached texture
-        if (cache.texture) |texture| {
-            const width, const height = try texture.getSize();
-            const dst = sdl.rect.FRect{ .x = x, .y = y, .w = width, .h = height };
-            try self.sdl.renderer.renderTexture(texture, null, dst);
-        }
-    }
-
-    fn render(self: *App) !void {
-        // Clear background
-        try self.sdl.renderer.setDrawColor(self.config.colors.background);
-        try self.sdl.renderer.clear();
-
-        // Apply display scale to all coordinates
-        const scale = self.render_ctx.display_scale;
-
-        // Show prompt with input buffer
-        const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
-            // Truncate display if input is too long, showing last chars with ellipsis
-            const ellipsis_threshold = self.config.limits.max_input_length - self.config.limits.input_ellipsis_margin;
-            const display_input = if (self.state.input_buffer.items.len > ellipsis_threshold)
-                blk2: {
-                    // Find UTF-8 safe starting position
-                    const approx_start = self.state.input_buffer.items.len - ellipsis_threshold;
-                    var start = approx_start;
-                    // Skip continuation bytes to find valid UTF-8 boundary
-                    while (start < self.state.input_buffer.items.len and (self.state.input_buffer.items[start] & 0xC0) == 0x80) {
-                        start += 1;
-                    }
-                    break :blk2 self.state.input_buffer.items[start..];
-                }
-            else
-                self.state.input_buffer.items;
-
-            const prefix = if (self.state.input_buffer.items.len > ellipsis_threshold) "> ..." else "> ";
-            break :blk std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "{s}{s}", .{ prefix, display_input }) catch "> [error]";
-        } else
-            std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
-
-        try self.renderCachedText(5.0 * scale, self.config.layout.prompt_y * scale, prompt_text, self.config.colors.prompt, &self.render_ctx.prompt_cache);
-
-        // Show filtered items count
-        const count_text = std.fmt.bufPrintZ(
-            self.render_ctx.count_buffer,
-            "{d}/{d}",
-            .{ self.state.filtered_items.items.len, self.state.items.items.len },
-        ) catch "?/?";
-
-        // Measure actual text width for right-alignment
-        const count_text_w, _ = try self.sdl.font.getStringSize(count_text);
-        const count_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(count_text_w)) - self.config.layout.width_padding) * scale;
-        try self.renderCachedText(count_x, self.config.layout.prompt_y * scale, count_text, self.config.colors.foreground, &self.render_ctx.count_cache);
-
-        // Cache length to avoid race conditions
-        const filtered_len = self.state.filtered_items.items.len;
-
-        // Show multiple items
-        if (filtered_len > 0) {
-            const visible_end = @min(self.state.scroll_offset + self.config.limits.max_visible_items, filtered_len);
-
-            var y_pos: f32 = self.config.layout.items_start_y * scale;
-
-            for (self.state.scroll_offset..visible_end) |i| {
-                // Double check bounds before accessing
-                if (i >= filtered_len) break;
-
-                const item_index = self.state.filtered_items.items[i];
-                if (item_index >= self.state.items.items.len) continue;
-
-                const item = self.state.items.items[item_index];
-
-                const is_selected = (i == self.state.selected_index);
-                const prefix = if (is_selected) "> " else "  ";
-
-                const item_text = std.fmt.bufPrintZ(
-                    self.render_ctx.item_buffer,
-                    "{s}{s}",
-                    .{ prefix, item },
-                ) catch "  [error]";
-
-                // Use TTF rendering with appropriate color
-                const color = if (is_selected) self.config.colors.selected else self.config.colors.foreground;
-                try self.renderText(5.0 * scale, y_pos, item_text, color);
-
-                y_pos += self.config.layout.item_line_height * scale;
-            }
-
-            // Show scroll indicator if needed
-            if (filtered_len > self.config.limits.max_visible_items) {
-                const scroll_text = std.fmt.bufPrintZ(
-                    self.render_ctx.scroll_buffer,
-                    "[{d}-{d}]",
-                    .{ self.state.scroll_offset + 1, visible_end },
-                ) catch "[?]";
-
-                // Measure actual scroll text width for right-alignment
-                const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
-                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - self.config.layout.width_padding) * scale;
-                try self.renderText(scroll_x, self.config.layout.items_start_y * scale, scroll_text, self.config.colors.foreground);
-            }
-        } else {
-            try self.renderCachedText(5.0 * scale, self.config.layout.items_start_y * scale, "No matches", self.config.colors.foreground, &self.render_ctx.no_match_cache);
-        }
-
-        try self.sdl.renderer.present();
-    }
-
-    fn colorEquals(a: sdl.pixels.Color, b: sdl.pixels.Color) bool {
-        return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
-    }
-
-    fn calculateOptimalWidth(self: *App) !u32 {
-        // Start with minimum width
-        var max_width: f32 = @floatFromInt(self.config.window.min_width);
-
-        // Measure sample prompt text width (uses config sample)
-        const prompt_w, _ = try self.sdl.font.getStringSize(self.config.layout.sample_prompt_text);
-
-        // Measure count and scroll indicator text width (use the longest one)
-        const count_w, _ = try self.sdl.font.getStringSize(self.config.layout.sample_count_text);
-        const scroll_w, _ = try self.sdl.font.getStringSize(self.config.layout.sample_scroll_text);
-        const right_side_width = @max(count_w, scroll_w);
-
-        // Calculate required width for prompt + right side + margins
-        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (self.config.layout.width_padding * self.config.layout.width_padding_multiplier);
-        if (base_width > max_width) max_width = base_width;
-
-        // Check widths of visible items
-        const filtered_len = self.state.filtered_items.items.len;
-        const visible_end = @min(self.config.limits.max_visible_items, filtered_len);
-
-        for (0..visible_end) |i| {
-            if (i >= filtered_len) break;
-
-            const item_index = self.state.filtered_items.items[i];
-            if (item_index >= self.state.items.items.len) continue;
-
-            const item = self.state.items.items[item_index];
-
-            // Measure item text (with prefix "> ")
-            const item_text = std.fmt.bufPrint(
-                self.render_ctx.item_buffer,
-                "> {s}",
-                .{item},
-            ) catch continue;
-
-            // Use fast text measurement without rendering
-            const item_w, _ = self.sdl.font.getStringSize(item_text) catch continue;
-
-            const total_item_width = @as(f32, @floatFromInt(item_w)) + (self.config.layout.width_padding * 2.0);
-            if (total_item_width > max_width) max_width = total_item_width;
-        }
-
-        // Apply min/max bounds with proper rounding
-        const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));
-        const final_width = @max(rounded_width, self.config.window.min_width);
-        return @min(final_width, self.config.window.max_width);
-    }
-
-    fn calculateOptimalHeight(self: *App) u32 {
-        // Calculate how many items we'll actually show
-        const filtered_len = self.state.filtered_items.items.len;
-        const visible_items = @min(filtered_len, self.config.limits.max_visible_items);
-
-        // Calculate required height: prompt area + (items × line height) + bottom margin
-        const prompt_area_height = self.config.layout.items_start_y; // Includes prompt + spacing
-        const items_height = @as(f32, @floatFromInt(visible_items)) * self.config.layout.item_line_height;
-
-        const total_height = prompt_area_height + items_height + self.config.layout.bottom_margin;
-
-        // Apply min/max bounds with proper rounding
-        const rounded_height = @as(u32, @intFromFloat(@ceil(total_height)));
-        const final_height = @max(rounded_height, self.config.window.min_height);
-        return @min(final_height, self.config.window.max_height);
-    }
-
-    fn updateWindowSize(self: *App) !void {
-        const new_width = try self.calculateOptimalWidth();
-        const new_height = self.calculateOptimalHeight();
-
-        // Only update if dimensions changed
-        if (new_width != self.render_ctx.current_width or new_height != self.render_ctx.current_height) {
-            self.render_ctx.current_width = new_width;
-            self.render_ctx.current_height = new_height;
-
-            try self.sdl.window.setSize(new_width, new_height);
-
-            // Re-center window after resize
-            try self.sdl.window.setPosition(.{ .centered = null }, .{ .centered = null });
-
-            self.state.needs_render = true;
-        }
-    }
-
-    fn run(self: *App) !void {
-        var running = true;
-
-        // Initial render
-        try self.render();
-        self.state.needs_render = false;
-
-        while (running) {
-            // Wait for event with timeout to reduce CPU usage
-            // Use a small timeout to keep UI responsive
-            const has_event = sdl.events.waitTimeout(16);
-
-            if (has_event) {
-                while (sdl.events.poll()) |event| {
-                    switch (event) {
-                        .quit => running = false,
-                        .terminating => running = false,
-                        .key_down => |key_event| {
-                            if (try self.handleKeyEvent(key_event)) {
-                                running = false;
-                            }
-                        },
-                        .text_input => |text_event| {
-                            try self.handleTextInput(text_event.text);
-                        },
-                        .window_display_scale_changed => {
-                            // Display DPI/scale changed - update our scale factor
-                            try self.updateDisplayScale();
-                        },
-                        .window_pixel_size_changed => {
-                            // Window pixel size changed - update dimensions
-                            try self.updateDisplayScale();
-                        },
-                        else => {
-                            // Ignore other events (mouse, etc.)
-                        },
-                    }
-                }
-            }
-
-            // Only render if something changed
-            if (self.state.needs_render) {
-                try self.render();
-                self.state.needs_render = false;
-            }
-        }
-    }
-};
+            break :blk features.FlagValue{ .int = value };
+        },
+    };
+}
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // Use DebugAllocator in debug builds for leak detection,
+    // SmpAllocator in release builds for production performance
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    const allocator = if (builtin.mode == .Debug)
+        debug_alloc.allocator()
+    else
+        std.heap.smp_allocator;
+    defer if (builtin.mode == .Debug) {
+        _ = debug_alloc.deinit();
+    };
 
-    var app = App.init(allocator) catch |err| {
-        if (err == error.NoItemsProvided) {
-            std.debug.print("Error: No items provided on stdin\n", .{});
-            std.debug.print("Usage: echo -e \"Item 1\\nItem 2\" | zmenu\n", .{});
-            std.process.exit(1);
+    // Check for --version or --features flag
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len > 1) {
+        if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
+            try printVersion();
+            return;
+        } else if (std.mem.eql(u8, args[1], "--features")) {
+            try printFeatures();
+            return;
+        } else if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
+            printHelp();
+            return;
         }
-        return err;
-    };
-    defer app.deinit();
+    }
 
-    try app.run();
+    // Parse --monitor flag
+    var monitor_index: ?usize = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--monitor") or std.mem.eql(u8, args[i], "-m")) {
+            if (i + 1 >= args.len) {
+                std.log.err("--monitor requires a numeric argument", .{});
+                std.process.exit(1);
+            }
+            monitor_index = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+                std.log.err("--monitor argument must be a valid number", .{});
+                std.process.exit(1);
+            };
+            i += 1; // Skip the argument value
+        }
+    }
+
+    // Parse feature-specific CLI flags
+    var parsed_flags = try parseFeatureFlags(args, allocator);
+    defer parsed_flags.deinit();
+
+    var application = try app.App.init(allocator, monitor_index, &parsed_flags);
+    defer application.deinit();
+
+    try application.run();
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
+fn printVersion() !void {
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
 
-test "fuzzyMatch - basic matching" {
-    try std.testing.expect(App.fuzzyMatch("hello world", "hello"));
-    try std.testing.expect(App.fuzzyMatch("hello world", "hlo"));
-    try std.testing.expect(App.fuzzyMatch("hello world", "hw"));
-    try std.testing.expect(App.fuzzyMatch("hello world", ""));
-    try std.testing.expect(!App.fuzzyMatch("hello world", "xyz"));
-    try std.testing.expect(!App.fuzzyMatch("hello world", "dlrow"));
+    try stdout.writeAll("zmenu 0.2.0 - Cross-platform dmenu-like application launcher\n");
+    try stdout.writeAll("Built with Zig 0.15.2\n");
+
+    try stdout.flush();
 }
 
-test "fuzzyMatch - case insensitive" {
-    try std.testing.expect(App.fuzzyMatch("Hello World", "hello"));
-    try std.testing.expect(App.fuzzyMatch("HELLO WORLD", "hello"));
-    try std.testing.expect(App.fuzzyMatch("HeLLo WoRLD", "hw"));
+fn printFeatures() !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    try stdout.writeAll("zmenu compile-time features:\n\n");
+
+    if (features.enabled_count == 0) {
+        try stdout.writeAll("  [none enabled - minimal build]\n\n");
+    } else {
+        try stdout.print("Enabled features ({d}):\n", .{features.enabled_count});
+
+        inline for (features.enabled_features) |feature| {
+            try stdout.print("  ✓ {s}\n", .{feature.name});
+        }
+        try stdout.writeAll("\n");
+    }
+
+    try stdout.writeAll("Configuration:\n");
+    try stdout.print("  - max_visible_items: {d}\n", .{config.limits.max_visible_items});
+    try stdout.print("  - max_item_length: {d}\n", .{config.limits.max_item_length});
+    try stdout.print("  - case_sensitive: {}\n", .{config.features.case_sensitive});
+    try stdout.print("  - match_mode: {s}\n", .{@tagName(config.features.match_mode)});
+
+    if (@hasDecl(config.features, "history") and config.features.history) {
+        try stdout.print("  - history_max_entries: {d}\n", .{config.features.history_max_entries});
+    }
+
+    try stdout.flush();
 }
 
-test "fuzzyMatch - UTF-8 safe" {
-    // UTF-8 bytes are matched as-is (no case conversion for non-ASCII)
-    try std.testing.expect(App.fuzzyMatch("café résumé", "café"));
-    try std.testing.expect(App.fuzzyMatch("日本語テスト", "日本"));
-    // ASCII parts still case-insensitive
-    try std.testing.expect(App.fuzzyMatch("CAFÉ", "caf")); // Matches CAF
-    // Mixed case in non-ASCII doesn't match differently-cased ASCII
-    try std.testing.expect(!App.fuzzyMatch("café", "cafe")); // é != e
-    try std.testing.expect(!App.fuzzyMatch("Düsseldorf", "dusseldorf")); // ü != u
+fn printHelp() void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    _ = stdout.writeAll(
+        \\zmenu - Cross-platform dmenu-like application launcher
+        \\
+        \\Usage:
+        \\  echo -e "Item 1\nItem 2\nItem 3" | zmenu
+        \\  seq 1 100 | zmenu
+        \\
+        \\Options:
+        \\  -h, --help      Show this help message
+        \\  -v, --version   Show version information
+        \\  --features      Show compile-time features and configuration
+        \\  -m, --monitor N Specify monitor/display index (0 = primary)
+        \\
+    ) catch {};
+
+    // Add feature-specific flags (compile-time generated)
+    const feature_help = comptime features.getFeatureFlagsHelp();
+    if (feature_help.len > 0) {
+        _ = stdout.writeAll(feature_help) catch {};
+    }
+
+    _ = stdout.writeAll(
+        \\
+        \\Configuration:
+        \\  Copy config.def.zig to config.zig and customize, then rebuild
+        \\
+        \\Keyboard shortcuts:
+        \\  Enter           Confirm selection
+        \\  Escape/Ctrl+C   Cancel and exit
+        \\  Up/Down/j/k     Navigate items
+        \\  Tab/Shift+Tab   Navigate items
+        \\  Home/End        Jump to first/last item
+        \\  PgUp/PgDown     Navigate by page
+        \\  Backspace       Delete character
+        \\  Ctrl+U          Clear input
+        \\  Ctrl+W          Delete word
+        \\
+    ) catch {};
+
+    stdout.flush() catch {};
 }
 
-test "findUtf8Boundary - no truncation needed" {
-    const text = "hello";
-    try std.testing.expectEqual(@as(usize, 5), App.findUtf8Boundary(text, 10));
-    try std.testing.expectEqual(@as(usize, 5), App.findUtf8Boundary(text, 5));
-}
+test "parseFlag - string flag rejects value that looks like another flag" {
+    // --hist-file --hist-limit (user forgot the path argument).
+    // parseFlag should reject values starting with "-" for string/int flags.
 
-test "findUtf8Boundary - ASCII truncation" {
-    const text = "hello world";
-    try std.testing.expectEqual(@as(usize, 5), App.findUtf8Boundary(text, 5));
-}
-
-test "findUtf8Boundary - UTF-8 truncation" {
-    // "café" = c(1) a(1) f(1) é(2 bytes: 0xC3 0xA9) = 5 bytes total
-    const text = "café";
-    try std.testing.expectEqual(@as(usize, 5), App.findUtf8Boundary(text, 10)); // No truncation
-    try std.testing.expectEqual(@as(usize, 5), App.findUtf8Boundary(text, 5)); // Exactly at boundary
-    try std.testing.expectEqual(@as(usize, 3), App.findUtf8Boundary(text, 4)); // Would split é, backs up to 3
-    try std.testing.expectEqual(@as(usize, 3), App.findUtf8Boundary(text, 3)); // At 'f'
-}
-
-test "findUtf8Boundary - multi-byte characters" {
-    // "日本語" = 3 chars, each 3 bytes = 9 bytes total
-    const text = "日本語";
-    try std.testing.expectEqual(@as(usize, 9), App.findUtf8Boundary(text, 10));
-    try std.testing.expectEqual(@as(usize, 9), App.findUtf8Boundary(text, 9));
-    try std.testing.expectEqual(@as(usize, 6), App.findUtf8Boundary(text, 8)); // Would split 3rd char
-    try std.testing.expectEqual(@as(usize, 6), App.findUtf8Boundary(text, 7)); // Would split 3rd char
-    try std.testing.expectEqual(@as(usize, 6), App.findUtf8Boundary(text, 6)); // At boundary
-    try std.testing.expectEqual(@as(usize, 3), App.findUtf8Boundary(text, 5)); // Would split 2nd char
-}
-
-test "colorEquals - same colors" {
-    const color1 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
-    const color2 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
-    try std.testing.expect(App.colorEquals(color1, color2));
-}
-
-test "colorEquals - different colors" {
-    const color1 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 64, .a = 255 };
-    const color2 = sdl.pixels.Color{ .r = 255, .g = 128, .b = 65, .a = 255 };
-    try std.testing.expect(!App.colorEquals(color1, color2));
-}
-
-test "Config - buffer sizes aligned with limits" {
-    const config = Config{};
-    // Prompt buffer must accommodate max_input_length + prefix + null
-    try std.testing.expect(config.limits.prompt_buffer_size >= config.limits.max_input_length + 10);
-    // Item buffer must accommodate max_item_length + prefix + null
-    try std.testing.expect(config.limits.item_buffer_size >= config.limits.max_item_length + 10);
-    // Ellipsis margin should be reasonable
-    try std.testing.expect(config.limits.input_ellipsis_margin < config.limits.max_input_length);
-}
-
-test "deleteLastCodepoint - ASCII" {
-    const allocator = std.testing.allocator;
-    var app = App{
-        .sdl = .{
-            .window = undefined,
-            .renderer = undefined,
-            .font = undefined,
-            .loaded_font_path = undefined,
-        },
-        .state = .{
-            .input_buffer = std.ArrayList(u8).empty,
-            .items = std.ArrayList([]const u8).empty,
-            .filtered_items = std.ArrayList(usize).empty,
-            .selected_index = 0,
-            .scroll_offset = 0,
-            .needs_render = false,
-        },
-        .render_ctx = .{
-            .prompt_buffer = undefined,
-            .item_buffer = undefined,
-            .count_buffer = undefined,
-            .scroll_buffer = undefined,
-            .prompt_cache = undefined,
-            .count_cache = undefined,
-            .no_match_cache = undefined,
-            .display_scale = 1.0,
-            .pixel_width = 800,
-            .pixel_height = 300,
-            .current_width = 800,
-            .current_height = 300,
-        },
-        .config = Config{},
-        .allocator = allocator,
-    };
-
-    try app.state.input_buffer.appendSlice(allocator, "hello");
-    app.deleteLastCodepoint();
-    try std.testing.expectEqualStrings("hell", app.state.input_buffer.items);
-
-    app.state.input_buffer.deinit(allocator);
-}
-
-test "deleteLastCodepoint - UTF-8 multi-byte" {
-    const allocator = std.testing.allocator;
-    var app = App{
-        .sdl = .{
-            .window = undefined,
-            .renderer = undefined,
-            .font = undefined,
-            .loaded_font_path = undefined,
-        },
-        .state = .{
-            .input_buffer = std.ArrayList(u8).empty,
-            .items = std.ArrayList([]const u8).empty,
-            .filtered_items = std.ArrayList(usize).empty,
-            .selected_index = 0,
-            .scroll_offset = 0,
-            .needs_render = false,
-        },
-        .render_ctx = .{
-            .prompt_buffer = undefined,
-            .item_buffer = undefined,
-            .count_buffer = undefined,
-            .scroll_buffer = undefined,
-            .prompt_cache = undefined,
-            .count_cache = undefined,
-            .no_match_cache = undefined,
-            .display_scale = 1.0,
-            .pixel_width = 800,
-            .pixel_height = 300,
-            .current_width = 800,
-            .current_height = 300,
-        },
-        .config = Config{},
-        .allocator = allocator,
+    const string_flag = features.CliFlag{
+        .long = "hist-file",
+        .short = 'H',
+        .description = "Custom history file path",
+        .value_type = .string,
     };
 
-    // "café" = c a f é(2 bytes)
-    try app.state.input_buffer.appendSlice(allocator, "café");
-    try std.testing.expectEqual(@as(usize, 5), app.state.input_buffer.items.len);
-
-    app.deleteLastCodepoint(); // Remove é (2 bytes)
-    try std.testing.expectEqualStrings("caf", app.state.input_buffer.items);
-    try std.testing.expectEqual(@as(usize, 3), app.state.input_buffer.items.len);
-
-    app.state.input_buffer.deinit(allocator);
+    // Missing value: next arg is another flag
+    const args = &[_][]const u8{ "zmenu", "--hist-file", "--hist-limit" };
+    const result = parseFlag(args, string_flag);
+    try std.testing.expectError(error.MissingFlagValue, result);
 }
 
-test "deleteLastCodepoint - UTF-8 three-byte character" {
-    const allocator = std.testing.allocator;
-    var app = App{
-        .sdl = .{
-            .window = undefined,
-            .renderer = undefined,
-            .font = undefined,
-            .loaded_font_path = undefined,
-        },
-        .state = .{
-            .input_buffer = std.ArrayList(u8).empty,
-            .items = std.ArrayList([]const u8).empty,
-            .filtered_items = std.ArrayList(usize).empty,
-            .selected_index = 0,
-            .scroll_offset = 0,
-            .needs_render = false,
-        },
-        .render_ctx = .{
-            .prompt_buffer = undefined,
-            .item_buffer = undefined,
-            .count_buffer = undefined,
-            .scroll_buffer = undefined,
-            .prompt_cache = undefined,
-            .count_cache = undefined,
-            .no_match_cache = undefined,
-            .display_scale = 1.0,
-            .pixel_width = 800,
-            .pixel_height = 300,
-            .current_width = 800,
-            .current_height = 300,
-        },
-        .config = Config{},
-        .allocator = allocator,
+test "parseFlag - short flag rejects value that looks like a flag" {
+    const string_flag = features.CliFlag{
+        .long = "hist-file",
+        .short = 'H',
+        .description = "Custom history file path",
+        .value_type = .string,
     };
 
-    // "日" = 3 bytes
-    try app.state.input_buffer.appendSlice(allocator, "a日");
-    try std.testing.expectEqual(@as(usize, 4), app.state.input_buffer.items.len);
-
-    app.deleteLastCodepoint(); // Remove 日 (3 bytes)
-    try std.testing.expectEqualStrings("a", app.state.input_buffer.items);
-    try std.testing.expectEqual(@as(usize, 1), app.state.input_buffer.items.len);
-
-    app.state.input_buffer.deinit(allocator);
+    const args = &[_][]const u8{ "zmenu", "-H", "--something" };
+    const result = parseFlag(args, string_flag);
+    try std.testing.expectError(error.MissingFlagValue, result);
 }
 
-test "deleteLastCodepoint - empty buffer" {
-    const allocator = std.testing.allocator;
-    var app = App{
-        .sdl = .{
-            .window = undefined,
-            .renderer = undefined,
-            .font = undefined,
-            .loaded_font_path = undefined,
-        },
-        .state = .{
-            .input_buffer = std.ArrayList(u8).empty,
-            .items = std.ArrayList([]const u8).empty,
-            .filtered_items = std.ArrayList(usize).empty,
-            .selected_index = 0,
-            .scroll_offset = 0,
-            .needs_render = false,
-        },
-        .render_ctx = .{
-            .prompt_buffer = undefined,
-            .item_buffer = undefined,
-            .count_buffer = undefined,
-            .scroll_buffer = undefined,
-            .prompt_cache = undefined,
-            .count_cache = undefined,
-            .no_match_cache = undefined,
-            .display_scale = 1.0,
-            .pixel_width = 800,
-            .pixel_height = 300,
-            .current_width = 800,
-            .current_height = 300,
-        },
-        .config = Config{},
-        .allocator = allocator,
+test "parseFlag - int flag accepts negative values" {
+    const int_flag = features.CliFlag{
+        .long = "offset",
+        .description = "An offset value",
+        .value_type = .int,
     };
 
-    app.deleteLastCodepoint(); // Should not crash
-    try std.testing.expectEqual(@as(usize, 0), app.state.input_buffer.items.len);
-
-    app.state.input_buffer.deinit(allocator);
+    const args = &[_][]const u8{ "zmenu", "--offset", "-5" };
+    const result = try parseFlag(args, int_flag);
+    if (result) |val| {
+        try std.testing.expectEqual(@as(i64, -5), val.int);
+    } else {
+        return error.TestExpectedEqual;
+    }
 }
 
-test "isatty - stdin detection works" {
-    // This test verifies that std.posix.isatty() is callable
-    // When running tests, stdin is typically redirected (not a TTY)
-    // When running the app directly in terminal, stdin IS a TTY
-    // The actual behavior is tested manually in integration tests
-    const result = std.posix.isatty(std.posix.STDIN_FILENO);
-    // Just verify it doesn't crash and returns a boolean
-    _ = result;
+test "parseFlag - int flag rejects non-numeric value" {
+    const int_flag = features.CliFlag{
+        .long = "offset",
+        .description = "An offset value",
+        .value_type = .int,
+    };
+
+    const args = &[_][]const u8{ "zmenu", "--offset", "--other-flag" };
+    const result = parseFlag(args, int_flag);
+    try std.testing.expectError(error.InvalidFlagValue, result);
 }
 
-test "NoItemsProvided error propagates correctly" {
-    // This test verifies that the error.NoItemsProvided error
-    // is handled correctly in the main flow
-    // The actual TTY check in loadItemsFromStdin() returns this error
-    // when stdin is a TTY (interactive terminal)
-    const err = error.NoItemsProvided;
-    try std.testing.expectEqual(error.NoItemsProvided, err);
+test "parseFlag - string flag accepts normal value" {
+    const string_flag = features.CliFlag{
+        .long = "hist-file",
+        .short = 'H',
+        .description = "Custom history file path",
+        .value_type = .string,
+    };
+
+    const args = &[_][]const u8{ "zmenu", "--hist-file", "/tmp/history" };
+    const result = try parseFlag(args, string_flag);
+    if (result) |val| {
+        try std.testing.expectEqualStrings("/tmp/history", val.string);
+    } else {
+        return error.TestExpectedEqual;
+    }
+}
+
+test "parseFlag - uses no heap allocation for flag matching" {
+    // Bug: parseFlag used allocPrint + catch unreachable to build "--flagname"
+    // for comparison. This is UB in release on OOM. The fix should use
+    // std.mem.startsWith which requires zero allocation.
+
+    const test_flag = features.CliFlag{
+        .long = "test-flag",
+        .short = 't',
+        .description = "A test flag",
+        .value_type = .bool,
+    };
+
+    // This should work without any allocator — zero allocations needed
+    const args = &[_][]const u8{ "zmenu", "--test-flag" };
+    const result = parseFlag(args, test_flag) catch |err| {
+        std.debug.print("BUG: parseFlag failed with allocator error: {}\n", .{err});
+        return error.TestExpectedEqual;
+    };
+
+    // Should find the flag
+    if (result) |val| {
+        try std.testing.expect(val.bool == true);
+    } else {
+        std.debug.print("BUG: parseFlag didn't find --test-flag\n", .{});
+        return error.TestExpectedEqual;
+    }
+}
+
+// Re-export tests from modules
+test {
+    _ = @import("app.zig");
+    _ = @import("input.zig");
+    _ = @import("features.zig");
+    _ = @import("features/history.zig");
 }
