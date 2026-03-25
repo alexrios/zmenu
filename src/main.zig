@@ -23,7 +23,7 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
 
     // Initialize storage for each feature
     inline for (features.enabled_features) |_| {
-        try result.values.append(allocator, std.ArrayList(features.FlagValue).empty);
+        try result.values.append(allocator, std.ArrayList(?features.FlagValue).empty);
     }
 
     // Parse flags for each enabled feature
@@ -46,13 +46,8 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
                     std.log.err("required flag --{s} not provided", .{flag.long});
                     return error.MissingRequiredFlag;
                 } else {
-                    // Optional flag not provided, use zero value
-                    const zero_value = switch (flag.value_type) {
-                        .string => features.FlagValue{ .string = "" },
-                        .int => features.FlagValue{ .int = 0 },
-                        .bool => features.FlagValue{ .bool = false },
-                    };
-                    try result.values.items[feat_idx].append(allocator, zero_value);
+                    // Optional flag not provided — store null (distinguishable from zero)
+                    try result.values.items[feat_idx].append(allocator, null);
                 }
             }
         }

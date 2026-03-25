@@ -1,5 +1,3 @@
-//! Feature hook system - Zig's answer to dmenu patches
-//!
 //! Compile-time feature registration with zero overhead for disabled features.
 //! See docs/features.md for detailed documentation.
 
@@ -38,18 +36,57 @@ pub const CliFlag = struct {
 /// Feature initialization data (passed to onInit hook)
 pub const FeatureInitData = struct {
     allocator: std.mem.Allocator,
-    cli_values: []const FlagValue,  // Parsed CLI flag values (indexed by flag order)
+    cli_values: []const ?FlagValue, // Parsed CLI flag values (null = not provided)
+    cli_flags: []const CliFlag, // Flag declarations (for name-based lookup)
+
+    /// Look up a flag value by name. Returns null if not found or not provided.
+    pub fn getFlag(self: FeatureInitData, name: []const u8) ?FlagValue {
+        for (self.cli_flags, 0..) |flag, i| {
+            if (std.mem.eql(u8, flag.long, name)) {
+                if (i < self.cli_values.len) return self.cli_values[i];
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /// Get a string flag value by name.
+    pub fn getString(self: FeatureInitData, name: []const u8) ?[]const u8 {
+        const val = self.getFlag(name) orelse return null;
+        return switch (val) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Get an int flag value by name.
+    pub fn getInt(self: FeatureInitData, name: []const u8) ?i64 {
+        const val = self.getFlag(name) orelse return null;
+        return switch (val) {
+            .int => |i| i,
+            else => null,
+        };
+    }
+
+    /// Get a bool flag value by name. Returns false if not found.
+    pub fn getBool(self: FeatureInitData, name: []const u8) bool {
+        const val = self.getFlag(name) orelse return false;
+        return switch (val) {
+            .bool => |b| b,
+            else => false,
+        };
+    }
 };
 
 /// Storage for parsed CLI flag values for all features
 pub const ParsedFlags = struct {
     allocator: std.mem.Allocator,
-    values: std.ArrayList(std.ArrayList(FlagValue)),  // values[feature_idx][flag_idx]
+    values: std.ArrayList(std.ArrayList(?FlagValue)), // values[feature_idx][flag_idx], null = absent
 
     pub fn init(allocator: std.mem.Allocator) ParsedFlags {
         return .{
             .allocator = allocator,
-            .values = std.ArrayList(std.ArrayList(FlagValue)).empty,
+            .values = std.ArrayList(std.ArrayList(?FlagValue)).empty,
         };
     }
 
@@ -60,7 +97,7 @@ pub const ParsedFlags = struct {
         self.values.deinit(self.allocator);
     }
 
-    pub fn getFeatureValues(self: *const ParsedFlags, feature_idx: usize) []const FlagValue {
+    pub fn getFeatureValues(self: *const ParsedFlags, feature_idx: usize) []const ?FlagValue {
         if (feature_idx >= self.values.items.len) return &.{};
         return self.values.items[feature_idx].items;
     }
@@ -88,7 +125,7 @@ pub const Hooks = struct {
     onExit: ?*const fn (?FeatureState) void = null,
 };
 
-/// Config transform function signature (advanced - see docs/features.md)
+/// Config transform function signature
 pub const ConfigTransform = fn (comptime base_config: type) type;
 
 /// Feature definition
@@ -338,6 +375,7 @@ pub fn initAll(allocator: std.mem.Allocator, states: *FeatureStates, parsed_flag
             const init_data = FeatureInitData{
                 .allocator = allocator,
                 .cli_values = parsed_flags.getFeatureValues(i),
+                .cli_flags = feature.cli_flags orelse &.{},
             };
             states[i] = try initFn(init_data);
         }
@@ -502,4 +540,87 @@ test "Feature hooks - handle empty filtered items gracefully" {
     // Cleanup
     for (items.items) |item| item.deinit(allocator);
     deinitAll(&states, allocator);
+}
+
+test "FeatureInitData - getFlag finds flag by name" {
+    const flags = &[_]CliFlag{
+        .{ .long = "file", .description = "A file", .value_type = .string },
+        .{ .long = "count", .description = "A count", .value_type = .int },
+        .{ .long = "verbose", .description = "Verbose", .value_type = .bool },
+    };
+    const values = &[_]?FlagValue{
+        FlagValue{ .string = "/tmp/test" },
+        null,
+        FlagValue{ .bool = true },
+    };
+
+    const init_data = FeatureInitData{
+        .allocator = std.testing.allocator,
+        .cli_values = values,
+        .cli_flags = flags,
+    };
+
+    // Found flags
+    const file_val = init_data.getFlag("file");
+    try std.testing.expect(file_val != null);
+    try std.testing.expectEqualStrings("/tmp/test", file_val.?.string);
+
+    // Null (absent) flag
+    try std.testing.expect(init_data.getFlag("count") == null);
+
+    // Bool flag
+    const verbose_val = init_data.getFlag("verbose");
+    try std.testing.expect(verbose_val != null);
+    try std.testing.expect(verbose_val.?.bool == true);
+
+    // Unknown flag
+    try std.testing.expect(init_data.getFlag("unknown") == null);
+}
+
+test "FeatureInitData - typed getters" {
+    const flags = &[_]CliFlag{
+        .{ .long = "path", .description = "Path", .value_type = .string },
+        .{ .long = "limit", .description = "Limit", .value_type = .int },
+        .{ .long = "dry-run", .description = "Dry run", .value_type = .bool },
+        .{ .long = "absent", .description = "Absent", .value_type = .string },
+    };
+    const values = &[_]?FlagValue{
+        FlagValue{ .string = "/tmp" },
+        FlagValue{ .int = 42 },
+        FlagValue{ .bool = true },
+        null,
+    };
+
+    const init_data = FeatureInitData{
+        .allocator = std.testing.allocator,
+        .cli_values = values,
+        .cli_flags = flags,
+    };
+
+    // getString
+    try std.testing.expectEqualStrings("/tmp", init_data.getString("path").?);
+    try std.testing.expect(init_data.getString("limit") == null); // wrong type
+    try std.testing.expect(init_data.getString("absent") == null); // null value
+
+    // getInt
+    try std.testing.expectEqual(@as(i64, 42), init_data.getInt("limit").?);
+    try std.testing.expect(init_data.getInt("path") == null); // wrong type
+
+    // getBool
+    try std.testing.expect(init_data.getBool("dry-run") == true);
+    try std.testing.expect(init_data.getBool("absent") == false); // null → false
+    try std.testing.expect(init_data.getBool("unknown") == false); // missing → false
+}
+
+test "FeatureInitData - empty flags" {
+    const init_data = FeatureInitData{
+        .allocator = std.testing.allocator,
+        .cli_values = &.{},
+        .cli_flags = &.{},
+    };
+
+    try std.testing.expect(init_data.getFlag("anything") == null);
+    try std.testing.expect(init_data.getString("anything") == null);
+    try std.testing.expect(init_data.getInt("anything") == null);
+    try std.testing.expect(init_data.getBool("anything") == false);
 }

@@ -179,16 +179,10 @@ fn getHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
 fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.FeatureState {
     const allocator = init_data.allocator;
 
-    // Extract CLI flag values (in declaration order)
-    const custom_path: ?[]const u8 = if (init_data.cli_values.len > 0 and
-        init_data.cli_values[0] == .string)
-        init_data.cli_values[0].string
-    else
-        null;
-
-    const max_entries: usize = if (init_data.cli_values.len > 1 and
-        init_data.cli_values[1] == .int)
-        @intCast(init_data.cli_values[1].int)
+    // Extract CLI flag values by name (order-independent)
+    const custom_path = init_data.getString("hist-file");
+    const max_entries: usize = if (init_data.getInt("hist-limit")) |v|
+        @intCast(v)
     else
         history_config.max_entries;
 
