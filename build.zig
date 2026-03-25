@@ -1,5 +1,13 @@
 const std = @import("std");
 
+fn parseVersionFromZon() []const u8 {
+    const zon = @embedFile("build.zig.zon");
+    const prefix = ".version = \"";
+    const start = (std.mem.indexOf(u8, zon, prefix) orelse @compileError("no .version in build.zig.zon")) + prefix.len;
+    const end = start + (std.mem.indexOf(u8, zon[start..], "\"") orelse @compileError("unterminated version string"));
+    return zon[start..end];
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -14,6 +22,7 @@ pub fn build(b: *std.Build) void {
     // Create build options for compile-time configuration
     const options = b.addOptions();
     options.addOption(std.log.Level, "log_level", log_level);
+    options.addOption([]const u8, "version", comptime parseVersionFromZon());
 
     // Add SDL3 dependency
     const sdl3 = b.dependency("sdl3", .{

@@ -170,8 +170,7 @@ fn printVersion() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.writeAll("zmenu 0.2.0 - Cross-platform dmenu-like application launcher\n");
-    try stdout.writeAll("Built with Zig 0.15.2\n");
+    try stdout.writeAll("zmenu " ++ build_options.version ++ " - Cross-platform dmenu-like application launcher\n");
 
     try stdout.flush();
 }
@@ -248,6 +247,18 @@ fn printHelp() void {
         \\  Backspace       Delete character
         \\  Ctrl+U          Clear input
         \\  Ctrl+W          Delete word
+        \\  Type to filter   Fuzzy search
+        \\
+        \\Environment Variables:
+        \\  ZMENU_THEME      Set color theme (default: mocha)
+        \\                   Available: mocha, latte, frappe, macchiato,
+        \\                              dracula, gruvbox, nord, solarized
+        \\
+        \\Examples:
+        \\  echo -e "Apple\nBanana\nCherry" | zmenu
+        \\  find . -type f | zmenu
+        \\  cat items.txt | zmenu
+        \\  echo -e "Option A\nOption B" | ZMENU_THEME=dracula zmenu
         \\
     ) catch {};
 
