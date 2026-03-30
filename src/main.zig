@@ -34,7 +34,6 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
                     switch (err) {
                         error.MissingFlagValue => std.log.err("--{s} requires a value", .{flag.long}),
                         error.InvalidFlagValue => std.log.err("--{s} requires a valid value", .{flag.long}),
-                        else => std.log.err("unexpected error parsing --{s}: {}", .{ flag.long, err }),
                     }
                     return err;
                 };
