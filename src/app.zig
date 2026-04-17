@@ -27,6 +27,7 @@ pub const App = struct {
     color_scheme: ColorScheme,
     allocator: std.mem.Allocator,
     feature_states: features.FeatureStates, // Zero-size when no features enabled
+    has_provided_items: bool = false, // True if features injected items via provideItems
 
     pub fn init(allocator: std.mem.Allocator, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
         // Initialize SDL
@@ -102,6 +103,28 @@ pub const App = struct {
 
         // Initialize enabled features with parsed CLI flags
         try features.initAll(allocator, &app.feature_states, parsed_flags);
+        errdefer features.deinitAll(&app.feature_states, allocator);
+
+        // Let features inject items (e.g., app launcher discovers installed apps)
+        app.has_provided_items = try features.callProvideItems(
+            &app.feature_states,
+            &app.state.items,
+            allocator,
+        );
+        errdefer {
+            for (app.state.items.items) |item| item.deinit(allocator);
+            app.state.items.deinit(allocator);
+        }
+
+        // Measure injected items for window sizing
+        if (app.has_provided_items) {
+            for (app.state.items.items) |item| {
+                const item_width = app.measureItemWidth(item);
+                if (item_width > app.render_ctx.cached_max_item_width) {
+                    app.render_ctx.cached_max_item_width = item_width;
+                }
+            }
+        }
 
         try app.updateWindowSize();
 
@@ -131,21 +154,27 @@ pub const App = struct {
         self.sdl.deinit();
     }
 
-    pub fn run(self: *App) !void {
+    pub fn run(self: *App, skip_stdin: bool) !void {
         var running = true;
+        const stdin_is_tty = std.posix.isatty(std.fs.File.stdin().handle);
+        const should_read_stdin = !skip_stdin and !stdin_is_tty;
 
-        // Check if stdin is a TTY (no piped input)
-        if (std.posix.isatty(std.fs.File.stdin().handle)) {
+        // Require either provided items or piped stdin
+        if (!self.has_provided_items and stdin_is_tty) {
             const stderr = std.fs.File.stderr();
             _ = stderr.write("Error: No items provided on stdin\n") catch {};
             _ = stderr.write("Usage: echo -e \"Item 1\\nItem 2\" | zmenu\n") catch {};
+            _ = stderr.write("   or: zmenu --app-launcher\n") catch {};
             return error.NoItemsProvided;
         }
 
-        // Start threaded stdin reader (cross-platform)
-        var stdin_reader = ThreadedStdinReader.init(self.allocator);
-        try stdin_reader.startThread(); // Spawn thread after reader is in final memory location
-        defer stdin_reader.deinit();
+        // Start threaded stdin reader if we need stdin
+        var stdin_reader: ?ThreadedStdinReader = if (should_read_stdin) blk: {
+            var reader = ThreadedStdinReader.init(self.allocator);
+            try reader.startThread();
+            break :blk reader;
+        } else null;
+        defer if (stdin_reader) |*reader| reader.deinit();
 
         // Buffer for lines from reader thread
         var new_lines = std.ArrayList([]u8).empty;
@@ -156,13 +185,24 @@ pub const App = struct {
             new_lines.deinit(self.allocator);
         }
 
-        // Initial render (shows loading screen)
+        // If features provided items and we're not reading stdin, go straight to ready
+        if (self.has_provided_items and !should_read_stdin) {
+            if (self.state.items.items.len == 0) {
+                const stderr = std.fs.File.stderr();
+                _ = stderr.write("Error: No applications found\n") catch {};
+                return error.NoItemsProvided;
+            }
+            self.state.input_state = .ready;
+            try self.updateFilter();
+        }
+
+        // Initial render
         try self.render();
         self.state.needs_render = false;
 
         while (running) {
             // Check for new lines from reader thread (non-blocking)
-            const eof = try stdin_reader.pollLines(&new_lines);
+            const eof = if (stdin_reader) |*reader| try reader.pollLines(&new_lines) else true;
 
             // Process any new lines
             if (new_lines.items.len > 0) {
@@ -179,7 +219,7 @@ pub const App = struct {
                 // Stdin complete - transition to ready state
                 self.state.input_state = .ready;
 
-                // Handle empty stdin case
+                // Handle empty case (no stdin items AND no provided items)
                 if (self.state.items.items.len == 0) {
                     const stderr = std.fs.File.stderr();
                     _ = stderr.write("Error: No items provided on stdin\n") catch {};

@@ -31,6 +31,12 @@ pub const features = struct {
     /// Degrades gracefully in headless/SSH environments (warns but continues)
     pub const clipboard: bool = true;
 
+    /// App Launcher: discover and show installed applications
+    /// Linux: scans XDG .desktop files (including Flatpak and Snap)
+    /// macOS: walks .app bundles in standard directories
+    /// Usage: zmenu --app-launcher | sh
+    pub const app_launcher: bool = false;
+
 };
 
 pub const MatchMode = enum {

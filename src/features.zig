@@ -131,6 +131,11 @@ pub const Hooks = struct {
     /// Must complete within global timeout (see config.exit_timeout_ms)
     /// No allocations allowed, no error returns
     onExit: ?*const fn (?FeatureState) void = null,
+
+    /// Called after feature init to let features inject items into the shared list.
+    /// Features append Item structs via the provided ArrayList and allocator.
+    /// Called before stdin reading begins.
+    provideItems: ?*const fn (?FeatureState, *std.ArrayList(types.Item), std.mem.Allocator) anyerror!void = null,
 };
 
 /// Feature definition
@@ -261,6 +266,10 @@ fn buildFeatureList() []const Feature {
             list = list ++ &[_]Feature{@import("features/clipboard.zig").feature};
         }
 
+        if (@hasDecl(config.features, "app_launcher") and config.features.app_launcher) {
+            list = list ++ &[_]Feature{@import("features/app_launcher.zig").feature};
+        }
+
         validateCliFlags(list);
         return list;
     }
@@ -372,6 +381,26 @@ pub fn callOnExit(states: *FeatureStates, timeout_ms: u32) bool {
     }
 
     return all_completed;
+}
+
+/// Call provideItems hooks - called after feature init, before stdin reading
+/// Returns true if any feature provided items
+pub fn callProvideItems(
+    states: *FeatureStates,
+    items: *std.ArrayList(types.Item),
+    allocator: std.mem.Allocator,
+) !bool {
+    if (enabled_count == 0) return false;
+
+    const initial_count = items.items.len;
+
+    inline for (enabled_features, 0..) |feature, i| {
+        if (feature.hooks.provideItems) |provideFn| {
+            try provideFn(states[i], items, allocator);
+        }
+    }
+
+    return items.items.len > initial_count;
 }
 
 test "Feature hooks - handle empty filtered items gracefully" {

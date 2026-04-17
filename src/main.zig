@@ -31,11 +31,7 @@ fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !fe
         if (feature.cli_flags) |flags| {
             for (flags) |flag| {
                 const value = parseFlag(args, flag) catch |err| {
-                    switch (err) {
-                        error.MissingFlagValue => std.log.err("--{s} requires a value", .{flag.long}),
-                        error.InvalidFlagValue => std.log.err("--{s} requires a valid value", .{flag.long}),
-                        else => std.log.err("unexpected error parsing --{s}: {}", .{ flag.long, err }),
-                    }
+                    std.log.err("error parsing --{s}: {}", .{ flag.long, err });
                     return err;
                 };
                 if (value) |v| {
@@ -162,7 +158,17 @@ pub fn main() !void {
     var application = try app.App.init(allocator, monitor_index, &parsed_flags);
     defer application.deinit();
 
-    try application.run();
+    // Check if app launcher wants to skip stdin
+    const skip_stdin = blk: {
+        if (!application.has_provided_items) break :blk false;
+        // If features provided items, skip stdin unless --app-merge-stdin is set
+        for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--app-merge-stdin")) break :blk false;
+        }
+        break :blk true;
+    };
+
+    try application.run(skip_stdin);
 }
 
 fn printVersion() !void {
@@ -363,4 +369,11 @@ test {
     _ = @import("input.zig");
     _ = @import("features.zig");
     _ = @import("features/history.zig");
+    _ = @import("features/app_launcher/common.zig");
+    if (builtin.os.tag == .linux) {
+        _ = @import("features/app_launcher/linux.zig");
+    }
+    if (builtin.os.tag == .macos) {
+        _ = @import("features/app_launcher/macos.zig");
+    }
 }
