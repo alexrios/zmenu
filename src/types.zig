@@ -22,18 +22,27 @@ pub const Item = struct {
 
         if (std.mem.indexOfScalar(u8, owned_line, '|')) |pipe_idx| {
             // Found pipe: split into display|value
-            return Item{
+            const item = Item{
                 .raw = owned_line,
                 .display = owned_line[0..pipe_idx],
                 .value = owned_line[pipe_idx + 1 ..],
             };
+            // Round-trip: display and value are slices into raw with the pipe
+            // byte as the only gap. Encodes the layout the caller depends on.
+            std.debug.assert(item.display.len + 1 + item.value.len == item.raw.len);
+            std.debug.assert(item.display.ptr == item.raw.ptr);
+            std.debug.assert(@intFromPtr(item.value.ptr) == @intFromPtr(item.raw.ptr) + item.display.len + 1);
+            return item;
         } else {
             // No pipe: entire text is both display and value
-            return Item{
+            const item = Item{
                 .raw = owned_line,
                 .display = owned_line,
                 .value = owned_line,
             };
+            std.debug.assert(item.display.ptr == item.raw.ptr and item.value.ptr == item.raw.ptr);
+            std.debug.assert(item.display.len == item.raw.len and item.value.len == item.raw.len);
+            return item;
         }
     }
 

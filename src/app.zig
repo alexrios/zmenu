@@ -376,6 +376,11 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
         if (trimmed.len > 0) {
             const truncate_len = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
+            // Paired with findUtf8Boundary's internal postcondition: the
+            // returned index must be on a leading byte (or at end / zero).
+            std.debug.assert(truncate_len <= trimmed.len);
+            std.debug.assert(truncate_len == 0 or truncate_len == trimmed.len or (trimmed[truncate_len] & 0xC0) != 0x80);
+
             const final_line = trimmed[0..truncate_len];
             const item = try types.Item.parse(self.allocator, final_line);
             try self.state.items.append(self.allocator, item);
@@ -560,7 +565,14 @@ pub const App = struct {
 
         if (key == .backspace) {
             if (self.state.input_buffer.items.len > 0) {
+                const old_len = self.state.input_buffer.items.len;
                 input.deleteLastCodepoint(&self.state.input_buffer);
+                // Paired with deleteLastCodepoint's internal asserts: removed
+                // exactly one codepoint, so 1..=4 bytes (UTF-8 max width).
+                const removed = old_len - self.state.input_buffer.items.len;
+                std.debug.assert(self.state.input_buffer.items.len < old_len);
+                std.debug.assert(removed >= 1 and removed <= 4);
+
                 try self.updateFilter();
                 self.state.needs_render = true;
             }
@@ -861,6 +873,9 @@ pub const App = struct {
 
             const preview_text = if (config.multivalue.preview_max_length > 0 and item.value.len > config.multivalue.preview_max_length) blk: {
                 const truncate_len = input.findUtf8Boundary(item.value, config.multivalue.preview_max_length);
+                // Paired: re-verify the boundary on the caller's side.
+                std.debug.assert(truncate_len <= item.value.len);
+                std.debug.assert(truncate_len == 0 or truncate_len == item.value.len or (item.value[truncate_len] & 0xC0) != 0x80);
                 break :blk std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}...", .{item.value[0..truncate_len]}) catch "...";
             } else std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}", .{item.value}) catch "...";
 
