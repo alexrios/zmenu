@@ -648,40 +648,64 @@ pub const App = struct {
         }
     }
 
+    /// Top-level orchestrator. Each helper is responsible for a single visual
+    /// element. Order of calls below is the SDL drawing/layering order — do not
+    /// reorder without understanding the implications (background must be first,
+    /// present() must be last).
     fn render(self: *App) !void {
-        try self.sdl.renderer.setDrawColor(self.color_scheme.background);
-        try self.sdl.renderer.clear();
-
+        try self.renderClear();
         const scale = self.render_ctx.window.display_scale;
 
-        // Render based on input state
+        // Loading state has its own minimal layout and short-circuits.
         switch (self.state.input_state) {
             .loading => |data| {
-                // Show loading screen while reading stdin
-                const loading_text = std.fmt.bufPrintZ(
-                    self.render_ctx.prompt_buffer,
-                    "Loading...",
-                    .{},
-                ) catch "Loading...";
-
-                try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, loading_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
-
-                // Show item count
-                const count_text = std.fmt.bufPrintZ(
-                    self.render_ctx.count_buffer,
-                    "Loaded {d} items",
-                    .{data.items_loaded},
-                ) catch "Loading...";
-
-                try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
-
+                try self.renderLoading(scale, data.items_loaded);
                 try self.sdl.renderer.present();
                 return;
             },
             .ready => {},
         }
 
-        // Prompt
+        try self.renderPromptLine(scale);
+        try self.renderCounter(scale);
+        try self.renderItemList(scale);
+        try self.sdl.renderer.present();
+    }
+
+    /// Fill the framebuffer with the configured background color.
+    fn renderClear(self: *App) !void {
+        try self.sdl.renderer.setDrawColor(self.color_scheme.background);
+        try self.sdl.renderer.clear();
+    }
+
+    /// Render the loading screen (shown while stdin is still being read).
+    fn renderLoading(self: *App, scale: f32, items_loaded: usize) !void {
+        std.debug.assert(scale > 0.0);
+        std.debug.assert(self.state.input_state == .loading);
+
+        const loading_text = std.fmt.bufPrintZ(
+            self.render_ctx.prompt_buffer,
+            "Loading...",
+            .{},
+        ) catch "Loading...";
+
+        try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, loading_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
+
+        const count_text = std.fmt.bufPrintZ(
+            self.render_ctx.count_buffer,
+            "Loaded {d} items",
+            .{items_loaded},
+        ) catch "Loading...";
+
+        try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
+    }
+
+    /// Render the prompt line: "> " followed by the user's input (with leading
+    /// ellipsis if the input exceeds the visible threshold). UTF-8 safe.
+    fn renderPromptLine(self: *App, scale: f32) !void {
+        std.debug.assert(scale > 0.0);
+        std.debug.assert(config.limits.input_ellipsis_margin < config.limits.max_input_length);
+
         const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
             const ellipsis_threshold = config.limits.max_input_length - config.limits.input_ellipsis_margin;
             const display_input = if (self.state.input_buffer.items.len > ellipsis_threshold)
@@ -702,8 +726,13 @@ pub const App = struct {
             std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
 
         try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, prompt_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
+    }
 
-        // Count
+    /// Render the "filtered/total" match counter on the right side of the prompt row.
+    fn renderCounter(self: *App, scale: f32) !void {
+        std.debug.assert(scale > 0.0);
+        std.debug.assert(self.state.filtered_items.items.len <= self.state.items.items.len);
+
         const count_text = std.fmt.bufPrintZ(
             self.render_ctx.count_buffer,
             "{d}/{d}",
@@ -713,65 +742,89 @@ pub const App = struct {
         const count_text_w, _ = try self.sdl.font.getStringSize(count_text);
         const count_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(count_text_w)) - config.layout.width_padding) * scale;
         try self.renderCachedText(count_x, config.layout.prompt_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
+    }
 
-        // Items
+    /// Render the filtered item list (or the empty-state message), plus the
+    /// scroll indicator when the list overflows the visible window.
+    fn renderItemList(self: *App, scale: f32) !void {
+        std.debug.assert(scale > 0.0);
+
         const filtered_len = self.state.filtered_items.items.len;
-
-        if (filtered_len > 0) {
-            const visible_end = @min(self.state.scroll_offset + config.limits.max_visible_items, filtered_len);
-            var y_pos: f32 = config.layout.items_start_y * scale;
-
-            for (self.state.scroll_offset..visible_end) |i| {
-                if (i >= filtered_len) break;
-
-                const item_index = self.state.filtered_items.items[i];
-                if (item_index >= self.state.items.items.len) continue;
-
-                const item = self.state.items.items[item_index];
-                const is_selected = (i == self.state.selected_index);
-                const prefix = if (is_selected) "> " else "  ";
-
-                // Render display field with prefix
-                const display_text = std.fmt.bufPrintZ(self.render_ctx.item_buffer, "{s}{s}", .{ prefix, item.display }) catch "  [error]";
-                const display_color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
-                try self.renderText(5.0 * scale, y_pos, display_text, display_color);
-
-                // Render value preview if enabled and different from display
-                if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
-                    // Measure display text width for positioning
-                    const display_w, _ = try self.sdl.font.getStringSize(display_text);
-                    const value_x = 5.0 * scale + @as(f32, @floatFromInt(display_w)) + config.multivalue.preview_spacing * scale;
-
-                    // Truncate value preview if needed
-                    const preview_text = if (config.multivalue.preview_max_length > 0 and item.value.len > config.multivalue.preview_max_length) blk: {
-                        const truncate_len = input.findUtf8Boundary(item.value, config.multivalue.preview_max_length);
-                        break :blk std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}...", .{item.value[0..truncate_len]}) catch "...";
-                    } else std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}", .{item.value}) catch "...";
-
-                    // Use dimmed color (never use selected color for preview)
-                    try self.renderText(value_x, y_pos, preview_text, self.color_scheme.value_preview);
-                }
-
-                y_pos += config.layout.item_line_height * scale;
-            }
-
-            // Scroll indicator
-            if (filtered_len > config.limits.max_visible_items) {
-                const scroll_text = std.fmt.bufPrintZ(
-                    self.render_ctx.scroll_buffer,
-                    "[{d}-{d}]",
-                    .{ self.state.scroll_offset + 1, visible_end },
-                ) catch "[?]";
-
-                const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
-                const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - config.layout.width_padding) * scale;
-                try self.renderText(scroll_x, config.layout.items_start_y * scale, scroll_text, self.color_scheme.foreground);
-            }
-        } else {
-            try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, "No matches", self.color_scheme.foreground, &self.render_ctx.no_match_cache);
+        if (filtered_len == 0) {
+            try self.renderEmptyState(scale);
+            return;
         }
 
-        try self.sdl.renderer.present();
+        const visible_end = @min(self.state.scroll_offset + config.limits.max_visible_items, filtered_len);
+        std.debug.assert(visible_end <= filtered_len);
+        std.debug.assert(self.state.scroll_offset <= visible_end);
+
+        var y_pos: f32 = config.layout.items_start_y * scale;
+        for (self.state.scroll_offset..visible_end) |i| {
+            if (i >= filtered_len) break;
+
+            const item_index = self.state.filtered_items.items[i];
+            if (item_index >= self.state.items.items.len) continue;
+
+            const item = self.state.items.items[item_index];
+            const is_selected = (i == self.state.selected_index);
+            try self.renderItem(scale, y_pos, item, is_selected);
+            y_pos += config.layout.item_line_height * scale;
+        }
+
+        if (filtered_len > config.limits.max_visible_items) {
+            try self.renderScrollIndicator(scale, visible_end);
+        }
+    }
+
+    /// Render a single item row: prefix ("> " when selected, "  " otherwise),
+    /// display text, and optional dimmed value-preview.
+    fn renderItem(self: *App, scale: f32, y_pos: f32, item: types.Item, is_selected: bool) !void {
+        std.debug.assert(scale > 0.0);
+        std.debug.assert(y_pos >= 0.0);
+
+        const prefix = if (is_selected) "> " else "  ";
+        const display_text = std.fmt.bufPrintZ(self.render_ctx.item_buffer, "{s}{s}", .{ prefix, item.display }) catch "  [error]";
+        const display_color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
+        try self.renderText(5.0 * scale, y_pos, display_text, display_color);
+
+        if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
+            const display_w, _ = try self.sdl.font.getStringSize(display_text);
+            const value_x = 5.0 * scale + @as(f32, @floatFromInt(display_w)) + config.multivalue.preview_spacing * scale;
+
+            const preview_text = if (config.multivalue.preview_max_length > 0 and item.value.len > config.multivalue.preview_max_length) blk: {
+                const truncate_len = input.findUtf8Boundary(item.value, config.multivalue.preview_max_length);
+                break :blk std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}...", .{item.value[0..truncate_len]}) catch "...";
+            } else std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}", .{item.value}) catch "...";
+
+            // Use dimmed color (never use selected color for preview).
+            try self.renderText(value_x, y_pos, preview_text, self.color_scheme.value_preview);
+        }
+    }
+
+    /// Render the "No matches" placeholder when the filter excludes every item.
+    fn renderEmptyState(self: *App, scale: f32) !void {
+        std.debug.assert(scale > 0.0);
+        std.debug.assert(self.state.filtered_items.items.len == 0);
+
+        try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, "No matches", self.color_scheme.foreground, &self.render_ctx.no_match_cache);
+    }
+
+    /// Render the "[start-end]" scroll indicator on the right side of the items row.
+    fn renderScrollIndicator(self: *App, scale: f32, visible_end: usize) !void {
+        std.debug.assert(scale > 0.0);
+        std.debug.assert(self.state.scroll_offset < visible_end);
+        std.debug.assert(visible_end <= self.state.filtered_items.items.len);
+
+        const scroll_text = std.fmt.bufPrintZ(
+            self.render_ctx.scroll_buffer,
+            "[{d}-{d}]",
+            .{ self.state.scroll_offset + 1, visible_end },
+        ) catch "[?]";
+
+        const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
+        const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - config.layout.width_padding) * scale;
+        try self.renderText(scroll_x, config.layout.items_start_y * scale, scroll_text, self.color_scheme.foreground);
     }
 
     fn renderText(self: *App, x: f32, y: f32, text: [:0]const u8, color: sdl.pixels.Color) !void {
