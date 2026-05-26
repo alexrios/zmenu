@@ -236,9 +236,15 @@ fn afterFilter(
     // Build a lookup map: display text → history position (O(N) where N = history entries)
     var position_map = std.StringHashMap(usize).init(state.allocator);
     defer position_map.deinit();
-    position_map.ensureTotalCapacity(@intCast(state.entries.items.len)) catch return;
+    position_map.ensureTotalCapacity(@intCast(state.entries.items.len)) catch |err| {
+        std.log.warn("history: skipping reorder, lookup map allocation failed: {}", .{err});
+        return;
+    };
     for (state.entries.items, 0..) |entry, pos| {
-        position_map.put(entry, pos) catch return;
+        position_map.put(entry, pos) catch |err| {
+            std.log.warn("history: skipping reorder, lookup map population failed: {}", .{err});
+            return;
+        };
     }
 
     // Insertion sort using O(1) lookups instead of O(N) getPosition scans
