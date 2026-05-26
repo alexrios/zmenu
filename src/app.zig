@@ -223,6 +223,10 @@ pub const App = struct {
 
         try self.updateFilter();
         self.state.needs_render = true;
+
+        // Post: one-way transition complete; filter reflects the now-final set.
+        std.debug.assert(self.state.input_state == .ready);
+        std.debug.assert(self.state.filtered_items.items.len <= self.state.items.items.len);
     }
 
     /// Drain SDL's event queue (capped by max_events_per_tick — Safe-Zig R2).
@@ -375,14 +379,18 @@ pub const App = struct {
     fn processLine(self: *App, line: []const u8) !void {
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
         if (trimmed.len > 0) {
+            std.debug.assert(trimmed.len <= line.len);
+
             const truncate_len = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
             // Paired with findUtf8Boundary's internal postcondition: the
             // returned index must be on a leading byte (or at end / zero).
             std.debug.assert(truncate_len <= trimmed.len);
+            std.debug.assert(truncate_len <= config.limits.max_item_length);
             std.debug.assert(truncate_len == 0 or truncate_len == trimmed.len or (trimmed[truncate_len] & 0xC0) != 0x80);
 
             const final_line = trimmed[0..truncate_len];
             const item = try types.Item.parse(self.allocator, final_line);
+            std.debug.assert(item.display.len <= config.limits.max_item_length);
             try self.state.items.append(self.allocator, item);
 
             // Update cached max item width (measure once on ingest, not per frame)
@@ -468,6 +476,11 @@ pub const App = struct {
         // Features may reorder, but not add or remove items.
         features.callAfterFilter(&self.feature_states, &self.state.filtered_items, self.state.items.items);
         std.debug.assert(self.state.filtered_items.items.len <= total_items);
+        // Defend against a future feature that mutates indices: every entry
+        // must still point inside self.state.items.items.
+        for (self.state.filtered_items.items) |idx| {
+            std.debug.assert(idx < total_items);
+        }
 
         if (self.state.filtered_items.items.len > 0) {
             if (self.state.selected_index >= self.state.filtered_items.items.len) {
@@ -494,6 +507,7 @@ pub const App = struct {
             self.state.scroll_offset = 0;
             return;
         }
+        std.debug.assert(self.state.selected_index < filtered_len);
 
         // Clamp scroll_offset when filtered list shrinks below previous range
         const max_scroll = if (filtered_len > config.limits.max_visible_items)
@@ -509,10 +523,15 @@ pub const App = struct {
         } else if (self.state.selected_index >= self.state.scroll_offset + config.limits.max_visible_items) {
             self.state.scroll_offset = self.state.selected_index - config.limits.max_visible_items + 1;
         }
+
+        // Post: the selected row is inside the visible window.
+        std.debug.assert(self.state.scroll_offset <= self.state.selected_index);
+        std.debug.assert(self.state.selected_index < self.state.scroll_offset + config.limits.max_visible_items);
     }
 
     fn navigate(self: *App, delta: isize) void {
         if (self.state.filtered_items.items.len == 0) return;
+        std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len);
 
         const current = @as(isize, @intCast(self.state.selected_index));
         const new_idx = current + delta;
@@ -522,6 +541,8 @@ pub const App = struct {
             self.adjustScroll();
             self.state.needs_render = true;
         }
+
+        std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len);
     }
 
     fn navigateToFirst(self: *App) void {
@@ -697,12 +718,16 @@ pub const App = struct {
 
         const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));
         const final_width = @max(rounded_width, config.window.min_width);
-        return @min(final_width, config.window.max_width);
+        const result = @min(final_width, config.window.max_width);
+        std.debug.assert(result >= config.window.min_width);
+        std.debug.assert(result <= config.window.max_width);
+        return result;
     }
 
     fn calculateOptimalHeight(self: *App) u32 {
         const filtered_len = self.state.filtered_items.items.len;
         const visible_items = @min(filtered_len, config.limits.max_visible_items);
+        std.debug.assert(visible_items <= config.limits.max_visible_items);
 
         const prompt_area_height = config.layout.items_start_y;
         const items_height = @as(f32, @floatFromInt(visible_items)) * config.layout.item_line_height;
@@ -710,7 +735,10 @@ pub const App = struct {
 
         const rounded_height = @as(u32, @intFromFloat(@ceil(total_height)));
         const final_height = @max(rounded_height, config.window.min_height);
-        return @min(final_height, config.window.max_height);
+        const result = @min(final_height, config.window.max_height);
+        std.debug.assert(result >= config.window.min_height);
+        std.debug.assert(result <= config.window.max_height);
+        return result;
     }
 
     fn updateWindowSize(self: *App) !void {

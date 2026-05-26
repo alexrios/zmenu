@@ -300,8 +300,13 @@ fn afterFilter(
 ) void {
     const state = features_mod.castState(HistoryState, state_ptr) orelse return;
 
+    // Pre: filter is a permutation of a subset of all_items indices.
+    std.debug.assert(filtered_items.items.len <= all_items.len);
+
     if (filtered_items.items.len <= 1) return;
     if (state.entries.items.len == 0) return;
+
+    const original_len = filtered_items.items.len;
 
     // Hot path (Safe-Zig R3): no allocation per keystroke. Map is rebuilt only
     // when addEntry / loadFromFile invalidates it.
@@ -319,6 +324,7 @@ fn afterFilter(
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         const idx = items[i];
+        std.debug.assert(idx < all_items.len);
         const item_pos = position_map.get(all_items[idx].display);
 
         var j = i;
@@ -337,6 +343,9 @@ fn afterFilter(
         }
         items[j] = idx;
     }
+
+    // Post: reorder is in-place — no items added, removed, or invalidated.
+    std.debug.assert(filtered_items.items.len == original_len);
 }
 
 fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) void {

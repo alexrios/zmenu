@@ -25,6 +25,8 @@ fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) vo
 
     // Truncate if needed (SDL requires null-terminated string)
     const copy_len = @min(value.len, clipboard_config.max_clipboard_length);
+    std.debug.assert(copy_len <= clipboard_config.max_clipboard_length);
+    std.debug.assert(copy_len <= value.len);
 
     // Stack buffer for null termination (SDL API requirement)
     var buffer: [clipboard_config.max_clipboard_length + 1]u8 = undefined;

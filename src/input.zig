@@ -111,6 +111,8 @@ pub fn deleteLastCodepoint(buffer: *std.ArrayList(u8)) void {
 
 /// Delete the last word from a buffer (Ctrl+W behavior)
 pub fn deleteWord(buffer: *std.ArrayList(u8)) void {
+    const old_len = buffer.items.len;
+
     // Skip trailing whitespace first (UTF-8 safe: space and tab are single bytes)
     while (buffer.items.len > 0) {
         const ch = buffer.getLast();
@@ -124,6 +126,11 @@ pub fn deleteWord(buffer: *std.ArrayList(u8)) void {
         if (ch == ' ' or ch == '\t') break;
         deleteLastCodepoint(buffer);
     }
+
+    // Post: any non-empty input shrinks at least one byte (whitespace or a
+    // codepoint). Empty input stays empty.
+    if (old_len > 0) std.debug.assert(buffer.items.len < old_len);
+    std.debug.assert(buffer.items.len <= old_len);
 }
 
 

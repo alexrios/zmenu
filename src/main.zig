@@ -64,20 +64,27 @@ fn looksLikeFlag(value: []const u8) bool {
 /// Returns the parsed value, null if not found, or an error.
 /// Caller is responsible for user-facing error messages.
 fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagValue {
+    std.debug.assert(args.len > 0); // Process always has at least argv[0]
+    std.debug.assert(flag.long.len > 0);
+
     var i: usize = 1; // Skip program name
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
         // Check long flag (no allocation: match "--" prefix then compare suffix)
         if (std.mem.startsWith(u8, arg, "--") and std.mem.eql(u8, arg[2..], flag.long)) {
-            return try parseFlagValue(args, i, flag);
+            const value = try parseFlagValue(args, i, flag);
+            std.debug.assert(@as(features.FlagValueType, value) == flag.value_type);
+            return value;
         }
 
         // Check short flag
         if (flag.short) |short_char| {
             const short_flag = &[_]u8{ '-', short_char };
             if (std.mem.eql(u8, arg, short_flag)) {
-                return try parseFlagValue(args, i, flag);
+                const value = try parseFlagValue(args, i, flag);
+                std.debug.assert(@as(features.FlagValueType, value) == flag.value_type);
+                return value;
             }
         }
     }
@@ -87,7 +94,8 @@ fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagVa
 
 /// Extract the value for a matched flag at position i in args.
 fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !features.FlagValue {
-    return switch (flag.value_type) {
+    std.debug.assert(i < args.len);
+    const value: features.FlagValue = switch (flag.value_type) {
         .bool => features.FlagValue{ .bool = true },
         .string => blk: {
             if (i + 1 >= args.len or looksLikeFlag(args[i + 1])) {
@@ -100,12 +108,14 @@ fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !f
             if (i + 1 >= args.len) {
                 return error.MissingFlagValue;
             }
-            const value = std.fmt.parseInt(i64, args[i + 1], 10) catch {
+            const parsed = std.fmt.parseInt(i64, args[i + 1], 10) catch {
                 return error.InvalidFlagValue;
             };
-            break :blk features.FlagValue{ .int = value };
+            break :blk features.FlagValue{ .int = parsed };
         },
     };
+    std.debug.assert(@as(features.FlagValueType, value) == flag.value_type);
+    return value;
 }
 
 pub fn main(init: std.process.Init) !void {

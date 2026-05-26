@@ -151,6 +151,11 @@ fn validateCliFlags(features_list: []const Feature) void {
         for (features_list) |feature| {
             if (feature.cli_flags) |flags| {
                 for (flags) |flag| {
+                    // Empty long name would silently break flag matching at
+                    // runtime; reject at the registration boundary.
+                    if (flag.long.len == 0) {
+                        @compileError("Feature '" ++ feature.name ++ "': CLI flag has empty .long name");
+                    }
                     // Check for required flag with default value (invalid)
                     if (flag.required and flag.default != null) {
                         @compileError("Feature '" ++ feature.name ++ "': Flag --" ++ flag.long ++
