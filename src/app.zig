@@ -26,9 +26,10 @@ pub const App = struct {
     render_ctx: RenderContext,
     color_scheme: ColorScheme,
     allocator: std.mem.Allocator,
+    io: std.Io,
     feature_states: features.FeatureStates, // Zero-size when no features enabled
 
-    pub fn init(allocator: std.mem.Allocator, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
         // Initialize SDL
         try sdl_context.initSDL();
         errdefer sdl_context.quitSDL();
@@ -97,11 +98,12 @@ pub const App = struct {
             },
             .color_scheme = color_scheme,
             .allocator = allocator,
+            .io = io,
             .feature_states = features.initStates(),
         };
 
         // Initialize enabled features with parsed CLI flags
-        try features.initAll(allocator, &app.feature_states, parsed_flags);
+        try features.initAll(allocator, io, &app.feature_states, parsed_flags);
 
         try app.updateWindowSize();
 
@@ -135,15 +137,14 @@ pub const App = struct {
         var running = true;
 
         // Check if stdin is a TTY (no piped input)
-        if (std.posix.isatty(std.fs.File.stdin().handle)) {
-            const stderr = std.fs.File.stderr();
-            _ = stderr.write("Error: No items provided on stdin\n") catch {};
-            _ = stderr.write("Usage: echo -e \"Item 1\\nItem 2\" | zmenu\n") catch {};
+        if (try std.Io.File.stdin().isTty(self.io)) {
+            std.debug.print("Error: No items provided on stdin\n", .{});
+            std.debug.print("Usage: echo -e \"Item 1\\nItem 2\" | zmenu\n", .{});
             return error.NoItemsProvided;
         }
 
         // Start threaded stdin reader (cross-platform)
-        var stdin_reader = ThreadedStdinReader.init(self.allocator);
+        var stdin_reader = ThreadedStdinReader.init(self.allocator, self.io);
         try stdin_reader.startThread(); // Spawn thread after reader is in final memory location
         defer stdin_reader.deinit();
 
@@ -181,8 +182,7 @@ pub const App = struct {
 
                 // Handle empty stdin case
                 if (self.state.items.items.len == 0) {
-                    const stderr = std.fs.File.stderr();
-                    _ = stderr.write("Error: No items provided on stdin\n") catch {};
+                    std.debug.print("Error: No items provided on stdin\n", .{});
                     return error.NoItemsProvided;
                 }
 
@@ -231,19 +231,21 @@ pub const App = struct {
     pub const ThreadedStdinReader = struct {
         thread: std.Thread,
         thread_started: bool,
-        mutex: std.Thread.Mutex,
+        mutex: std.Io.Mutex,
         lines: std.ArrayList([]u8),
         eof_reached: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
+        io: std.Io,
 
-        pub fn init(allocator: std.mem.Allocator) ThreadedStdinReader {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io) ThreadedStdinReader {
             return ThreadedStdinReader{
                 .thread = undefined,
                 .thread_started = false,
-                .mutex = .{},
+                .mutex = .init,
                 .lines = std.ArrayList([]u8).empty,
                 .eof_reached = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
+                .io = io,
             };
         }
 
@@ -254,7 +256,7 @@ pub const App = struct {
         }
 
         fn readerThreadFn(self: *ThreadedStdinReader) void {
-            const stdin_file = std.fs.File.stdin();
+            const stdin_fd = std.Io.File.stdin().handle;
             var chunk_buffer: [4096]u8 = undefined;
             var line_buffer = std.ArrayList(u8).empty;
             defer line_buffer.deinit(self.allocator);
@@ -263,18 +265,20 @@ pub const App = struct {
             defer self.eof_reached.store(true, .seq_cst);
 
             while (true) {
-                // Blocking read (OK in background thread)
-                const bytes_read = stdin_file.read(&chunk_buffer) catch break;
+                // Blocking read (OK in background thread).
+                // Terminates on EOF (bytes_read == 0) or any read error.
+                const bytes_read = std.posix.read(stdin_fd, &chunk_buffer) catch break;
+                std.debug.assert(bytes_read <= chunk_buffer.len);
 
                 if (bytes_read == 0) {
                     // EOF - process any remaining buffered line
                     if (line_buffer.items.len > 0) {
                         const owned_line = self.allocator.dupe(u8, line_buffer.items) catch break;
-                        self.mutex.lock();
+                        self.mutex.lockUncancelable(self.io);
                         self.lines.append(self.allocator, owned_line) catch {
                             self.allocator.free(owned_line);
                         };
-                        self.mutex.unlock();
+                        self.mutex.unlock(self.io);
                     }
                     break;
                 }
@@ -283,16 +287,17 @@ pub const App = struct {
                 const chunk = chunk_buffer[0..bytes_read];
                 var start: usize = 0;
                 for (chunk, 0..) |byte, i| {
+                    std.debug.assert(start <= chunk.len);
                     if (byte == '\n') {
                         // Complete line found
                         line_buffer.appendSlice(self.allocator, chunk[start..i]) catch break;
 
                         const owned_line = self.allocator.dupe(u8, line_buffer.items) catch break;
-                        self.mutex.lock();
+                        self.mutex.lockUncancelable(self.io);
                         self.lines.append(self.allocator, owned_line) catch {
                             self.allocator.free(owned_line);
                         };
-                        self.mutex.unlock();
+                        self.mutex.unlock(self.io);
 
                         line_buffer.clearRetainingCapacity();
                         start = i + 1;
@@ -309,8 +314,8 @@ pub const App = struct {
         /// Poll for new lines from the reader thread (non-blocking)
         /// Returns true if EOF has been reached
         pub fn pollLines(self: *ThreadedStdinReader, dest: *std.ArrayList([]u8)) !bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             // Transfer lines from thread buffer to destination
             try dest.appendSlice(self.allocator, self.lines.items);
@@ -499,9 +504,12 @@ pub const App = struct {
                 }
 
                 // Output value field only to stdout
-                const stdout_file = std.fs.File.stdout();
-                _ = try stdout_file.write(selected_item.value);
-                _ = try stdout_file.write("\n");
+                var stdout_buffer: [4096]u8 = undefined;
+                var stdout_writer = std.Io.File.stdout().writer(self.io, &stdout_buffer);
+                const stdout = &stdout_writer.interface;
+                try stdout.writeAll(selected_item.value);
+                try stdout.writeAll("\n");
+                try stdout.flush();
             }
             return true;
         } else if (key == .backspace) {
@@ -822,7 +830,7 @@ test "ThreadedStdinReader - initial state and pollLines contract" {
 
     const allocator = std.testing.allocator;
 
-    var reader = App.ThreadedStdinReader.init(allocator);
+    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
     defer reader.deinit();
 
     // Initial state: no EOF, no lines
@@ -831,10 +839,10 @@ test "ThreadedStdinReader - initial state and pollLines contract" {
     // Simulate thread producing lines by manually adding to the shared buffer
     const line1 = try allocator.dupe(u8, "line one");
     const line2 = try allocator.dupe(u8, "line two");
-    reader.mutex.lock();
+    reader.mutex.lockUncancelable(std.testing.io);
     reader.lines.append(allocator, line1) catch unreachable;
     reader.lines.append(allocator, line2) catch unreachable;
-    reader.mutex.unlock();
+    reader.mutex.unlock(std.testing.io);
 
     // pollLines should drain them
     var dest = std.ArrayList([]u8).empty;
@@ -875,7 +883,7 @@ test "ThreadedStdinReader - defer ensures eof_reached on all exit paths" {
     // guarantee (defer at function scope) covers all paths by construction.
 
     const allocator = std.testing.allocator;
-    var reader = App.ThreadedStdinReader.init(allocator);
+    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
     defer reader.deinit();
     try std.testing.expect(!reader.eof_reached.load(.seq_cst));
 }

@@ -160,15 +160,12 @@ pub fn loadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
     }
 
     // No fonts found
-    const stderr = std.fs.File.stderr();
-    _ = stderr.write("Error: Could not find any suitable font. Tried:\n") catch {};
+    std.debug.print("Error: Could not find any suitable font. Tried:\n", .{});
     if (config.font.use_embedded) {
-        _ = stderr.write("  - (embedded: Crimson Pro)\n") catch {};
+        std.debug.print("  - (embedded: Crimson Pro)\n", .{});
     }
     for (config.default_font_paths) |font_path| {
-        var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "  - {s}\n", .{font_path}) catch continue;
-        _ = stderr.write(msg) catch {};
+        std.debug.print("  - {s}\n", .{font_path});
     }
     return error.NoFontFound;
 }

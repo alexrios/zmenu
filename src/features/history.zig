@@ -20,16 +20,17 @@ pub const history_config = struct {
 
 pub const HistoryState = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     entries: std.ArrayList([]const u8),
     history_path: []const u8,
     max_entries: usize,
     dirty: bool = false,
 
-    pub fn load(allocator: std.mem.Allocator) !*HistoryState {
-        return loadWithConfig(allocator, null, history_config.max_entries);
+    pub fn load(allocator: std.mem.Allocator, io: std.Io) !*HistoryState {
+        return loadWithConfig(allocator, io, null, history_config.max_entries);
     }
 
-    pub fn loadWithConfig(allocator: std.mem.Allocator, custom_path: ?[]const u8, max_entries: usize) !*HistoryState {
+    pub fn loadWithConfig(allocator: std.mem.Allocator, io: std.Io, custom_path: ?[]const u8, max_entries: usize) !*HistoryState {
         const state = try allocator.create(HistoryState);
         errdefer allocator.destroy(state);
 
@@ -40,6 +41,7 @@ pub const HistoryState = struct {
 
         state.* = .{
             .allocator = allocator,
+            .io = io,
             .entries = std.ArrayList([]const u8).empty,
             .history_path = history_path,
             .max_entries = max_entries,
@@ -56,40 +58,60 @@ pub const HistoryState = struct {
     }
 
     fn loadFromFile(self: *HistoryState) !void {
-        const file = try std.fs.openFileAbsolute(self.history_path, .{});
-        defer file.close();
+        std.debug.assert(self.history_path.len > 0);
+        std.debug.assert(self.entries.items.len == 0);
 
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        const content = try std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            self.history_path,
+            self.allocator,
+            .limited(1024 * 1024),
+        );
         defer self.allocator.free(content);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
+            if (self.entries.items.len >= self.max_entries) break;
             const entry = try self.allocator.dupe(u8, line);
             try self.entries.append(self.allocator, entry);
         }
+        std.debug.assert(self.entries.items.len <= self.max_entries);
     }
 
     pub fn save(self: *HistoryState) void {
+        std.debug.assert(self.history_path.len > 0);
+        std.debug.assert(self.entries.items.len <= self.max_entries);
+
         if (!self.dirty) return;
 
         if (std.fs.path.dirname(self.history_path)) |dir| {
-            std.fs.cwd().makePath(dir) catch |err| {
+            std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| {
                 std.log.warn("could not create history dir: {}", .{err});
                 return;
             };
         }
 
-        const file = std.fs.createFileAbsolute(self.history_path, .{}) catch |err| {
+        const file = std.Io.Dir.createFileAbsolute(self.io, self.history_path, .{}) catch |err| {
             std.log.warn("could not save history: {}", .{err});
             return;
         };
-        defer file.close();
+        defer file.close(self.io);
 
+        var write_buf: [4096]u8 = undefined;
+        var file_writer = file.writer(self.io, &write_buf);
+        const writer = &file_writer.interface;
         for (self.entries.items) |entry| {
-            _ = file.write(entry) catch continue;
-            _ = file.write("\n") catch continue;
+            writer.writeAll(entry) catch |err| {
+                std.log.warn("history save aborted mid-write: {}", .{err});
+                return;
+            };
+            writer.writeAll("\n") catch |err| {
+                std.log.warn("history save aborted mid-write: {}", .{err});
+                return;
+            };
         }
+        writer.flush() catch |err| std.log.warn("history flush failed: {}", .{err});
     }
 
     /// Add entry (moves to front if exists). Marks state as dirty.
@@ -188,7 +210,7 @@ fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.Featur
 
     // Load or create history state with custom settings
     // Degrade gracefully if history path can't be resolved (e.g., missing HOME)
-    const state = HistoryState.loadWithConfig(allocator, custom_path, max_entries) catch |err| {
+    const state = HistoryState.loadWithConfig(allocator, init_data.io, custom_path, max_entries) catch |err| {
         std.log.warn("history feature unavailable: {}", .{err});
         return null;
     };
@@ -279,6 +301,7 @@ test "HistoryState - add and retrieve entries" {
 
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/zmenu_test_history"),
         .max_entries = 100,
@@ -306,6 +329,7 @@ test "HistoryState - re-adding moves to front" {
 
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/zmenu_test_history"),
         .max_entries = 100,
@@ -337,6 +361,7 @@ test "History afterFilter - basic reordering correctness" {
     // Setup history with 2 entries (most recent first)
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/test_history"),
         .max_entries = 100,
@@ -391,10 +416,11 @@ test "HistoryState - save creates nested directories" {
     const nested_path = "/tmp/zmenu_test_nested/level1/level2/level3/history";
 
     // Clean up any previous test artifacts
-    std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+    std.Io.Dir.cwd().deleteTree(std.testing.io, "/tmp/zmenu_test_nested") catch {};
 
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, nested_path),
         .max_entries = 100,
@@ -409,16 +435,16 @@ test "HistoryState - save creates nested directories" {
     state.save();
 
     // Verify the file was actually created
-    const file = std.fs.openFileAbsolute(nested_path, .{}) catch |err| {
+    const file = std.Io.Dir.openFileAbsolute(std.testing.io, nested_path, .{}) catch |err| {
         std.debug.print("BUG: save() failed to create file with nested dirs: {}\n", .{err});
         // Clean up
-        std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+        std.Io.Dir.cwd().deleteTree(std.testing.io, "/tmp/zmenu_test_nested") catch {};
         return error.TestExpectedEqual;
     };
-    file.close();
+    file.close(std.testing.io);
 
     // Clean up
-    std.fs.deleteTreeAbsolute("/tmp/zmenu_test_nested") catch {};
+    std.Io.Dir.cwd().deleteTree(std.testing.io, "/tmp/zmenu_test_nested") catch {};
 }
 
 test "History afterFilter - matches on display field not value" {
@@ -429,6 +455,7 @@ test "History afterFilter - matches on display field not value" {
 
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/test_history"),
         .max_entries = 100,
@@ -481,11 +508,12 @@ test "HistoryState - save skipped when no changes made" {
     const test_path = "/tmp/zmenu_test_dirty_flag_history";
 
     // Clean up any previous artifacts
-    std.fs.deleteFileAbsolute(test_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
 
     // Create state and add entries (simulates loading from file)
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, test_path),
         .max_entries = 100,
@@ -505,7 +533,7 @@ test "HistoryState - save skipped when no changes made" {
 
     // File should NOT exist (save was skipped)
     const file_exists = blk: {
-        std.fs.accessAbsolute(test_path, .{}) catch break :blk false;
+        std.Io.Dir.accessAbsolute(std.testing.io, test_path, .{}) catch break :blk false;
         break :blk true;
     };
     try std.testing.expect(!file_exists);
@@ -519,13 +547,13 @@ test "HistoryState - save skipped when no changes made" {
 
     // File should exist
     const file_exists2 = blk: {
-        std.fs.accessAbsolute(test_path, .{}) catch break :blk false;
+        std.Io.Dir.accessAbsolute(std.testing.io, test_path, .{}) catch break :blk false;
         break :blk true;
     };
     try std.testing.expect(file_exists2);
 
     // Clean up
-    std.fs.deleteFileAbsolute(test_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
 }
 
 test "History afterFilter - rapid updates" {
@@ -536,6 +564,7 @@ test "History afterFilter - rapid updates" {
 
     var state = HistoryState{
         .allocator = allocator,
+        .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/test_history"),
         .max_entries = 100,

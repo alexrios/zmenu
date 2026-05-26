@@ -108,7 +108,10 @@ fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !f
     };
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+
     // Use DebugAllocator in debug builds for leak detection,
     // SmpAllocator in release builds for production performance
     var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
@@ -120,19 +123,22 @@ pub fn main() !void {
         _ = debug_alloc.deinit();
     };
 
-    // Check for --version or --features flag
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Args are owned by the process arena and live for the program's lifetime.
+    // Sentinel-terminated strings coerce to non-sentinel slices element-wise.
+    const zsentinel_args = try init.minimal.args.toSlice(arena);
+    const args = try arena.alloc([]const u8, zsentinel_args.len);
+    for (zsentinel_args, args) |z, *out| out.* = z;
+    std.debug.assert(args.len == zsentinel_args.len);
 
     if (args.len > 1) {
         if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
-            try printVersion();
+            try printVersion(io);
             return;
         } else if (std.mem.eql(u8, args[1], "--features")) {
-            try printFeatures();
+            try printFeatures(io);
             return;
         } else if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
-            printHelp();
+            printHelp(io);
             return;
         }
     }
@@ -158,15 +164,15 @@ pub fn main() !void {
     var parsed_flags = try parseFeatureFlags(args, allocator);
     defer parsed_flags.deinit();
 
-    var application = try app.App.init(allocator, monitor_index, &parsed_flags);
+    var application = try app.App.init(allocator, io, monitor_index, &parsed_flags);
     defer application.deinit();
 
     try application.run();
 }
 
-fn printVersion() !void {
+fn printVersion(io: std.Io) !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     try stdout.writeAll("zmenu " ++ build_options.version ++ " - Cross-platform dmenu-like application launcher\n");
@@ -174,9 +180,9 @@ fn printVersion() !void {
     try stdout.flush();
 }
 
-fn printFeatures() !void {
+fn printFeatures(io: std.Io) !void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     try stdout.writeAll("zmenu compile-time features:\n\n");
@@ -205,9 +211,9 @@ fn printFeatures() !void {
     try stdout.flush();
 }
 
-fn printHelp() void {
+fn printHelp(io: std.Io) void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
     _ = stdout.writeAll(

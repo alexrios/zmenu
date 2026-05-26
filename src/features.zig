@@ -44,6 +44,7 @@ pub const CliFlag = struct {
 /// Feature initialization data (passed to onInit hook)
 pub const FeatureInitData = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     cli_values: []const ?FlagValue, // Parsed CLI flag values (null = not provided)
     cli_flags: []const CliFlag, // Flag declarations (for name-based lookup)
 
@@ -289,7 +290,7 @@ pub fn initStates() FeatureStates {
 
 /// Initialize all enabled features - called from App.init()
 /// On failure, cleans up any features that were already initialized.
-pub fn initAll(allocator: std.mem.Allocator, states: *FeatureStates, parsed_flags: *const ParsedFlags) !void {
+pub fn initAll(allocator: std.mem.Allocator, io: std.Io, states: *FeatureStates, parsed_flags: *const ParsedFlags) !void {
     if (enabled_count == 0) return;
 
     errdefer deinitAll(states, allocator);
@@ -298,6 +299,7 @@ pub fn initAll(allocator: std.mem.Allocator, states: *FeatureStates, parsed_flag
         if (feature.hooks.onInit) |initFn| {
             const init_data = FeatureInitData{
                 .allocator = allocator,
+                .io = io,
                 .cli_values = parsed_flags.getFeatureValues(i),
                 .cli_flags = feature.cli_flags orelse &.{},
             };
@@ -418,6 +420,7 @@ test "FeatureInitData - getFlag finds flag by name" {
 
     const init_data = FeatureInitData{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .cli_values = values,
         .cli_flags = flags,
     };
@@ -455,6 +458,7 @@ test "FeatureInitData - typed getters" {
 
     const init_data = FeatureInitData{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .cli_values = values,
         .cli_flags = flags,
     };
@@ -477,6 +481,7 @@ test "FeatureInitData - typed getters" {
 test "FeatureInitData - empty flags" {
     const init_data = FeatureInitData{
         .allocator = std.testing.allocator,
+        .io = std.testing.io,
         .cli_values = &.{},
         .cli_flags = &.{},
     };

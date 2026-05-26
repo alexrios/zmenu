@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     // Check if user config exists, fallback to default
     // Users can copy config.def.zig to config.zig and customize
     const config_path: std.Build.LazyPath = blk: {
-        std.fs.cwd().access("config.zig", .{}) catch break :blk b.path("config.def.zig");
+        b.build_root.handle.access(b.graph.io, "config.zig", .{}) catch break :blk b.path("config.def.zig");
         break :blk b.path("config.zig");
     };
 
