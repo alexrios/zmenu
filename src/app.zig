@@ -44,69 +44,88 @@ pub const App = struct {
     io: std.Io,
     feature_states: features.FeatureStates, // Zero-size when no features enabled
 
+    const RenderBuffers = struct {
+        prompt: []u8,
+        item: []u8,
+        count: []u8,
+        scroll: []u8,
+        value_preview: []u8,
+    };
+
+    fn initRenderBuffers(allocator: std.mem.Allocator) !RenderBuffers {
+        const prompt = try allocator.alloc(u8, config.limits.prompt_buffer_size);
+        errdefer allocator.free(prompt);
+        const item = try allocator.alloc(u8, config.limits.item_buffer_size);
+        errdefer allocator.free(item);
+        const count = try allocator.alloc(u8, config.limits.count_buffer_size);
+        errdefer allocator.free(count);
+        const scroll = try allocator.alloc(u8, config.limits.scroll_buffer_size);
+        errdefer allocator.free(scroll);
+        const value_preview = try allocator.alloc(u8, config.limits.value_preview_buffer_size);
+        // No errdefer needed on the last one: only this success path returns it.
+        return .{ .prompt = prompt, .item = item, .count = count, .scroll = scroll, .value_preview = value_preview };
+    }
+
+    fn freeRenderBuffers(allocator: std.mem.Allocator, bufs: RenderBuffers) void {
+        allocator.free(bufs.prompt);
+        allocator.free(bufs.item);
+        allocator.free(bufs.count);
+        allocator.free(bufs.scroll);
+        allocator.free(bufs.value_preview);
+    }
+
+    const DisplayMetrics = struct {
+        scale: f32,
+        width: u32,
+        height: u32,
+    };
+
+    fn queryDisplayMetrics(window: anytype) !DisplayMetrics {
+        const scale = try window.getDisplayScale();
+        const pixel_width, const pixel_height = try window.getSizeInPixels();
+        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
+            return error.DisplayTooLarge;
+        }
+        return .{ .scale = scale, .width = @intCast(pixel_width), .height = @intCast(pixel_height) };
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
-        // Initialize SDL
         try sdl_context.initSDL();
         errdefer sdl_context.quitSDL();
 
-        // Build color scheme from compile-time configuration
         const color_scheme = ColorScheme.fromConfig();
 
-
-        // Create window and renderer
         const window_result = try sdl_context.createWindow(allocator, monitor_index);
         const window = window_result.window;
         const renderer = window_result.renderer;
         errdefer renderer.deinit();
         errdefer window.deinit();
 
-        // Allocate render buffers
-        const prompt_buffer = try allocator.alloc(u8, config.limits.prompt_buffer_size);
-        errdefer allocator.free(prompt_buffer);
-        const item_buffer = try allocator.alloc(u8, config.limits.item_buffer_size);
-        errdefer allocator.free(item_buffer);
-        const count_buffer = try allocator.alloc(u8, config.limits.count_buffer_size);
-        errdefer allocator.free(count_buffer);
-        const scroll_buffer = try allocator.alloc(u8, config.limits.scroll_buffer_size);
-        errdefer allocator.free(scroll_buffer);
-        const value_preview_buffer = try allocator.alloc(u8, config.limits.value_preview_buffer_size);
-        errdefer allocator.free(value_preview_buffer);
+        const bufs = try initRenderBuffers(allocator);
+        errdefer freeRenderBuffers(allocator, bufs);
 
-        // Load font with platform-specific fallback
         const font_result = try sdl_context.loadFont();
         const font = font_result.font;
-        const path = font_result.path;
         errdefer font.deinit();
 
-        // Query display scale and pixel dimensions for high DPI support
-        const display_scale = try window.getDisplayScale();
-        const pixel_width, const pixel_height = try window.getSizeInPixels();
-
-        if (pixel_width > std.math.maxInt(u32) or pixel_height > std.math.maxInt(u32)) {
-            return error.DisplayTooLarge;
-        }
+        const metrics = try queryDisplayMetrics(window);
 
         var app = App{
-            .sdl = .{
-                .window = window,
-                .renderer = renderer,
-                .font = font,
-                .loaded_font_path = path,
-            },
+            .sdl = .{ .window = window, .renderer = renderer, .font = font, .loaded_font_path = font_result.path },
             .state = AppState.empty,
             .render_ctx = .{
-                .prompt_buffer = prompt_buffer,
-                .item_buffer = item_buffer,
-                .count_buffer = count_buffer,
-                .scroll_buffer = scroll_buffer,
-                .value_preview_buffer = value_preview_buffer,
+                .prompt_buffer = bufs.prompt,
+                .item_buffer = bufs.item,
+                .count_buffer = bufs.count,
+                .scroll_buffer = bufs.scroll,
+                .value_preview_buffer = bufs.value_preview,
                 .prompt_cache = TextureCache.empty,
                 .count_cache = TextureCache.empty,
                 .no_match_cache = TextureCache.empty,
                 .window = .{
-                    .display_scale = display_scale,
-                    .width = @intCast(pixel_width),
-                    .height = @intCast(pixel_height),
+                    .display_scale = metrics.scale,
+                    .width = metrics.width,
+                    .height = metrics.height,
                     .current_width = config.window.initial_width,
                     .current_height = config.window.initial_height,
                 },
@@ -117,15 +136,9 @@ pub const App = struct {
             .feature_states = features.initStates(),
         };
 
-        // Initialize enabled features with parsed CLI flags
         try features.initAll(allocator, io, &app.feature_states, parsed_flags);
-
         try app.updateWindowSize();
-
-        // Center window on initial creation
         try window.setPosition(.{ .centered = null }, .{ .centered = null });
-
-        // Start text input
         try sdl.keyboard.startTextInput(window);
 
         return app;
@@ -149,8 +162,6 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
-        var running = true;
-
         // Check if stdin is a TTY (no piped input)
         if (try std.Io.File.stdin().isTty(self.io)) {
             std.debug.print("Error: No items provided on stdin\n", .{});
@@ -158,17 +169,13 @@ pub const App = struct {
             return error.NoItemsProvided;
         }
 
-        // Start threaded stdin reader (cross-platform)
         var stdin_reader = ThreadedStdinReader.init(self.allocator, self.io);
-        try stdin_reader.startThread(); // Spawn thread after reader is in final memory location
+        try stdin_reader.startThread();
         defer stdin_reader.deinit();
 
-        // Buffer for lines from reader thread
         var new_lines = std.ArrayList([]u8).empty;
         defer {
-            for (new_lines.items) |line| {
-                self.allocator.free(line);
-            }
+            for (new_lines.items) |line| self.allocator.free(line);
             new_lines.deinit(self.allocator);
         }
 
@@ -176,67 +183,16 @@ pub const App = struct {
         try self.render();
         self.state.needs_render = false;
 
+        var running = true;
         while (running) {
-            // Check for new lines from reader thread (non-blocking)
             const eof = try stdin_reader.pollLines(&new_lines);
-
-            // Process any new lines
-            if (new_lines.items.len > 0) {
-                for (new_lines.items) |line| {
-                    try self.processLine(line);
-                    self.allocator.free(line);
-                }
-                new_lines.clearRetainingCapacity();
-                self.state.needs_render = true;
-            }
-
-            // Handle EOF transition
+            try self.processNewLines(&new_lines);
             if (eof and self.state.input_state == .loading) {
-                // Stdin complete - transition to ready state
-                self.state.input_state = .ready;
-
-                // Handle empty stdin case
-                if (self.state.items.items.len == 0) {
-                    std.debug.print("Error: No items provided on stdin\n", .{});
-                    return error.NoItemsProvided;
-                }
-
-                // Populate filtered items now that all items are loaded
-                try self.updateFilter();
-                self.state.needs_render = true;
+                try self.handleEofTransition();
             }
 
-            // Wait for SDL events with timeout (blocks up to 16ms, returns early on event)
-            // This avoids busy-waiting while still polling stdin regularly
             if (sdl.events.waitTimeout(16)) {
-                // Process all queued events. The `for (0..MAX) |_|` form
-                // encodes a static upper bound (Safe-Zig R2). Any events that
-                // overflow the per-tick cap will be drained on the next tick.
-                for (0..max_events_per_tick) |_| {
-                    const event = sdl.events.poll() orelse break;
-                    switch (event) {
-                        .quit => running = false,
-                        .terminating => running = false,
-                        .key_down => |key_event| {
-                            if (try self.handleKeyEvent(key_event)) {
-                                running = false;
-                            }
-                        },
-                        .text_input => |text_event| {
-                            // Only handle text input when ready
-                            if (self.state.input_state == .ready) {
-                                try self.handleTextInput(text_event.text);
-                            }
-                        },
-                        .window_display_scale_changed => {
-                            try self.updateDisplayScale();
-                        },
-                        .window_pixel_size_changed => {
-                            try self.updateDisplayScale();
-                        },
-                        else => {},
-                    }
-                }
+                running = try self.processEvents();
             }
 
             if (self.state.needs_render) {
@@ -244,6 +200,53 @@ pub const App = struct {
                 self.state.needs_render = false;
             }
         }
+    }
+
+    fn processNewLines(self: *App, new_lines: *std.ArrayList([]u8)) !void {
+        if (new_lines.items.len == 0) return;
+        for (new_lines.items) |line| {
+            try self.processLine(line);
+            self.allocator.free(line);
+        }
+        new_lines.clearRetainingCapacity();
+        self.state.needs_render = true;
+    }
+
+    fn handleEofTransition(self: *App) !void {
+        std.debug.assert(self.state.input_state == .loading);
+        self.state.input_state = .ready;
+
+        if (self.state.items.items.len == 0) {
+            std.debug.print("Error: No items provided on stdin\n", .{});
+            return error.NoItemsProvided;
+        }
+
+        try self.updateFilter();
+        self.state.needs_render = true;
+    }
+
+    /// Drain SDL's event queue (capped by max_events_per_tick — Safe-Zig R2).
+    /// Returns false when the user requested quit/terminate, true to keep running.
+    fn processEvents(self: *App) !bool {
+        for (0..max_events_per_tick) |_| {
+            const event = sdl.events.poll() orelse break;
+            switch (event) {
+                .quit, .terminating => return false,
+                .key_down => |key_event| {
+                    if (try self.handleKeyEvent(key_event)) return false;
+                },
+                .text_input => |text_event| {
+                    if (self.state.input_state == .ready) {
+                        try self.handleTextInput(text_event.text);
+                    }
+                },
+                .window_display_scale_changed,
+                .window_pixel_size_changed,
+                => try self.updateDisplayScale(),
+                else => {},
+            }
+        }
+        return true;
     }
 
     pub const ThreadedStdinReader = struct {
@@ -526,52 +529,32 @@ pub const App = struct {
 
     fn handleKeyEvent(self: *App, event: sdl.events.Keyboard) !bool {
         const key = event.key orelse return false;
+        const ctrl = event.mod.left_control or event.mod.right_control;
+        const shift = event.mod.left_shift or event.mod.right_shift;
 
         // During loading, only allow ESC and Ctrl+C for early cancellation
         if (self.state.input_state == .loading) {
-            if (key == .escape) {
-                return true;
-            } else if (key == .c and (event.mod.left_control or event.mod.right_control)) {
-                return true;
-            }
-            return false;
+            return key == .escape or (key == .c and ctrl);
         }
 
-        if (key == .escape) {
+        if (key == .escape) return true;
+        if (key == .c and ctrl) return true;
+        if (key == .return_key or key == .kp_enter) {
+            try self.handleConfirm();
             return true;
-        } else if (key == .return_key or key == .kp_enter) {
-            if (self.state.filtered_items.items.len > 0) {
-                const selected_item = self.state.items.items[self.state.filtered_items.items[self.state.selected_index]];
+        }
 
-                // Notify features of selection with full Item (features choose display/value)
-                features.callOnSelect(&self.feature_states, selected_item);
-
-                // Allow features to perform pre-shutdown cleanup
-                const all_completed = features.callOnExit(&self.feature_states, config.exit_timeout_ms);
-                if (!all_completed) {
-                    std.log.warn("Some features did not complete onExit within timeout", .{});
-                }
-
-                // Output value field only to stdout
-                var stdout_buffer: [4096]u8 = undefined;
-                var stdout_writer = std.Io.File.stdout().writer(self.io, &stdout_buffer);
-                const stdout = &stdout_writer.interface;
-                try stdout.writeAll(selected_item.value);
-                try stdout.writeAll("\n");
-                try stdout.flush();
-            }
-            return true;
-        } else if (key == .backspace) {
+        if (key == .backspace) {
             if (self.state.input_buffer.items.len > 0) {
                 input.deleteLastCodepoint(&self.state.input_buffer);
                 try self.updateFilter();
                 self.state.needs_render = true;
             }
-        } else if (key == .u and (event.mod.left_control or event.mod.right_control)) {
+        } else if (key == .u and ctrl) {
             self.state.input_buffer.clearRetainingCapacity();
             try self.updateFilter();
             self.state.needs_render = true;
-        } else if (key == .w and (event.mod.left_control or event.mod.right_control)) {
+        } else if (key == .w and ctrl) {
             input.deleteWord(&self.state.input_buffer);
             try self.updateFilter();
             self.state.needs_render = true;
@@ -579,14 +562,8 @@ pub const App = struct {
             self.navigate(-1);
         } else if (key == .down or key == .j) {
             self.navigate(1);
-        } else if (key == .c and (event.mod.left_control or event.mod.right_control)) {
-            return true;
         } else if (key == .tab) {
-            if (event.mod.left_shift or event.mod.right_shift) {
-                self.navigate(-1);
-            } else {
-                self.navigate(1);
-            }
+            self.navigate(if (shift) -1 else 1);
         } else if (key == .home) {
             self.navigateToFirst();
         } else if (key == .end) {
@@ -598,6 +575,33 @@ pub const App = struct {
         }
 
         return false;
+    }
+
+    /// Confirm the current selection: notify features, run their onExit hooks,
+    /// and write the selected item's value to stdout. No-op if nothing matches.
+    fn handleConfirm(self: *App) !void {
+        if (self.state.filtered_items.items.len == 0) return;
+        std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len);
+
+        const item_idx = self.state.filtered_items.items[self.state.selected_index];
+        std.debug.assert(item_idx < self.state.items.items.len);
+        const selected_item = self.state.items.items[item_idx];
+
+        // Notify features of selection with full Item (features choose display/value).
+        features.callOnSelect(&self.feature_states, selected_item);
+
+        const all_completed = features.callOnExit(&self.feature_states, config.exit_timeout_ms);
+        if (!all_completed) {
+            std.log.warn("Some features did not complete onExit within timeout", .{});
+        }
+
+        // Output value field only to stdout.
+        var stdout_buffer: [4096]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(self.io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+        try stdout.writeAll(selected_item.value);
+        try stdout.writeAll("\n");
+        try stdout.flush();
     }
 
     fn handleTextInput(self: *App, text: []const u8) !void {
