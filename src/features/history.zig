@@ -218,6 +218,11 @@ pub const HistoryState = struct {
 
     /// Get position (0=most recent, null=not found)
     pub fn getPosition(self: *HistoryState, item: []const u8) ?usize {
+        // Pre: entries respect the configured cap. Catches state corruption
+        // where trim logic in record()/loadFromFile regressed and let the
+        // list outgrow max_entries — independent invariant from a different
+        // code path, not a restatement of local logic.
+        std.debug.assert(self.entries.items.len <= self.max_entries);
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry, item)) {
                 return i;
