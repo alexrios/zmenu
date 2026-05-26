@@ -111,11 +111,36 @@ pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct
             return .{ .window = window, .renderer = renderer };
         };
 
-        // Calculate centered position on target display
-        const window_x = bounds.x + @divTrunc(bounds.w - @as(i32, @intCast(config.window.initial_width)), 2);
-        const window_y = bounds.y + @divTrunc(bounds.h - @as(i32, @intCast(config.window.initial_height)), 2);
+        // Guard the u32->i32 cast: any config above maxInt(i32) would silently wrap.
+        comptime {
+            std.debug.assert(config.window.initial_width <= std.math.maxInt(i32));
+            std.debug.assert(config.window.initial_height <= std.math.maxInt(i32));
+        }
+        const window_w: i32 = @intCast(config.window.initial_width);
+        const window_h: i32 = @intCast(config.window.initial_height);
 
-        window.setPosition(.{ .absolute = window_x }, .{ .absolute = window_y }) catch |err| {
+        // Guard against bounds smaller than the window: avoid negative offsets producing
+        // an off-screen window. Fall back to SDL-centered positioning.
+        if (bounds.w < window_w or bounds.h < window_h) {
+            std.log.warn("Display {} smaller than window ({}x{} < {}x{}), falling back to centered", .{ monitor_index.?, bounds.w, bounds.h, window_w, window_h });
+            window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
+                std.log.warn("Failed to position window: {}", .{pos_err});
+            };
+            return .{ .window = window, .renderer = renderer };
+        }
+
+        // Use @addWithOverflow to defend against bounds.x/y near i32 extremes.
+        const ox = @addWithOverflow(bounds.x, @divTrunc(bounds.w - window_w, 2));
+        const oy = @addWithOverflow(bounds.y, @divTrunc(bounds.h - window_h, 2));
+        if (ox[1] != 0 or oy[1] != 0) {
+            std.log.warn("Display {} bounds produced overflow, falling back to centered", .{monitor_index.?});
+            window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
+                std.log.warn("Failed to position window: {}", .{pos_err});
+            };
+            return .{ .window = window, .renderer = renderer };
+        }
+
+        window.setPosition(.{ .absolute = ox[0] }, .{ .absolute = oy[0] }) catch |err| {
             std.log.warn("Failed to position window on monitor {}: {}", .{ monitor_index.?, err });
         };
     } else {
