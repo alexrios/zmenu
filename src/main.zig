@@ -163,11 +163,11 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[i], "--monitor") or std.mem.eql(u8, args[i], "-m")) {
             if (i + 1 >= args.len) {
                 std.log.err("--monitor requires a numeric argument", .{});
-                std.process.exit(1);
+                return error.MonitorIndexRequired;
             }
             monitor_index = std.fmt.parseInt(usize, args[i + 1], 10) catch {
                 std.log.err("--monitor argument must be a valid number", .{});
-                std.process.exit(1);
+                return error.InvalidMonitorIndex;
             };
             i += 1; // Skip the argument value
         }
