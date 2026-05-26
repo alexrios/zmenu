@@ -351,26 +351,36 @@ pub fn callOnSelect(states: *FeatureStates, selected_item: types.Item) void {
 /// Call onExit hooks with timeout - called after onSelect, before deinit
 /// Returns true if all hooks completed within timeout, false if any timed out
 pub fn callOnExit(states: *FeatureStates, timeout_ms: u32) bool {
+    std.debug.assert(timeout_ms > 0);
     if (enabled_count == 0) return true;
 
-    const start_time = sdl.timer.getMillisecondsSinceInit();
+    // Deadline-based to avoid bare unsigned subtraction on the SDL timer:
+    // saturating add for the cutoff, comparison against `now`. Plain `-` for
+    // the elapsed-time diagnostic is safe inside each guarded branch — `now`
+    // is provably greater than the start it's subtracted from.
+    const start_time: u64 = sdl.timer.getMillisecondsSinceInit();
+    const total_deadline: u64 = start_time +| @as(u64, timeout_ms);
     var all_completed = true;
 
     inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.onExit) |exitFn| {
-            const hook_start = sdl.timer.getMillisecondsSinceInit();
+            const hook_start: u64 = sdl.timer.getMillisecondsSinceInit();
+            const hook_deadline: u64 = hook_start +| @as(u64, timeout_ms);
             exitFn(states[i]);
-            const hook_duration = sdl.timer.getMillisecondsSinceInit() - hook_start;
+            const hook_now: u64 = sdl.timer.getMillisecondsSinceInit();
 
-            if (hook_duration > timeout_ms) {
+            if (hook_now > hook_deadline) {
+                std.debug.assert(hook_now > hook_start);
+                const hook_duration: u64 = hook_now - hook_start;
                 std.log.warn("Feature '{s}' onExit exceeded timeout ({d}ms > {d}ms)", .{ feature.name, hook_duration, timeout_ms });
                 all_completed = false;
             }
         }
 
-        // Check total elapsed time
-        const total_elapsed = sdl.timer.getMillisecondsSinceInit() - start_time;
-        if (total_elapsed > timeout_ms) {
+        const now: u64 = sdl.timer.getMillisecondsSinceInit();
+        if (now > total_deadline) {
+            std.debug.assert(now > start_time);
+            const total_elapsed: u64 = now - start_time;
             std.log.warn("onExit total timeout exceeded ({d}ms > {d}ms), skipping remaining features", .{ total_elapsed, timeout_ms });
             return false;
         }
