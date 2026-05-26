@@ -276,76 +276,72 @@ pub const App = struct {
             self.thread_started = true;
         }
 
+        /// Dupe `line` into heap memory, then enqueue it on the shared list
+        /// under the mutex. Returns OOM on either allocation failure; caller
+        /// should stop reading rather than masking the failure.
+        fn emitLine(self: *ThreadedStdinReader, line: []const u8) std.mem.Allocator.Error!void {
+            const owned = try self.allocator.dupe(u8, line);
+            errdefer self.allocator.free(owned);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            try self.lines.append(self.allocator, owned);
+        }
+
+        /// Split one chunk on '\n', emit each completed line, and buffer the
+        /// trailing partial line (if any) into `line_buffer` for the next chunk
+        /// to complete. Propagates OOM.
+        fn processChunk(
+            self: *ThreadedStdinReader,
+            chunk: []const u8,
+            line_buffer: *std.ArrayList(u8),
+        ) std.mem.Allocator.Error!void {
+            var start: usize = 0;
+            for (chunk, 0..) |byte, i| {
+                std.debug.assert(start <= chunk.len);
+                if (byte != '\n') continue;
+                try line_buffer.appendSlice(self.allocator, chunk[start..i]);
+                try self.emitLine(line_buffer.items);
+                line_buffer.clearRetainingCapacity();
+                start = i + 1;
+            }
+            if (start < chunk.len) {
+                try line_buffer.appendSlice(self.allocator, chunk[start..]);
+            }
+        }
+
+        /// Emit any final partial line at EOF (stdin without trailing newline).
+        /// Failure is logged and swallowed — the thread is already exiting.
+        fn flushPartialLine(self: *ThreadedStdinReader, line_buffer: *std.ArrayList(u8)) void {
+            if (line_buffer.items.len == 0) return;
+            self.emitLine(line_buffer.items) catch |err| {
+                std.log.warn("stdin reader: dropped final line on emit: {}", .{err});
+            };
+        }
+
         fn readerThreadFn(self: *ThreadedStdinReader) void {
             const stdin_fd = std.Io.File.stdin().handle;
             var chunk_buffer: [4096]u8 = undefined;
             var line_buffer = std.ArrayList(u8).empty;
             defer line_buffer.deinit(self.allocator);
-            // Ensure eof_reached is always set when the thread exits,
-            // regardless of which code path (error, OOM, normal EOF).
+            // Always signal EOF on exit so pollLines never blocks waiting for
+            // a thread that already died (read error, OOM, normal EOF).
             defer self.eof_reached.store(true, .seq_cst);
 
             // Statically-bounded outer loop (Safe-Zig R2). Functional termination
-            // is EOF / read error; the iteration cap is a safety net against a
-            // misbehaving stdin source that never returns 0 or an error.
+            // is EOF / read error / OOM; the iteration cap is a safety net
+            // against a stdin source that never returns 0 or errors.
             for (0..max_stdin_read_iterations) |_| {
-                // Blocking read (OK in background thread).
-                // Terminates on EOF (bytes_read == 0) or any read error.
                 const bytes_read = std.posix.read(stdin_fd, &chunk_buffer) catch break;
                 std.debug.assert(bytes_read <= chunk_buffer.len);
 
                 if (bytes_read == 0) {
-                    // EOF - process any remaining buffered line
-                    if (line_buffer.items.len > 0) {
-                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch |err| {
-                            std.log.warn("stdin reader: dropped final line on OOM: {}", .{err});
-                            break;
-                        };
-                        self.mutex.lockUncancelable(self.io);
-                        self.lines.append(self.allocator, owned_line) catch |err| {
-                            std.log.warn("stdin reader: dropped final line on append: {}", .{err});
-                            self.allocator.free(owned_line);
-                        };
-                        self.mutex.unlock(self.io);
-                    }
+                    self.flushPartialLine(&line_buffer);
                     break;
                 }
-
-                // Process chunk for complete lines
-                const chunk = chunk_buffer[0..bytes_read];
-                var start: usize = 0;
-                for (chunk, 0..) |byte, i| {
-                    std.debug.assert(start <= chunk.len);
-                    if (byte == '\n') {
-                        // Complete line found
-                        line_buffer.appendSlice(self.allocator, chunk[start..i]) catch |err| {
-                            std.log.warn("stdin reader: dropped line, append OOM: {}", .{err});
-                            break;
-                        };
-
-                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch |err| {
-                            std.log.warn("stdin reader: dropped line on dupe: {}", .{err});
-                            break;
-                        };
-                        self.mutex.lockUncancelable(self.io);
-                        self.lines.append(self.allocator, owned_line) catch |err| {
-                            std.log.warn("stdin reader: dropped line on shared append: {}", .{err});
-                            self.allocator.free(owned_line);
-                        };
-                        self.mutex.unlock(self.io);
-
-                        line_buffer.clearRetainingCapacity();
-                        start = i + 1;
-                    }
-                }
-
-                // Buffer remaining partial line
-                if (start < chunk.len) {
-                    line_buffer.appendSlice(self.allocator, chunk[start..]) catch |err| {
-                        std.log.warn("stdin reader: dropped partial line on buffer: {}", .{err});
-                        break;
-                    };
-                }
+                self.processChunk(chunk_buffer[0..bytes_read], &line_buffer) catch |err| {
+                    std.log.warn("stdin reader: stopping on chunk processing error: {}", .{err});
+                    break;
+                };
             }
         }
 
@@ -1010,6 +1006,66 @@ test "ThreadedStdinReader - defer ensures eof_reached on all exit paths" {
     var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
     defer reader.deinit();
     try std.testing.expect(!reader.eof_reached.load(.seq_cst));
+}
+
+test "ThreadedStdinReader.processChunk - splits complete lines and buffers partial" {
+    // Refactor (F3) split readerThreadFn into helpers. Verify processChunk
+    // emits complete lines and buffers the trailing partial line for the next
+    // chunk to complete.
+    const allocator = std.testing.allocator;
+    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
+    defer reader.deinit();
+
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
+
+    // Chunk 1: "a\nbb\nccc" → emits "a" and "bb", buffers "ccc".
+    try reader.processChunk("a\nbb\nccc", &line_buffer);
+    try std.testing.expectEqual(@as(usize, 2), reader.lines.items.len);
+    try std.testing.expectEqualStrings("a", reader.lines.items[0]);
+    try std.testing.expectEqualStrings("bb", reader.lines.items[1]);
+    try std.testing.expectEqualStrings("ccc", line_buffer.items);
+
+    // Chunk 2: "DD\nE" → completes "cccDD", buffers "E".
+    try reader.processChunk("DD\nE", &line_buffer);
+    try std.testing.expectEqual(@as(usize, 3), reader.lines.items.len);
+    try std.testing.expectEqualStrings("cccDD", reader.lines.items[2]);
+    try std.testing.expectEqualStrings("E", line_buffer.items);
+
+    // EOF flush emits the trailing "E".
+    reader.flushPartialLine(&line_buffer);
+    try std.testing.expectEqual(@as(usize, 4), reader.lines.items.len);
+    try std.testing.expectEqualStrings("E", reader.lines.items[3]);
+}
+
+test "ThreadedStdinReader.emitLine - dupes input and enqueues" {
+    // emitLine takes a borrowed slice and dupes it; the caller's source can be
+    // mutated/freed without affecting the queued copy.
+    const allocator = std.testing.allocator;
+    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
+    defer reader.deinit();
+
+    var transient: [16]u8 = undefined;
+    @memcpy(transient[0..5], "hello");
+    try reader.emitLine(transient[0..5]);
+
+    // Mutate the source; queued copy must be unaffected.
+    @memcpy(transient[0..5], "WORLD");
+
+    try std.testing.expectEqual(@as(usize, 1), reader.lines.items.len);
+    try std.testing.expectEqualStrings("hello", reader.lines.items[0]);
+}
+
+test "ThreadedStdinReader.flushPartialLine - no-op on empty buffer" {
+    const allocator = std.testing.allocator;
+    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
+    defer reader.deinit();
+
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(allocator);
+
+    reader.flushPartialLine(&line_buffer);
+    try std.testing.expectEqual(@as(usize, 0), reader.lines.items.len);
 }
 
 test "colorEquals - same colors" {
