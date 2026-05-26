@@ -201,6 +201,6 @@ pub fn loadFont() !struct { font: sdl.ttf.Font, path: []const u8 } {
 /// and is never freed by SDL_CloseIO. Verified against SDL3 source.
 fn loadEmbeddedFont() !sdl.ttf.Font {
     const stream = try sdl.io_stream.Stream.initFromConstMem(embedded_font_data);
-    errdefer stream.deinit() catch {};
+    errdefer stream.deinit() catch |err| std.log.warn("failed to close embedded font stream: {}", .{err});
     return try sdl.ttf.Font.initFromIO(stream, true, config.font.size);
 }
