@@ -1,6 +1,6 @@
 .{
     .name = .zmenu,
-    .version = "0.2.1",
+    .version = "0.3.0",
     .dependencies = .{
         .sdl3 = .{
             .url = "https://codeberg.org/7Games/zig-sdl3/archive/v0.2.0.tar.gz",
