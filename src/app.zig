@@ -383,7 +383,12 @@ pub const App = struct {
     }
 
     fn updateFilter(self: *App) !void {
+        // Pre: invariants every caller must satisfy.
+        std.debug.assert(self.state.filtered_items.items.len <= self.state.items.items.len);
+        std.debug.assert(self.state.input_buffer.items.len <= config.limits.max_input_length);
+
         const prev_filtered_count = self.state.filtered_items.items.len;
+        const total_items = self.state.items.items.len;
         self.state.filtered_items.clearRetainingCapacity();
 
         if (self.state.input_buffer.items.len == 0) {
@@ -399,8 +404,13 @@ pub const App = struct {
             }
         }
 
-        // Let features post-process filtered results (e.g., history boost)
+        // Filtering is a subset operation: result never exceeds the source.
+        std.debug.assert(self.state.filtered_items.items.len <= total_items);
+
+        // Let features post-process filtered results (e.g., history boost).
+        // Features may reorder, but not add or remove items.
         features.callAfterFilter(&self.feature_states, &self.state.filtered_items, self.state.items.items);
+        std.debug.assert(self.state.filtered_items.items.len <= total_items);
 
         if (self.state.filtered_items.items.len > 0) {
             if (self.state.selected_index >= self.state.filtered_items.items.len) {
@@ -409,6 +419,10 @@ pub const App = struct {
         } else {
             self.state.selected_index = 0;
         }
+
+        // Post: selection always points inside the filtered range (or is 0 when empty).
+        std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len or
+            self.state.filtered_items.items.len == 0);
 
         self.adjustScroll();
 
