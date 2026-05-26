@@ -919,23 +919,23 @@ pub const App = struct {
         color: sdl.pixels.Color,
         cache: *TextureCache,
     ) !void {
-        const text_changed = !std.mem.eql(u8, cache.last_text, text);
+        // R3: hot path. Comparison reads from cache.last_text_buf (stack/struct
+        // memory); setText below uses @memcpy. No heap allocation per frame.
+        std.debug.assert(text.len <= rendering_mod.max_cache_text_len);
+
+        const text_changed = !std.mem.eql(u8, cache.lastText(), text);
         const color_changed = !rendering_mod.colorEquals(cache.last_color, color);
 
         if (text_changed or color_changed or cache.texture == null) {
-            // Create new texture before modifying cache state to avoid
-            // inconsistency if rendering fails partway through
+            // Build the new texture before mutating cache state — if the SDL
+            // call fails, the cache stays consistent with the previous frame.
             const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
             const surface = try self.sdl.font.renderTextBlended(text, ttf_color);
             defer surface.deinit();
             const new_texture = try self.sdl.renderer.createTextureFromSurface(surface);
 
-            const new_text = try self.allocator.dupe(u8, text);
-
-            // All allocations succeeded — now update cache atomically
             if (cache.texture) |old_tex| old_tex.deinit();
-            self.allocator.free(cache.last_text);
-            cache.last_text = new_text;
+            cache.setText(text);
             cache.last_color = color;
             cache.texture = new_texture;
         }
@@ -1030,4 +1030,37 @@ test "config - buffer sizes aligned with limits" {
     try std.testing.expect(config.limits.input_ellipsis_margin < config.limits.max_input_length);
     // Value preview buffer must fit truncated preview + "..." suffix + null terminator
     try std.testing.expect(config.limits.value_preview_buffer_size >= config.multivalue.preview_max_length + 4);
+}
+
+test "TextureCache - empty has zero-length text" {
+    const cache = TextureCache.empty;
+    try std.testing.expectEqual(@as(usize, 0), cache.last_text_len);
+    try std.testing.expectEqualStrings("", cache.lastText());
+    try std.testing.expect(cache.texture == null);
+}
+
+test "TextureCache - setText / lastText round-trip" {
+    var cache = TextureCache.empty;
+    cache.setText("hello world");
+    try std.testing.expectEqual(@as(usize, 11), cache.last_text_len);
+    try std.testing.expectEqualStrings("hello world", cache.lastText());
+
+    // Overwrite with shorter text — length tracking must shrink.
+    cache.setText("hi");
+    try std.testing.expectEqual(@as(usize, 2), cache.last_text_len);
+    try std.testing.expectEqualStrings("hi", cache.lastText());
+
+    // Overwrite with empty — back to zero.
+    cache.setText("");
+    try std.testing.expectEqual(@as(usize, 0), cache.last_text_len);
+    try std.testing.expectEqualStrings("", cache.lastText());
+}
+
+test "TextureCache - max-size text fits exactly" {
+    var cache = TextureCache.empty;
+    var buf: [rendering_mod.max_cache_text_len]u8 = undefined;
+    @memset(&buf, 'X');
+    cache.setText(&buf);
+    try std.testing.expectEqual(rendering_mod.max_cache_text_len, cache.last_text_len);
+    try std.testing.expectEqualSlices(u8, &buf, cache.lastText());
 }
