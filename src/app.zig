@@ -20,6 +20,21 @@ pub const AppState = state_mod.AppState;
 pub const InputState = state_mod.InputState;
 pub const RenderContext = rendering_mod.RenderContext;
 
+// Safe-Zig R2 hard caps on otherwise input-driven loops. These are safety
+// nets — exceeding them would require a pathological OS condition or a runaway
+// SDL event source — but they encode a statically provable upper bound.
+
+/// Maximum events drained per 16ms event-loop tick. Any excess events are
+/// processed on the next tick. SDL's queue is small; 1024 is far above the
+/// largest reasonable burst (keyboard auto-repeat, paste, window events).
+const max_events_per_tick: u32 = 1024;
+
+/// Maximum read syscalls the stdin reader thread will perform before it
+/// gives up. 1 million chunks × 4 KiB = 4 GiB of stdin — orders of magnitude
+/// beyond any reasonable launcher input. Functional termination still occurs
+/// on EOF (`bytes_read == 0`) or read error.
+const max_stdin_read_iterations: u32 = 1_000_000;
+
 pub const App = struct {
     sdl: SdlContext,
     state: AppState,
@@ -194,8 +209,11 @@ pub const App = struct {
             // Wait for SDL events with timeout (blocks up to 16ms, returns early on event)
             // This avoids busy-waiting while still polling stdin regularly
             if (sdl.events.waitTimeout(16)) {
-                // Process all queued events
-                while (sdl.events.poll()) |event| {
+                // Process all queued events. The `for (0..MAX) |_|` form
+                // encodes a static upper bound (Safe-Zig R2). Any events that
+                // overflow the per-tick cap will be drained on the next tick.
+                for (0..max_events_per_tick) |_| {
+                    const event = sdl.events.poll() orelse break;
                     switch (event) {
                         .quit => running = false,
                         .terminating => running = false,
@@ -264,7 +282,10 @@ pub const App = struct {
             // regardless of which code path (error, OOM, normal EOF).
             defer self.eof_reached.store(true, .seq_cst);
 
-            while (true) {
+            // Statically-bounded outer loop (Safe-Zig R2). Functional termination
+            // is EOF / read error; the iteration cap is a safety net against a
+            // misbehaving stdin source that never returns 0 or an error.
+            for (0..max_stdin_read_iterations) |_| {
                 // Blocking read (OK in background thread).
                 // Terminates on EOF (bytes_read == 0) or any read error.
                 const bytes_read = std.posix.read(stdin_fd, &chunk_buffer) catch break;
