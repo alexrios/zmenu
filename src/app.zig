@@ -137,6 +137,7 @@ pub const App = struct {
         };
 
         try features.initAll(allocator, io, &app.feature_states, parsed_flags);
+        errdefer features.deinitAll(&app.feature_states, allocator);
         try app.updateWindowSize();
         try window.setPosition(.{ .centered = null }, .{ .centered = null });
         try sdl.keyboard.startTextInput(window);
