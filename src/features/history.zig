@@ -25,6 +25,11 @@ pub const HistoryState = struct {
     history_path: []const u8,
     max_entries: usize,
     dirty: bool = false,
+    // Separate from `dirty`: loadFromFile mutates entries but does not need a
+    // save. addEntry sets both; save() clears only `dirty`. Empty entries + empty
+    // map is consistent, so default false.
+    lookup_dirty: bool = false,
+    lookup_map: std.StringHashMap(usize),
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io) !*HistoryState {
         return loadWithConfig(allocator, io, null, history_config.max_entries);
@@ -38,15 +43,23 @@ pub const HistoryState = struct {
             try allocator.dupe(u8, path)
         else
             try getHistoryPath(allocator);
+        errdefer allocator.free(history_path);
 
+        var lookup_map = std.StringHashMap(usize).init(allocator);
+        errdefer lookup_map.deinit();
+        try lookup_map.ensureTotalCapacity(@intCast(max_entries));
+
+        // After this assignment `history_path` and `lookup_map` alias state's
+        // fields. The local errdefers above remain valid (they free the same
+        // buffers), so any error returned below cleans up exactly once.
         state.* = .{
             .allocator = allocator,
             .io = io,
             .entries = std.ArrayList([]const u8).empty,
             .history_path = history_path,
             .max_entries = max_entries,
+            .lookup_map = lookup_map,
         };
-        errdefer allocator.free(state.history_path);
 
         state.loadFromFile() catch |err| {
             if (err != error.FileNotFound) {
@@ -69,10 +82,30 @@ pub const HistoryState = struct {
         );
         defer self.allocator.free(content);
 
+        // Set early: if dupe/append errors mid-loop, the caller catches and
+        // continues with partial entries. lookup_dirty must already be true so
+        // the next afterFilter rebuilds the map instead of reading a stale empty
+        // one.
+        self.lookup_dirty = true;
+
+        std.debug.assert(self.max_entries <= 10_000);
         var lines = std.mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             if (self.entries.items.len >= self.max_entries) break;
+            // Skip duplicates (manual file edits, corruption, concurrent writers).
+            // rebuildLookupMap asserts count == entries.len, which fails if
+            // putAssumeCapacity collapses duplicate keys.
+            // O(N^2) but N <= max_entries (asserted above; <= 10_000).
+            std.debug.assert(self.entries.items.len <= self.max_entries);
+            var dup = false;
+            for (self.entries.items) |existing| {
+                if (std.mem.eql(u8, existing, line)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
             const entry = try self.allocator.dupe(u8, line);
             try self.entries.append(self.allocator, entry);
         }
@@ -125,6 +158,7 @@ pub const HistoryState = struct {
                 self.allocator.free(entry);
                 _ = self.entries.orderedRemove(i);
                 self.dirty = true;
+                self.lookup_dirty = true;
                 break;
             }
         }
@@ -140,6 +174,7 @@ pub const HistoryState = struct {
             return;
         };
         self.dirty = true;
+        self.lookup_dirty = true;
 
         // Trim to max (use instance max_entries). Bounded: at most one
         // iteration since insert added exactly one element.
@@ -150,6 +185,28 @@ pub const HistoryState = struct {
             self.allocator.free(removed);
         }
         std.debug.assert(self.entries.items.len <= self.max_entries);
+    }
+
+    /// Rebuild lookup_map from current entries. Keys are slices into entry
+    /// strings; entries must outlive the map (see deinit ordering).
+    /// Returns false on allocation failure; callers must fall back.
+    fn rebuildLookupMap(self: *HistoryState) bool {
+        std.debug.assert(self.entries.items.len <= self.max_entries);
+
+        self.lookup_map.clearRetainingCapacity();
+        self.lookup_map.ensureTotalCapacity(@intCast(self.entries.items.len)) catch return false;
+        // Bounded by max_entries (asserted above; <= 10_000 at compile time).
+        for (self.entries.items, 0..) |entry, pos| {
+            self.lookup_map.putAssumeCapacity(entry, pos);
+        }
+        self.lookup_dirty = false;
+
+        std.debug.assert(self.lookup_map.count() == self.entries.items.len);
+        if (self.entries.items.len > 0) {
+            const spot = self.lookup_map.get(self.entries.items[0]);
+            std.debug.assert(spot != null and spot.? == 0);
+        }
+        return true;
     }
 
     /// Get position (0=most recent, null=not found)
@@ -163,6 +220,9 @@ pub const HistoryState = struct {
     }
 
     pub fn deinit(self: *HistoryState) void {
+        // Tear down the map before freeing entries — keys are slices into entry
+        // strings, so dropping entries first would leave dangling references.
+        self.lookup_map.deinit();
         for (self.entries.items) |entry| {
             self.allocator.free(entry);
         }
@@ -243,19 +303,15 @@ fn afterFilter(
     if (filtered_items.items.len <= 1) return;
     if (state.entries.items.len == 0) return;
 
-    // Build a lookup map: display text → history position (O(N) where N = history entries)
-    var position_map = std.StringHashMap(usize).init(state.allocator);
-    defer position_map.deinit();
-    position_map.ensureTotalCapacity(@intCast(state.entries.items.len)) catch |err| {
-        std.log.warn("history: skipping reorder, lookup map allocation failed: {}", .{err});
-        return;
-    };
-    for (state.entries.items, 0..) |entry, pos| {
-        position_map.put(entry, pos) catch |err| {
-            std.log.warn("history: skipping reorder, lookup map population failed: {}", .{err});
+    // Hot path (Safe-Zig R3): no allocation per keystroke. Map is rebuilt only
+    // when addEntry / loadFromFile invalidates it.
+    if (state.lookup_dirty) {
+        if (!state.rebuildLookupMap()) {
+            std.log.warn("history: skipping reorder, lookup map rebuild failed", .{});
             return;
-        };
+        }
     }
+    const position_map = &state.lookup_map;
 
     // Insertion sort using O(1) lookups instead of O(N) getPosition scans
     const items = filtered_items.items;
@@ -321,8 +377,10 @@ test "HistoryState - add and retrieve entries" {
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/zmenu_test_history"),
         .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| {
             allocator.free(entry);
         }
@@ -349,8 +407,10 @@ test "HistoryState - re-adding moves to front" {
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/zmenu_test_history"),
         .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| {
             allocator.free(entry);
         }
@@ -381,8 +441,10 @@ test "History afterFilter - basic reordering correctness" {
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/test_history"),
         .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
         allocator.free(state.history_path);
@@ -440,8 +502,10 @@ test "HistoryState - save creates nested directories" {
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, nested_path),
         .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
         allocator.free(state.history_path);
@@ -475,8 +539,10 @@ test "History afterFilter - matches on display field not value" {
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/test_history"),
         .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
         allocator.free(state.history_path);
@@ -534,8 +600,10 @@ test "HistoryState - save skipped when no changes made" {
         .history_path = try allocator.dupe(u8, test_path),
         .max_entries = 100,
         .dirty = false,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
         allocator.free(state.history_path);
@@ -584,8 +652,10 @@ test "History afterFilter - rapid updates" {
         .entries = std.ArrayList([]const u8).empty,
         .history_path = try allocator.dupe(u8, "/tmp/test_history"),
         .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
         allocator.free(state.history_path);
@@ -640,4 +710,206 @@ test "History afterFilter - rapid updates" {
             try std.testing.expect(idx < all_items.items.len);
         }
     }
+}
+
+test "History lazy lookup_map - addEntry invalidates and reorder still works" {
+    // Regression: after addEntry mutates entries, the next afterFilter must
+    // rebuild the cached map so reordering reflects new positions.
+    const allocator = std.testing.allocator;
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, "/tmp/test_history_lazy"),
+        .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
+    };
+    defer {
+        state.lookup_map.deinit();
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    state.addEntry("alpha");
+    state.addEntry("beta");
+
+    var all_items = std.ArrayList(types.Item).empty;
+    defer {
+        for (all_items.items) |item| item.deinit(allocator);
+        all_items.deinit(allocator);
+    }
+    try all_items.append(allocator, try types.Item.parse(allocator, "gamma"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "alpha"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "beta"));
+
+    var filtered = std.ArrayList(usize).empty;
+    defer filtered.deinit(allocator);
+    try filtered.append(allocator, 0);
+    try filtered.append(allocator, 1);
+    try filtered.append(allocator, 2);
+
+    const state_ptr: ?features_mod.FeatureState = @ptrCast(&state);
+    afterFilter(state_ptr, &filtered, all_items.items);
+    // beta most recent → first, alpha → second
+    try std.testing.expectEqual(@as(usize, 2), filtered.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), filtered.items[1]);
+    try std.testing.expect(!state.lookup_dirty);
+
+    // Promote alpha — must invalidate the cached map.
+    state.addEntry("alpha");
+    try std.testing.expect(state.lookup_dirty);
+
+    filtered.clearRetainingCapacity();
+    try filtered.append(allocator, 0);
+    try filtered.append(allocator, 1);
+    try filtered.append(allocator, 2);
+
+    afterFilter(state_ptr, &filtered, all_items.items);
+    // alpha now most recent → first, beta → second
+    try std.testing.expectEqual(@as(usize, 1), filtered.items[0]);
+    try std.testing.expectEqual(@as(usize, 2), filtered.items[1]);
+    try std.testing.expect(!state.lookup_dirty);
+}
+
+test "History lazy lookup_map - repeated afterFilter without mutation skips rebuild" {
+    // The Safe-Zig win: many keystrokes (repeated afterFilter) must not redo
+    // hashmap work. Verified by lookup_dirty staying false across 100 calls.
+    const allocator = std.testing.allocator;
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, "/tmp/test_history_no_rebuild"),
+        .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
+    };
+    defer {
+        state.lookup_map.deinit();
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    state.addEntry("x");
+    state.addEntry("y");
+    try std.testing.expect(state.lookup_dirty);
+
+    var all_items = std.ArrayList(types.Item).empty;
+    defer {
+        for (all_items.items) |item| item.deinit(allocator);
+        all_items.deinit(allocator);
+    }
+    try all_items.append(allocator, try types.Item.parse(allocator, "x"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "y"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "z"));
+
+    const state_ptr: ?features_mod.FeatureState = @ptrCast(&state);
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var filtered = std.ArrayList(usize).empty;
+        defer filtered.deinit(allocator);
+        try filtered.append(allocator, 0);
+        try filtered.append(allocator, 1);
+        try filtered.append(allocator, 2);
+
+        afterFilter(state_ptr, &filtered, all_items.items);
+        // After the first call, dirty stays false → rebuild is skipped.
+        try std.testing.expect(!state.lookup_dirty);
+    }
+}
+
+test "History loadFromFile - partial-load state still triggers rebuild" {
+    // If loadFromFile errors mid-loop (caller catches and continues), entries
+    // has items but the map was never populated. The early `lookup_dirty = true`
+    // ensures the next afterFilter rebuilds instead of reading a stale empty map.
+    // Simulated by directly populating entries while map stays empty.
+    const allocator = std.testing.allocator;
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, "/tmp/test_partial_load"),
+        .max_entries = 100,
+        .lookup_dirty = true, // post-partial-load invariant
+        .lookup_map = std.StringHashMap(usize).init(allocator),
+    };
+    defer {
+        state.lookup_map.deinit();
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+
+    // Populate entries directly (bypassing addEntry) to mimic partial load.
+    const owned = try allocator.dupe(u8, "loaded_item");
+    try state.entries.append(allocator, owned);
+
+    var all_items = std.ArrayList(types.Item).empty;
+    defer {
+        for (all_items.items) |item| item.deinit(allocator);
+        all_items.deinit(allocator);
+    }
+    try all_items.append(allocator, try types.Item.parse(allocator, "other"));
+    try all_items.append(allocator, try types.Item.parse(allocator, "loaded_item"));
+
+    var filtered = std.ArrayList(usize).empty;
+    defer filtered.deinit(allocator);
+    try filtered.append(allocator, 0);
+    try filtered.append(allocator, 1);
+
+    const state_ptr: ?features_mod.FeatureState = @ptrCast(&state);
+    afterFilter(state_ptr, &filtered, all_items.items);
+
+    // loaded_item must be promoted; if the rebuild didn't happen, ordering is unchanged.
+    try std.testing.expectEqual(@as(usize, 1), filtered.items[0]);
+    try std.testing.expect(!state.lookup_dirty);
+}
+
+test "HistoryState loadFromFile - dedupes duplicate lines without tripping assertion" {
+    // History file may contain duplicates (manual edits, corruption, concurrent
+    // writes). loadFromFile must skip them so rebuildLookupMap's
+    // count==entries.len assertion holds.
+    const allocator = std.testing.allocator;
+
+    const test_path = "/tmp/zmenu_test_dedup_history";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
+
+    // Write 6 lines, 3 unique
+    const file = try std.Io.Dir.createFileAbsolute(std.testing.io, test_path, .{});
+    {
+        var buf: [256]u8 = undefined;
+        var fw = file.writer(std.testing.io, &buf);
+        const w = &fw.interface;
+        try w.writeAll("alpha\nbeta\nalpha\ngamma\nbeta\nalpha\n");
+        try w.flush();
+        file.close(std.testing.io);
+    }
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
+
+    var state = HistoryState{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = try allocator.dupe(u8, test_path),
+        .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(allocator),
+    };
+    defer {
+        state.lookup_map.deinit();
+        for (state.entries.items) |entry| allocator.free(entry);
+        state.entries.deinit(allocator);
+        allocator.free(state.history_path);
+    }
+    try state.lookup_map.ensureTotalCapacity(@intCast(state.max_entries));
+
+    try state.loadFromFile();
+
+    // 3 unique entries kept; rebuildLookupMap's count==entries.len holds.
+    try std.testing.expectEqual(@as(usize, 3), state.entries.items.len);
+    try std.testing.expect(state.rebuildLookupMap());
+    try std.testing.expectEqual(@as(usize, 3), state.lookup_map.count());
 }
