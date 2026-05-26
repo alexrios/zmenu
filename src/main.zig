@@ -222,11 +222,21 @@ fn printFeatures(io: std.Io) !void {
 }
 
 fn printHelp(io: std.Io) void {
+    // Single error-handling site: writeHelpBody uses try throughout, so any
+    // writeAll/flush failure short-circuits and is logged once. Previously each
+    // call had its own silent catch{}, masking broken-pipe and disk-full from
+    // both the user and any caller of zmenu --help.
+    writeHelpBody(io) catch |err| {
+        std.log.warn("help output truncated: {}", .{err});
+    };
+}
+
+fn writeHelpBody(io: std.Io) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    _ = stdout.writeAll(
+    try stdout.writeAll(
         \\zmenu - Cross-platform dmenu-like application launcher
         \\
         \\Usage:
@@ -239,15 +249,14 @@ fn printHelp(io: std.Io) void {
         \\  --features      Show compile-time features and configuration
         \\  -m, --monitor N Specify monitor/display index (0 = primary)
         \\
-    ) catch {};
+    );
 
-    // Add feature-specific flags (compile-time generated)
     const feature_help = comptime features.getFeatureFlagsHelp();
     if (feature_help.len > 0) {
-        _ = stdout.writeAll(feature_help) catch {};
+        try stdout.writeAll(feature_help);
     }
 
-    _ = stdout.writeAll(
+    try stdout.writeAll(
         \\
         \\Configuration:
         \\  Copy config.def.zig to config.zig and customize, then rebuild
@@ -275,9 +284,9 @@ fn printHelp(io: std.Io) void {
         \\  cat items.txt | zmenu
         \\  echo -e "Option A\nOption B" | ZMENU_THEME=dracula zmenu
         \\
-    ) catch {};
+    );
 
-    stdout.flush() catch {};
+    try stdout.flush();
 }
 
 test "parseFlag - string flag rejects value that looks like another flag" {
