@@ -116,6 +116,9 @@ pub const HistoryState = struct {
 
     /// Add entry (moves to front if exists). Marks state as dirty.
     pub fn addEntry(self: *HistoryState, item: []const u8) void {
+        std.debug.assert(self.max_entries > 0);
+        std.debug.assert(self.entries.items.len <= self.max_entries);
+
         // Remove if exists (modifies state, so mark dirty)
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry, item)) {
@@ -127,19 +130,26 @@ pub const HistoryState = struct {
         }
 
         // Add to front
-        const new_entry = self.allocator.dupe(u8, item) catch return;
-        self.entries.insert(self.allocator, 0, new_entry) catch {
+        const new_entry = self.allocator.dupe(u8, item) catch |err| {
+            std.log.warn("history addEntry: dropped on dupe OOM: {}", .{err});
+            return;
+        };
+        self.entries.insert(self.allocator, 0, new_entry) catch |err| {
+            std.log.warn("history addEntry: dropped on insert OOM: {}", .{err});
             self.allocator.free(new_entry);
             return;
         };
         self.dirty = true;
 
-        // Trim to max (use instance max_entries)
+        // Trim to max (use instance max_entries). Bounded: at most one
+        // iteration since insert added exactly one element.
+        std.debug.assert(self.entries.items.len <= self.max_entries + 1);
         while (self.entries.items.len > self.max_entries) {
             const removed = self.entries.items[self.entries.items.len - 1];
             self.entries.shrinkRetainingCapacity(self.entries.items.len - 1);
             self.allocator.free(removed);
         }
+        std.debug.assert(self.entries.items.len <= self.max_entries);
     }
 
     /// Get position (0=most recent, null=not found)

@@ -294,9 +294,13 @@ pub const App = struct {
                 if (bytes_read == 0) {
                     // EOF - process any remaining buffered line
                     if (line_buffer.items.len > 0) {
-                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch break;
+                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch |err| {
+                            std.log.warn("stdin reader: dropped final line on OOM: {}", .{err});
+                            break;
+                        };
                         self.mutex.lockUncancelable(self.io);
-                        self.lines.append(self.allocator, owned_line) catch {
+                        self.lines.append(self.allocator, owned_line) catch |err| {
+                            std.log.warn("stdin reader: dropped final line on append: {}", .{err});
                             self.allocator.free(owned_line);
                         };
                         self.mutex.unlock(self.io);
@@ -311,11 +315,18 @@ pub const App = struct {
                     std.debug.assert(start <= chunk.len);
                     if (byte == '\n') {
                         // Complete line found
-                        line_buffer.appendSlice(self.allocator, chunk[start..i]) catch break;
+                        line_buffer.appendSlice(self.allocator, chunk[start..i]) catch |err| {
+                            std.log.warn("stdin reader: dropped line, append OOM: {}", .{err});
+                            break;
+                        };
 
-                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch break;
+                        const owned_line = self.allocator.dupe(u8, line_buffer.items) catch |err| {
+                            std.log.warn("stdin reader: dropped line on dupe: {}", .{err});
+                            break;
+                        };
                         self.mutex.lockUncancelable(self.io);
-                        self.lines.append(self.allocator, owned_line) catch {
+                        self.lines.append(self.allocator, owned_line) catch |err| {
+                            std.log.warn("stdin reader: dropped line on shared append: {}", .{err});
                             self.allocator.free(owned_line);
                         };
                         self.mutex.unlock(self.io);
@@ -327,7 +338,10 @@ pub const App = struct {
 
                 // Buffer remaining partial line
                 if (start < chunk.len) {
-                    line_buffer.appendSlice(self.allocator, chunk[start..]) catch break;
+                    line_buffer.appendSlice(self.allocator, chunk[start..]) catch |err| {
+                        std.log.warn("stdin reader: dropped partial line on buffer: {}", .{err});
+                        break;
+                    };
                 }
             }
         }
