@@ -59,31 +59,29 @@ pub const FeatureInitData = struct {
         return null;
     }
 
-    /// Get a string flag value by name.
+    /// Get a string flag value by name. Returns null only if the flag wasn't
+    /// supplied on the command line. Calling this for a non-string flag is a
+    /// programmer error and traps in debug.
     pub fn getString(self: FeatureInitData, name: []const u8) ?[]const u8 {
         const val = self.getFlag(name) orelse return null;
-        return switch (val) {
-            .string => |s| s,
-            else => null,
-        };
+        std.debug.assert(val == .string);
+        return val.string;
     }
 
-    /// Get an int flag value by name.
+    /// Get an int flag value by name. Returns null only if the flag wasn't
+    /// supplied. Calling this for a non-int flag traps in debug.
     pub fn getInt(self: FeatureInitData, name: []const u8) ?i64 {
         const val = self.getFlag(name) orelse return null;
-        return switch (val) {
-            .int => |i| i,
-            else => null,
-        };
+        std.debug.assert(val == .int);
+        return val.int;
     }
 
-    /// Get a bool flag value by name. Returns false if not found.
+    /// Get a bool flag value by name. Returns false if not supplied.
+    /// Calling this for a non-bool flag traps in debug.
     pub fn getBool(self: FeatureInitData, name: []const u8) bool {
         const val = self.getFlag(name) orelse return false;
-        return switch (val) {
-            .bool => |b| b,
-            else => false,
-        };
+        std.debug.assert(val == .bool);
+        return val.bool;
     }
 };
 
@@ -468,19 +466,18 @@ test "FeatureInitData - typed getters" {
         .cli_flags = flags,
     };
 
-    // getString
+    // getString — only valid for declared string flags.
     try std.testing.expectEqualStrings("/tmp", init_data.getString("path").?);
-    try std.testing.expect(init_data.getString("limit") == null); // wrong type
-    try std.testing.expect(init_data.getString("absent") == null); // null value
+    try std.testing.expect(init_data.getString("absent") == null); // not supplied
+    try std.testing.expect(init_data.getString("unknown") == null); // not declared
 
-    // getInt
+    // getInt — only valid for declared int flags.
     try std.testing.expectEqual(@as(i64, 42), init_data.getInt("limit").?);
-    try std.testing.expect(init_data.getInt("path") == null); // wrong type
+    try std.testing.expect(init_data.getInt("unknown") == null); // not declared
 
-    // getBool
+    // getBool — only valid for declared bool flags.
     try std.testing.expect(init_data.getBool("dry-run") == true);
-    try std.testing.expect(init_data.getBool("absent") == false); // null → false
-    try std.testing.expect(init_data.getBool("unknown") == false); // missing → false
+    try std.testing.expect(init_data.getBool("unknown") == false); // not declared
 }
 
 test "FeatureInitData - empty flags" {
