@@ -400,8 +400,19 @@ pub const App = struct {
     /// Measure the rendered width of an item (display + optional value preview).
     /// Used once per item on ingest to maintain the cached max width.
     fn measureItemWidth(self: *App, item: types.Item) f32 {
-        const display_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item.display}) catch return 0;
-        const display_w, _ = self.sdl.font.getStringSize(display_text) catch return 0;
+        // bufPrint failure here means item_buffer_size is misconfigured (smaller
+        // than max_item_length + prefix). This is a comptime invariant per
+        // CLAUDE.md; assert it instead of silently degrading.
+        std.debug.assert(self.render_ctx.item_buffer.len >= config.limits.max_item_length + 16);
+
+        const display_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item.display}) catch |err| {
+            std.log.warn("measureItemWidth: display bufPrint failed ({}); width may be wrong", .{err});
+            return 0;
+        };
+        const display_w, _ = self.sdl.font.getStringSize(display_text) catch |err| {
+            std.log.warn("measureItemWidth: SDL getStringSize failed ({}); width may be wrong", .{err});
+            return 0;
+        };
         var total: f32 = @floatFromInt(display_w);
 
         if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
@@ -410,13 +421,20 @@ pub const App = struct {
             else
                 item.value.len;
 
-            const preview_text = std.fmt.bufPrint(self.render_ctx.value_preview_buffer, "{s}", .{item.value[0..preview_len]}) catch return total;
-            const preview_w, _ = self.sdl.font.getStringSize(preview_text) catch return total;
+            const preview_text = std.fmt.bufPrint(self.render_ctx.value_preview_buffer, "{s}", .{item.value[0..preview_len]}) catch |err| {
+                std.log.warn("measureItemWidth: preview bufPrint failed ({}); width may be wrong", .{err});
+                return total;
+            };
+            const preview_w, _ = self.sdl.font.getStringSize(preview_text) catch |err| {
+                std.log.warn("measureItemWidth: preview getStringSize failed ({}); width may be wrong", .{err});
+                return total;
+            };
 
             total += config.multivalue.preview_spacing + @as(f32, @floatFromInt(preview_w));
         }
 
         total += config.layout.width_padding * 2.0;
+        std.debug.assert(total >= 0.0);
         return total;
     }
 
