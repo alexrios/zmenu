@@ -59,14 +59,23 @@ pub fn exactMatch(haystack: []const u8, needle: []const u8) bool {
 /// Find the last valid UTF-8 character boundary at or before max_len
 /// Prevents truncating in the middle of a multi-byte character
 pub fn findUtf8Boundary(text: []const u8, max_len: usize) usize {
-    if (text.len <= max_len) return text.len;
+    if (text.len <= max_len) {
+        // Post: the trivial case — full slice fits, so the returned length
+        // is the slice length and trivially on a boundary.
+        return text.len;
+    }
 
     var pos = max_len;
-    // Walk backwards to find a non-continuation byte
-    // UTF-8 continuation bytes have the pattern 10xxxxxx (0x80-0xBF)
+    // Walk backwards to find a non-continuation byte.
+    // UTF-8 continuation bytes have the pattern 10xxxxxx (0x80-0xBF).
+    // Loop is bounded: pos strictly decreases each iteration, max max_len iterations.
     while (pos > 0 and (text[pos] & 0xC0) == 0x80) {
         pos -= 1;
     }
+    // Post: pos points to either text[0] or a non-continuation byte (the
+    // start of a codepoint). text[0..pos] is therefore a valid UTF-8 slice.
+    std.debug.assert(pos <= max_len);
+    std.debug.assert(pos == 0 or (text[pos] & 0xC0) != 0x80);
     return pos;
 }
 
@@ -75,16 +84,29 @@ pub fn findUtf8Boundary(text: []const u8, max_len: usize) usize {
 pub fn deleteLastCodepoint(buffer: *std.ArrayList(u8)) void {
     if (buffer.items.len == 0) return;
 
+    const old_len = buffer.items.len;
     var i = buffer.items.len - 1;
 
-    // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF)
-    // We need to backtrack to find the start of the codepoint
+    // UTF-8 continuation bytes start with 10xxxxxx (0x80-0xBF).
+    // We need to backtrack to find the start of the codepoint.
+    // Bounded: at most 3 iterations (a codepoint is ≤ 4 bytes total).
     while (i > 0 and (buffer.items[i] & 0xC0) == 0x80) {
         i -= 1;
     }
 
+    // Pre-shrink invariants: i is the codepoint start (or 0), and we removed
+    // at most one codepoint worth (≤ 4 bytes per UTF-8 spec).
+    // `buffer.items[i]` is the leading byte we're about to remove — it cannot
+    // itself be a continuation byte (we walked PAST continuation bytes).
+    std.debug.assert(i < old_len);
+    std.debug.assert(old_len - i <= 4);
+    std.debug.assert(i == 0 or (buffer.items[i] & 0xC0) != 0x80);
+
     // Resize to remove the entire codepoint
     buffer.shrinkRetainingCapacity(i);
+
+    // Post: buffer length was truncated exactly to the codepoint start.
+    std.debug.assert(buffer.items.len == i);
 }
 
 /// Delete the last word from a buffer (Ctrl+W behavior)
