@@ -130,7 +130,10 @@ pub fn main(init: std.process.Init) !void {
     else
         std.heap.smp_allocator;
     defer if (builtin.mode == .Debug) {
-        _ = debug_alloc.deinit();
+        switch (debug_alloc.deinit()) {
+            .ok => {},
+            .leak => std.debug.panic("memory leak detected in debug allocator", .{}),
+        }
     };
 
     // Args are owned by the process arena and live for the program's lifetime.
