@@ -68,6 +68,52 @@ pub fn getDisplayBounds(display: sdl.video.Display) !struct { x: i32, y: i32, w:
     };
 }
 
+/// Center the window via SDL's centered positioning, logging on failure.
+/// Used as the fallback whenever per-monitor placement is not possible.
+fn centerFallback(window: sdl.video.Window) void {
+    window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
+        std.log.warn("Failed to position window: {}", .{pos_err});
+    };
+}
+
+/// Position the window on the given display, falling back to centered on any error.
+fn positionOnDisplay(window: sdl.video.Window, display: sdl.video.Display, monitor_index: usize) void {
+    const bounds = getDisplayBounds(display) catch |err| {
+        std.log.warn("Failed to get display bounds: {}", .{err});
+        centerFallback(window);
+        return;
+    };
+
+    // Guard the u32->i32 cast: any config above maxInt(i32) would silently wrap.
+    comptime {
+        std.debug.assert(config.window.initial_width <= std.math.maxInt(i32));
+        std.debug.assert(config.window.initial_height <= std.math.maxInt(i32));
+    }
+    const window_w: i32 = @intCast(config.window.initial_width);
+    const window_h: i32 = @intCast(config.window.initial_height);
+
+    // Guard against bounds smaller than the window: avoid negative offsets producing
+    // an off-screen window. Fall back to SDL-centered positioning.
+    if (bounds.w < window_w or bounds.h < window_h) {
+        std.log.warn("Display {} smaller than window ({}x{} < {}x{}), falling back to centered", .{ monitor_index, bounds.w, bounds.h, window_w, window_h });
+        centerFallback(window);
+        return;
+    }
+
+    // Use @addWithOverflow to defend against bounds.x/y near i32 extremes.
+    const ox = @addWithOverflow(bounds.x, @divTrunc(bounds.w - window_w, 2));
+    const oy = @addWithOverflow(bounds.y, @divTrunc(bounds.h - window_h, 2));
+    if (ox[1] != 0 or oy[1] != 0) {
+        std.log.warn("Display {} bounds produced overflow, falling back to centered", .{monitor_index});
+        centerFallback(window);
+        return;
+    }
+
+    window.setPosition(.{ .absolute = ox[0] }, .{ .absolute = oy[0] }) catch |err| {
+        std.log.warn("Failed to position window on monitor {}: {}", .{ monitor_index, err });
+    };
+}
+
 /// Create window and renderer with configured settings
 pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct { window: sdl.video.Window, renderer: sdl.render.Renderer } {
     // Validate monitor if specified
@@ -100,54 +146,10 @@ pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct
         window_flags,
     );
 
-    // Position window on target display
     if (target_display) |display| {
-        const bounds = getDisplayBounds(display) catch |err| {
-            std.log.warn("Failed to get display bounds: {}", .{err});
-            // Fall back to centered positioning
-            window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
-                std.log.warn("Failed to position window: {}", .{pos_err});
-            };
-            return .{ .window = window, .renderer = renderer };
-        };
-
-        // Guard the u32->i32 cast: any config above maxInt(i32) would silently wrap.
-        comptime {
-            std.debug.assert(config.window.initial_width <= std.math.maxInt(i32));
-            std.debug.assert(config.window.initial_height <= std.math.maxInt(i32));
-        }
-        const window_w: i32 = @intCast(config.window.initial_width);
-        const window_h: i32 = @intCast(config.window.initial_height);
-
-        // Guard against bounds smaller than the window: avoid negative offsets producing
-        // an off-screen window. Fall back to SDL-centered positioning.
-        if (bounds.w < window_w or bounds.h < window_h) {
-            std.log.warn("Display {} smaller than window ({}x{} < {}x{}), falling back to centered", .{ monitor_index.?, bounds.w, bounds.h, window_w, window_h });
-            window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
-                std.log.warn("Failed to position window: {}", .{pos_err});
-            };
-            return .{ .window = window, .renderer = renderer };
-        }
-
-        // Use @addWithOverflow to defend against bounds.x/y near i32 extremes.
-        const ox = @addWithOverflow(bounds.x, @divTrunc(bounds.w - window_w, 2));
-        const oy = @addWithOverflow(bounds.y, @divTrunc(bounds.h - window_h, 2));
-        if (ox[1] != 0 or oy[1] != 0) {
-            std.log.warn("Display {} bounds produced overflow, falling back to centered", .{monitor_index.?});
-            window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
-                std.log.warn("Failed to position window: {}", .{pos_err});
-            };
-            return .{ .window = window, .renderer = renderer };
-        }
-
-        window.setPosition(.{ .absolute = ox[0] }, .{ .absolute = oy[0] }) catch |err| {
-            std.log.warn("Failed to position window on monitor {}: {}", .{ monitor_index.?, err });
-        };
+        positionOnDisplay(window, display, monitor_index.?);
     } else {
-        // No monitor specified, use default centered positioning
-        window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |err| {
-            std.log.warn("Failed to position window: {}", .{err});
-        };
+        centerFallback(window);
     }
 
     return .{ .window = window, .renderer = renderer };
