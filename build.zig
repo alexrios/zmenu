@@ -52,6 +52,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Strip debug info for any non-Debug build; keeps release artifacts
+            // small (38M -> 6.6M for ReleaseFast) without affecting development.
+            .strip = optimize != .Debug,
         }),
     });
 
