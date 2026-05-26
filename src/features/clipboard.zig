@@ -43,6 +43,18 @@ fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) vo
     };
 }
 
+// Safe-Zig Rule 2 (Power of 10): all loops have a statically-provable upper bound.
+// The wall-clock deadline is the functional termination condition, but each loop
+// also carries a hard iteration cap so a hostile/buggy clock or runaway poll
+// cannot trap us here.
+const linux_pump_budget_ms: u32 = 50;
+// Outer tick loop: 1ms minimum delay per iteration => ~50 iterations expected.
+// 10000 gives a ~200x safety margin against a misbehaving timer.
+const max_outer_iterations: u32 = 10_000;
+// Inner event drain: SDL's queue is small; 256 events per tick is far beyond
+// what a clipboard transfer ever produces.
+const max_inner_iterations: u32 = 256;
+
 fn onExit(state_ptr: ?features_mod.FeatureState) void {
     _ = state_ptr; // Stateless feature
 
@@ -50,10 +62,24 @@ fn onExit(state_ptr: ?features_mod.FeatureState) void {
         // Linux (X11/Wayland) requires event pumping to complete async clipboard transfer
         // The clipboard manager (xclipboard/wl_data_device) must request data via events
         // while the window is alive
-        const end_time = sdl.timer.getMillisecondsSinceInit() + 50;
-        while (sdl.timer.getMillisecondsSinceInit() < end_time) {
+        const timeout_ms: u32 = linux_pump_budget_ms;
+        std.debug.assert(timeout_ms > 0); // precondition
+
+        const start = sdl.timer.getMillisecondsSinceInit();
+        const end_time = start + timeout_ms;
+
+        // The `for (0..MAX) |_|` form encodes the static upper bound in the loop
+        // itself (Safe-Zig Rule 2). The wall-clock deadline is the functional
+        // termination condition; the iteration cap is the safety net against a
+        // hostile/stuck clock. No invariant assert needed: the bound is encoded
+        // in the loop form, making the iteration cap unreachable by construction
+        // under normal operation.
+        outer: for (0..max_outer_iterations) |_| {
+            if (sdl.timer.getMillisecondsSinceInit() >= end_time) break :outer;
+
             // Pump events - allows clipboard manager to communicate
-            while (sdl.events.poll()) |event| {
+            for (0..max_inner_iterations) |_| {
+                const event = sdl.events.poll() orelse break;
                 _ = event; // Just process events, don't handle them
             }
             sdl.timer.delayMilliseconds(1); // Small sleep to avoid busy loop
