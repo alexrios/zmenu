@@ -49,10 +49,13 @@ fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) vo
 // cannot trap us here.
 const linux_pump_budget_ms: u32 = 50;
 // Outer tick loop: 1ms minimum delay per iteration => ~50 iterations expected.
-// 10000 gives a ~200x safety margin against a misbehaving timer.
-const max_outer_iterations: u32 = 10_000;
-// Inner event drain: SDL's queue is small; 256 events per tick is far beyond
-// what a clipboard transfer ever produces.
+// Cap at 500 so the pathological clock-stuck case still completes well within
+// the global features.callOnExit timeout (500ms in config). A larger cap (e.g.
+// 10000 → 10s) would make the app feel frozen on shutdown if the clock misbehaves.
+const max_outer_iterations: u32 = 500;
+// Inner event drain: SDL's queue is small; X11/Wayland clipboard completion
+// typically fires 0-20 events, 50 in extreme contention. 256 is a generous
+// safety valve, well above realistic bursts.
 const max_inner_iterations: u32 = 256;
 
 fn onExit(state_ptr: ?features_mod.FeatureState) void {
@@ -65,8 +68,11 @@ fn onExit(state_ptr: ?features_mod.FeatureState) void {
         const timeout_ms: u32 = linux_pump_budget_ms;
         std.debug.assert(timeout_ms > 0); // precondition
 
-        const start = sdl.timer.getMillisecondsSinceInit();
-        const end_time = start + timeout_ms;
+        // SDL ms-since-init returns u64. Use saturating addition so the bound
+        // computation never traps even in pathological cases (per Kimi review).
+        const start: u64 = sdl.timer.getMillisecondsSinceInit();
+        const end_time: u64 = start +| @as(u64, timeout_ms);
+        std.debug.assert(end_time >= start);
 
         // The `for (0..MAX) |_|` form encodes the static upper bound in the loop
         // itself (Safe-Zig Rule 2). The wall-clock deadline is the functional
