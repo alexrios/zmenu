@@ -90,7 +90,14 @@ pub const HistoryState = struct {
 
         std.debug.assert(self.max_entries <= 10_000);
         var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
+        // Safe-Zig R2: bound the iterator with a static cap. content.len + 1 is
+        // the maximum number of '\n'-separated parts a buffer of length N can
+        // produce (one part per byte plus the trailing tail). The functional
+        // termination is still the max_entries break below; this cap exists so
+        // a corrupted iterator or malicious all-'\n' file cannot loop forever.
+        const max_lines = content.len + 1;
+        for (0..max_lines) |_| {
+            const line = lines.next() orelse break;
             if (line.len == 0) continue;
             if (self.entries.items.len >= self.max_entries) break;
             // Skip duplicates (manual file edits, corruption, concurrent writers).
