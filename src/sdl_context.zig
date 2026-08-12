@@ -57,7 +57,7 @@ pub fn getDisplays(allocator: std.mem.Allocator) ![]sdl.video.Display {
 }
 
 /// Get display bounds (position and dimensions)
-pub fn getDisplayBounds(display: sdl.video.Display) !struct { x: i32, y: i32, w: i32, h: i32 } {
+pub fn getDisplayBounds(display: sdl.video.Display) !DisplayBounds {
     const bounds = try display.getBounds();
 
     return .{
@@ -70,52 +70,48 @@ pub fn getDisplayBounds(display: sdl.video.Display) !struct { x: i32, y: i32, w:
 
 /// Center the window via SDL's centered positioning, logging on failure.
 /// Used as the fallback whenever per-monitor placement is not possible.
-fn centerFallback(window: sdl.video.Window) void {
-    window.setPosition(.{ .centered = null }, .{ .centered = null }) catch |pos_err| {
+fn centerFallback(window: sdl.video.Window, display: ?sdl.video.Display) void {
+    window.setPosition(.{ .centered = display }, .{ .centered = display }) catch |pos_err| {
         std.log.warn("Failed to position window: {}", .{pos_err});
     };
 }
 
 /// Position the window on the given display, falling back to centered on any error.
-fn positionOnDisplay(window: sdl.video.Window, display: sdl.video.Display, monitor_index: usize) void {
+pub const DisplayBounds = struct { x: i32, y: i32, w: i32, h: i32 };
+pub const WindowPosition = struct { x: i32, y: i32 };
+
+pub fn calculateWindowPosition(bounds: DisplayBounds, window_w: u32, window_h: u32) ?WindowPosition {
+    if (bounds.w <= 0 or bounds.h <= 0) return null;
+    if (window_w > std.math.maxInt(i32) or window_h > std.math.maxInt(i32)) return null;
+    const width: i32 = @intCast(window_w);
+    const height: i32 = @intCast(window_h);
+    if (bounds.w < width or bounds.h < height) return null;
+    const ox = @addWithOverflow(bounds.x, @divTrunc(bounds.w - width, 2));
+    const oy = @addWithOverflow(bounds.y, @divTrunc(bounds.h - height, 2));
+    if (ox[1] != 0 or oy[1] != 0) return null;
+    return .{ .x = ox[0], .y = oy[0] };
+}
+
+pub fn positionOnDisplay(window: sdl.video.Window, display: sdl.video.Display, monitor_index: usize, window_w: u32, window_h: u32) void {
     const bounds = getDisplayBounds(display) catch |err| {
         std.log.warn("Failed to get display bounds: {}", .{err});
-        centerFallback(window);
+        centerFallback(window, display);
+        return;
+    };
+    const position = calculateWindowPosition(bounds, window_w, window_h) orelse {
+        std.log.warn("Display {} cannot fit or center window ({}x{} in {}x{}), falling back to display-centered", .{ monitor_index, window_w, window_h, bounds.w, bounds.h });
+        centerFallback(window, display);
         return;
     };
 
-    // Guard the u32->i32 cast: any config above maxInt(i32) would silently wrap.
-    comptime {
-        std.debug.assert(config.window.initial_width <= std.math.maxInt(i32));
-        std.debug.assert(config.window.initial_height <= std.math.maxInt(i32));
-    }
-    const window_w: i32 = @intCast(config.window.initial_width);
-    const window_h: i32 = @intCast(config.window.initial_height);
-
-    // Guard against bounds smaller than the window: avoid negative offsets producing
-    // an off-screen window. Fall back to SDL-centered positioning.
-    if (bounds.w < window_w or bounds.h < window_h) {
-        std.log.warn("Display {} smaller than window ({}x{} < {}x{}), falling back to centered", .{ monitor_index, bounds.w, bounds.h, window_w, window_h });
-        centerFallback(window);
-        return;
-    }
-
-    // Use @addWithOverflow to defend against bounds.x/y near i32 extremes.
-    const ox = @addWithOverflow(bounds.x, @divTrunc(bounds.w - window_w, 2));
-    const oy = @addWithOverflow(bounds.y, @divTrunc(bounds.h - window_h, 2));
-    if (ox[1] != 0 or oy[1] != 0) {
-        std.log.warn("Display {} bounds produced overflow, falling back to centered", .{monitor_index});
-        centerFallback(window);
-        return;
-    }
-
-    window.setPosition(.{ .absolute = ox[0] }, .{ .absolute = oy[0] }) catch |err| {
+    window.setPosition(.{ .absolute = position.x }, .{ .absolute = position.y }) catch |err| {
         std.log.warn("Failed to position window on monitor {}: {}", .{ monitor_index, err });
+        centerFallback(window, display);
     };
 }
 
 /// Create window and renderer with configured settings
-pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct { window: sdl.video.Window, renderer: sdl.render.Renderer } {
+pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct { window: sdl.video.Window, renderer: sdl.render.Renderer, display: ?sdl.video.Display } {
     // Validate monitor if specified
     var target_display: ?sdl.video.Display = null;
     if (monitor_index) |idx| {
@@ -147,12 +143,24 @@ pub fn createWindow(allocator: std.mem.Allocator, monitor_index: ?usize) !struct
     );
 
     if (target_display) |display| {
-        positionOnDisplay(window, display, monitor_index.?);
+        positionOnDisplay(window, display, monitor_index.?, config.window.initial_width, config.window.initial_height);
     } else {
-        centerFallback(window);
+        centerFallback(window, null);
     }
 
-    return .{ .window = window, .renderer = renderer };
+    return .{ .window = window, .renderer = renderer, .display = target_display };
+}
+
+test "window position preserves offset display coordinates" {
+    const pos = calculateWindowPosition(.{ .x = -1920, .y = 200, .w = 1920, .h = 1080 }, 800, 300).?;
+    try std.testing.expectEqual(@as(i32, -1360), pos.x);
+    try std.testing.expectEqual(@as(i32, 590), pos.y);
+}
+
+test "window position rejects invalid or undersized displays" {
+    try std.testing.expectEqual(@as(?WindowPosition, null), calculateWindowPosition(.{ .x = 0, .y = 0, .w = 0, .h = 1080 }, 800, 300));
+    try std.testing.expectEqual(@as(?WindowPosition, null), calculateWindowPosition(.{ .x = 0, .y = 0, .w = 640, .h = 200 }, 800, 300));
+    try std.testing.expectEqual(@as(?WindowPosition, null), calculateWindowPosition(.{ .x = std.math.maxInt(i32), .y = 0, .w = 1920, .h = 1080 }, 800, 300));
 }
 
 /// Load font with embedded/custom/system fallback

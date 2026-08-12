@@ -10,7 +10,7 @@ pub const Theme = struct {
     value_preview: sdl.pixels.Color,
 };
 
-/// Catppuccin Mocha - Dark pastel theme (default)
+/// Catppuccin Mocha - Dark pastel theme
 pub const mocha = Theme{
     .background = .{ .r = 0x1e, .g = 0x1e, .b = 0x2e, .a = 0xff },
     .foreground = .{ .r = 0xcd, .g = 0xd6, .b = 0xf4, .a = 0xff },
@@ -19,7 +19,7 @@ pub const mocha = Theme{
     .value_preview = .{ .r = 0x7b, .g = 0x81, .b = 0x93, .a = 0xff },
 };
 
-/// Catppuccin Latte - Light pastel theme
+/// Catppuccin Latte - Light pastel theme (default)
 pub const latte = Theme{
     .background = .{ .r = 0xef, .g = 0xf1, .b = 0xf5, .a = 0xff },
     .foreground = .{ .r = 0x4c, .g = 0x4f, .b = 0x69, .a = 0xff },

@@ -29,10 +29,10 @@ pub const RenderContext = rendering_mod.RenderContext;
 /// largest reasonable burst (keyboard auto-repeat, paste, window events).
 const max_events_per_tick: u32 = 1024;
 
-/// Maximum read syscalls the stdin reader thread will perform before it
+/// Maximum read operations the asynchronous stdin task will perform before it
 /// gives up. 1 million chunks × 4 KiB = 4 GiB of stdin — orders of magnitude
 /// beyond any reasonable launcher input. Functional termination still occurs
-/// on EOF (`bytes_read == 0`) or read error.
+/// on `error.EndOfStream`, cancellation, or a propagated read/processing error.
 const max_stdin_read_iterations: u32 = 1_000_000;
 
 pub const App = struct {
@@ -42,6 +42,8 @@ pub const App = struct {
     color_scheme: ColorScheme,
     allocator: std.mem.Allocator,
     io: std.Io,
+    target_display: ?sdl.video.Display,
+    monitor_index: ?usize,
     feature_states: features.FeatureStates, // Zero-size when no features enabled
 
     const RenderBuffers = struct {
@@ -89,7 +91,7 @@ pub const App = struct {
         return .{ .scale = scale, .width = @intCast(pixel_width), .height = @intCast(pixel_height) };
     }
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_map: ?*const std.process.Environ.Map, monitor_index: ?usize, parsed_flags: *const features.ParsedFlags) !App {
         try sdl_context.initSDL();
         errdefer sdl_context.quitSDL();
 
@@ -133,13 +135,14 @@ pub const App = struct {
             .color_scheme = color_scheme,
             .allocator = allocator,
             .io = io,
+            .target_display = window_result.display,
+            .monitor_index = monitor_index,
             .feature_states = features.initStates(),
         };
 
-        try features.initAll(allocator, io, &app.feature_states, parsed_flags);
+        try features.initAll(allocator, io, environ_map, &app.feature_states, parsed_flags);
         errdefer features.deinitAll(&app.feature_states, allocator);
         try app.updateWindowSize();
-        try window.setPosition(.{ .centered = null }, .{ .centered = null });
         try sdl.keyboard.startTextInput(window);
 
         return app;
@@ -170,8 +173,8 @@ pub const App = struct {
             return error.NoItemsProvided;
         }
 
-        var stdin_reader = ThreadedStdinReader.init(self.allocator, self.io);
-        try stdin_reader.startThread();
+        var stdin_reader = CancelableStdinReader.init(self.allocator, self.io, std.Io.File.stdin());
+        stdin_reader.start();
         defer stdin_reader.deinit();
 
         var new_lines = std.ArrayList([]u8).empty;
@@ -186,15 +189,17 @@ pub const App = struct {
 
         var running = true;
         while (running) {
-            const eof = try stdin_reader.pollLines(&new_lines);
+            const read_status = try stdin_reader.pollLines(&new_lines);
             try self.processNewLines(&new_lines);
-            if (eof and self.state.input_state == .loading) {
+            if (read_status == .eof and self.state.input_state == .loading) {
                 try self.handleEofTransition();
             }
 
             if (sdl.events.waitTimeout(16)) {
                 running = try self.processEvents();
             }
+
+            if (!running) stdin_reader.cancel();
 
             if (self.state.needs_render) {
                 try self.render();
@@ -254,37 +259,49 @@ pub const App = struct {
         return true;
     }
 
-    pub const ThreadedStdinReader = struct {
-        thread: std.Thread,
-        thread_started: bool,
+    pub const CancelableStdinReader = struct {
+        pub const Status = enum(u8) { reading, eof, canceled, failed };
+
+        future: std.Io.Future(anyerror!Status),
+        started: bool,
         mutex: std.Io.Mutex,
         lines: std.ArrayList([]u8),
-        eof_reached: std.atomic.Value(bool),
+        status: std.atomic.Value(Status),
         allocator: std.mem.Allocator,
         io: std.Io,
+        file: std.Io.File,
+        max_iterations: u32,
 
-        pub fn init(allocator: std.mem.Allocator, io: std.Io) ThreadedStdinReader {
-            return ThreadedStdinReader{
-                .thread = undefined,
-                .thread_started = false,
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) CancelableStdinReader {
+            return .{
+                .future = undefined,
+                .started = false,
                 .mutex = .init,
                 .lines = std.ArrayList([]u8).empty,
-                .eof_reached = std.atomic.Value(bool).init(false),
+                .status = std.atomic.Value(Status).init(.reading),
                 .allocator = allocator,
                 .io = io,
+                .file = file,
+                .max_iterations = max_stdin_read_iterations,
             };
         }
 
-        fn startThread(self: *ThreadedStdinReader) !void {
-            // Spawn background reader thread (must be called after reader is in final location)
-            self.thread = try std.Thread.spawn(.{}, readerThreadFn, .{self});
-            self.thread_started = true;
+        fn initWithLimit(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, max_iterations: u32) CancelableStdinReader {
+            var result = CancelableStdinReader.init(allocator, io, file);
+            result.max_iterations = max_iterations;
+            return result;
+        }
+
+        pub fn start(self: *CancelableStdinReader) void {
+            std.debug.assert(!self.started);
+            self.future = self.io.async(readTask, .{self});
+            self.started = true;
         }
 
         /// Dupe `line` into heap memory, then enqueue it on the shared list
         /// under the mutex. Returns OOM on either allocation failure; caller
         /// should stop reading rather than masking the failure.
-        fn emitLine(self: *ThreadedStdinReader, line: []const u8) std.mem.Allocator.Error!void {
+        fn emitLine(self: *CancelableStdinReader, line: []const u8) std.mem.Allocator.Error!void {
             const owned = try self.allocator.dupe(u8, line);
             errdefer self.allocator.free(owned);
             self.mutex.lockUncancelable(self.io);
@@ -296,63 +313,67 @@ pub const App = struct {
         /// trailing partial line (if any) into `line_buffer` for the next chunk
         /// to complete. Propagates OOM.
         fn processChunk(
-            self: *ThreadedStdinReader,
+            self: *CancelableStdinReader,
             chunk: []const u8,
             line_buffer: *std.ArrayList(u8),
         ) std.mem.Allocator.Error!void {
-            var start: usize = 0;
+            var chunk_start: usize = 0;
             for (chunk, 0..) |byte, i| {
-                std.debug.assert(start <= chunk.len);
+                std.debug.assert(chunk_start <= chunk.len);
                 if (byte != '\n') continue;
-                try line_buffer.appendSlice(self.allocator, chunk[start..i]);
+                try line_buffer.appendSlice(self.allocator, chunk[chunk_start..i]);
                 try self.emitLine(line_buffer.items);
                 line_buffer.clearRetainingCapacity();
-                start = i + 1;
+                chunk_start = i + 1;
             }
-            if (start < chunk.len) {
-                try line_buffer.appendSlice(self.allocator, chunk[start..]);
+            if (chunk_start < chunk.len) {
+                try line_buffer.appendSlice(self.allocator, chunk[chunk_start..]);
             }
         }
 
         /// Emit any final partial line at EOF (stdin without trailing newline).
-        /// Failure is logged and swallowed — the thread is already exiting.
-        fn flushPartialLine(self: *ThreadedStdinReader, line_buffer: *std.ArrayList(u8)) void {
+        /// Allocation failures propagate to the task result.
+        fn flushPartialLine(self: *CancelableStdinReader, line_buffer: *std.ArrayList(u8)) !void {
             if (line_buffer.items.len == 0) return;
-            self.emitLine(line_buffer.items) catch |err| {
-                std.log.warn("stdin reader: dropped final line on emit: {}", .{err});
-            };
+            try self.emitLine(line_buffer.items);
         }
 
-        fn readerThreadFn(self: *ThreadedStdinReader) void {
-            const stdin_fd = std.Io.File.stdin().handle;
+        fn readTask(self: *CancelableStdinReader) anyerror!Status {
             var chunk_buffer: [4096]u8 = undefined;
             var line_buffer = std.ArrayList(u8).empty;
             defer line_buffer.deinit(self.allocator);
-            // Always signal EOF on exit so pollLines never blocks waiting for
-            // a thread that already died (read error, OOM, normal EOF).
-            defer self.eof_reached.store(true, .seq_cst);
 
-            // Statically-bounded outer loop (Safe-Zig R2). Functional termination
-            // is EOF / read error / OOM; the iteration cap is a safety net
-            // against a stdin source that never returns 0 or errors.
-            for (0..max_stdin_read_iterations) |_| {
-                const bytes_read = std.posix.read(stdin_fd, &chunk_buffer) catch break;
+            for (0..self.max_iterations) |_| {
+                const bytes_read = self.file.readStreaming(self.io, &.{&chunk_buffer}) catch |err| switch (err) {
+                    error.EndOfStream => {
+                        self.flushPartialLine(&line_buffer) catch |flush_err| {
+                            self.status.store(.failed, .release);
+                            return flush_err;
+                        };
+                        self.status.store(.eof, .release);
+                        return .eof;
+                    },
+                    error.Canceled => {
+                        self.status.store(.canceled, .release);
+                        return .canceled;
+                    },
+                    else => {
+                        self.status.store(.failed, .release);
+                        return err;
+                    },
+                };
                 std.debug.assert(bytes_read <= chunk_buffer.len);
-
-                if (bytes_read == 0) {
-                    self.flushPartialLine(&line_buffer);
-                    break;
-                }
                 self.processChunk(chunk_buffer[0..bytes_read], &line_buffer) catch |err| {
-                    std.log.warn("stdin reader: stopping on chunk processing error: {}", .{err});
-                    break;
+                    self.status.store(.failed, .release);
+                    return err;
                 };
             }
+            self.status.store(.failed, .release);
+            return error.StdinReadLimitExceeded;
         }
 
         /// Poll for new lines from the reader thread (non-blocking)
-        /// Returns true if EOF has been reached
-        pub fn pollLines(self: *ThreadedStdinReader, dest: *std.ArrayList([]u8)) !bool {
+        pub fn pollLines(self: *CancelableStdinReader, dest: *std.ArrayList([]u8)) !Status {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
@@ -360,13 +381,26 @@ pub const App = struct {
             try dest.appendSlice(self.allocator, self.lines.items);
             self.lines.clearRetainingCapacity();
 
-            return self.eof_reached.load(.seq_cst);
+            const current = self.status.load(.acquire);
+            if (current == .failed) {
+                _ = try self.future.await(self.io);
+                unreachable;
+            }
+            return current;
         }
 
-        pub fn deinit(self: *ThreadedStdinReader) void {
-            // Wait for reader thread to finish (only if it was started)
-            if (self.thread_started) {
-                self.thread.join();
+        pub fn cancel(self: *CancelableStdinReader) void {
+            if (!self.started or self.status.load(.acquire) != .reading) return;
+            _ = self.future.cancel(self.io) catch |err| switch (err) {
+                error.Canceled => {},
+                else => std.log.warn("stdin reader cancellation failed: {}", .{err}),
+            };
+        }
+
+        pub fn deinit(self: *CancelableStdinReader) void {
+            if (self.started) {
+                if (self.status.load(.acquire) == .reading) self.cancel();
+                if (self.future.any_future != null) _ = self.future.await(self.io) catch {};
             }
 
             // Free any remaining lines
@@ -638,9 +672,14 @@ pub const App = struct {
         // Notify features of selection with full Item (features choose display/value).
         features.callOnSelect(&self.feature_states, selected_item);
 
-        const all_completed = features.callOnExit(&self.feature_states, config.exit_timeout_ms);
-        if (!all_completed) {
-            std.log.warn("Some features did not complete onExit within timeout", .{});
+        const exit_budget_ms: u32 = if (@hasDecl(config, "exit_budget_ms"))
+            config.exit_budget_ms
+        else if (@hasDecl(config, "exit_timeout_ms"))
+            config.exit_timeout_ms
+        else
+            500;
+        if (features.callOnExit(&self.feature_states, exit_budget_ms) == .timed_out) {
+            std.log.warn("Some features did not complete onExit within the cooperative budget", .{});
         }
 
         // Output value field only to stdout.
@@ -751,6 +790,9 @@ pub const App = struct {
             self.render_ctx.window.current_height = new_height;
 
             try self.sdl.window.setSize(new_width, new_height);
+            if (self.target_display) |display| {
+                sdl_context.positionOnDisplay(self.sdl.window, display, self.monitor_index.?, new_width, new_height);
+            }
 
             self.state.needs_render = true;
         }
@@ -816,22 +858,18 @@ pub const App = struct {
 
         const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
             const ellipsis_threshold = config.limits.max_input_length - config.limits.input_ellipsis_margin;
-            const display_input = if (self.state.input_buffer.items.len > ellipsis_threshold)
-                blk2: {
-                    const approx_start = self.state.input_buffer.items.len - ellipsis_threshold;
-                    var start = approx_start;
-                    while (start < self.state.input_buffer.items.len and (self.state.input_buffer.items[start] & 0xC0) == 0x80) {
-                        start += 1;
-                    }
-                    break :blk2 self.state.input_buffer.items[start..];
+            const display_input = if (self.state.input_buffer.items.len > ellipsis_threshold) blk2: {
+                const approx_start = self.state.input_buffer.items.len - ellipsis_threshold;
+                var start = approx_start;
+                while (start < self.state.input_buffer.items.len and (self.state.input_buffer.items[start] & 0xC0) == 0x80) {
+                    start += 1;
                 }
-            else
-                self.state.input_buffer.items;
+                break :blk2 self.state.input_buffer.items[start..];
+            } else self.state.input_buffer.items;
 
             const prefix = if (self.state.input_buffer.items.len > ellipsis_threshold) "> ..." else "> ";
             break :blk std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "{s}{s}", .{ prefix, display_input }) catch "> [error]";
-        } else
-            std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
+        } else std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
 
         try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, prompt_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
     }
@@ -988,128 +1026,117 @@ pub const App = struct {
     }
 };
 
-test "ThreadedStdinReader - initial state and pollLines contract" {
-    // Verify the reader's initial state and that pollLines works correctly
-    // with manually populated data (simulating what the thread would produce).
-
+test "CancelableStdinReader.processChunk splits lines and preserves final partial line" {
     const allocator = std.testing.allocator;
-
-    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
-    defer reader.deinit();
-
-    // Initial state: no EOF, no lines
-    try std.testing.expect(!reader.eof_reached.load(.seq_cst));
-
-    // Simulate thread producing lines by manually adding to the shared buffer
-    const line1 = try allocator.dupe(u8, "line one");
-    const line2 = try allocator.dupe(u8, "line two");
-    reader.mutex.lockUncancelable(std.testing.io);
-    reader.lines.append(allocator, line1) catch unreachable;
-    reader.lines.append(allocator, line2) catch unreachable;
-    reader.mutex.unlock(std.testing.io);
-
-    // pollLines should drain them
-    var dest = std.ArrayList([]u8).empty;
-    defer {
-        for (dest.items) |line| allocator.free(line);
-        dest.deinit(allocator);
-    }
-
-    const eof = try reader.pollLines(&dest);
-    try std.testing.expect(!eof);
-    try std.testing.expectEqual(@as(usize, 2), dest.items.len);
-    try std.testing.expectEqualStrings("line one", dest.items[0]);
-    try std.testing.expectEqualStrings("line two", dest.items[1]);
-
-    // Internal buffer should be drained
-    try std.testing.expectEqual(@as(usize, 0), reader.lines.items.len);
-
-    // Simulate EOF
-    reader.eof_reached.store(true, .seq_cst);
-    for (dest.items) |line| allocator.free(line);
-    dest.clearRetainingCapacity();
-
-    const eof2 = try reader.pollLines(&dest);
-    try std.testing.expect(eof2);
-    try std.testing.expectEqual(@as(usize, 0), dest.items.len);
-}
-
-test "ThreadedStdinReader - defer ensures eof_reached on all exit paths" {
-    // The fix uses `defer self.eof_reached.store(true, .seq_cst)` at the
-    // top of readerThreadFn. This guarantees that regardless of which
-    // break/error path exits the loop, pollLines will eventually see EOF.
-    //
-    // Previously, break at the partial-line buffering (OOM) would exit
-    // without setting eof_reached, causing the app to hang in .loading
-    // state forever. The defer pattern makes this impossible.
-    //
-    // Direct thread testing with stdin is impractical, but the structural
-    // guarantee (defer at function scope) covers all paths by construction.
-
-    const allocator = std.testing.allocator;
-    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
-    defer reader.deinit();
-    try std.testing.expect(!reader.eof_reached.load(.seq_cst));
-}
-
-test "ThreadedStdinReader.processChunk - splits complete lines and buffers partial" {
-    // Refactor (F3) split readerThreadFn into helpers. Verify processChunk
-    // emits complete lines and buffers the trailing partial line for the next
-    // chunk to complete.
-    const allocator = std.testing.allocator;
-    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
+    var reader = App.CancelableStdinReader.init(allocator, std.testing.io, std.Io.File.stdin());
     defer reader.deinit();
 
     var line_buffer = std.ArrayList(u8).empty;
     defer line_buffer.deinit(allocator);
 
-    // Chunk 1: "a\nbb\nccc" → emits "a" and "bb", buffers "ccc".
     try reader.processChunk("a\nbb\nccc", &line_buffer);
     try std.testing.expectEqual(@as(usize, 2), reader.lines.items.len);
     try std.testing.expectEqualStrings("a", reader.lines.items[0]);
     try std.testing.expectEqualStrings("bb", reader.lines.items[1]);
     try std.testing.expectEqualStrings("ccc", line_buffer.items);
 
-    // Chunk 2: "DD\nE" → completes "cccDD", buffers "E".
     try reader.processChunk("DD\nE", &line_buffer);
     try std.testing.expectEqual(@as(usize, 3), reader.lines.items.len);
     try std.testing.expectEqualStrings("cccDD", reader.lines.items[2]);
     try std.testing.expectEqualStrings("E", line_buffer.items);
 
-    // EOF flush emits the trailing "E".
-    reader.flushPartialLine(&line_buffer);
+    try reader.flushPartialLine(&line_buffer);
     try std.testing.expectEqual(@as(usize, 4), reader.lines.items.len);
     try std.testing.expectEqualStrings("E", reader.lines.items[3]);
 }
 
-test "ThreadedStdinReader.emitLine - dupes input and enqueues" {
-    // emitLine takes a borrowed slice and dupes it; the caller's source can be
-    // mutated/freed without affecting the queued copy.
+test "CancelableStdinReader.emitLine owns queued input" {
     const allocator = std.testing.allocator;
-    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
+    var reader = App.CancelableStdinReader.init(allocator, std.testing.io, std.Io.File.stdin());
     defer reader.deinit();
 
     var transient: [16]u8 = undefined;
     @memcpy(transient[0..5], "hello");
     try reader.emitLine(transient[0..5]);
 
-    // Mutate the source; queued copy must be unaffected.
     @memcpy(transient[0..5], "WORLD");
 
     try std.testing.expectEqual(@as(usize, 1), reader.lines.items.len);
     try std.testing.expectEqualStrings("hello", reader.lines.items[0]);
 }
 
-test "ThreadedStdinReader.flushPartialLine - no-op on empty buffer" {
+test "CancelableStdinReader.flushPartialLine ignores empty buffer" {
     const allocator = std.testing.allocator;
-    var reader = App.ThreadedStdinReader.init(allocator, std.testing.io);
+    var reader = App.CancelableStdinReader.init(allocator, std.testing.io, std.Io.File.stdin());
     defer reader.deinit();
 
     var line_buffer = std.ArrayList(u8).empty;
     defer line_buffer.deinit(allocator);
 
-    reader.flushPartialLine(&line_buffer);
+    try reader.flushPartialLine(&line_buffer);
     try std.testing.expectEqual(@as(usize, 0), reader.lines.items.len);
+}
+
+test "CancelableStdinReader reads complete input including final line without newline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input", .data = "one\ntwo\nfinal" });
+    const file = try tmp.dir.openFile(std.testing.io, "input", .{});
+    defer file.close(std.testing.io);
+
+    var reader = App.CancelableStdinReader.init(std.testing.allocator, std.testing.io, file);
+    reader.start();
+    defer reader.deinit();
+    try std.testing.expectEqual(App.CancelableStdinReader.Status.eof, try reader.future.await(std.testing.io));
+
+    var lines = std.ArrayList([]u8).empty;
+    defer {
+        for (lines.items) |line| std.testing.allocator.free(line);
+        lines.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(App.CancelableStdinReader.Status.eof, try reader.pollLines(&lines));
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("final", lines.items[2]);
+}
+
+test "CancelableStdinReader propagates read errors and iteration exhaustion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const write_only = try tmp.dir.createFile(std.testing.io, "write-only", .{ .read = false });
+    defer write_only.close(std.testing.io);
+
+    var failed = App.CancelableStdinReader.init(std.testing.allocator, std.testing.io, write_only);
+    failed.start();
+    defer failed.deinit();
+    _ = failed.future.await(std.testing.io) catch {};
+    var lines = std.ArrayList([]u8).empty;
+    defer lines.deinit(std.testing.allocator);
+    try std.testing.expectError(error.NotOpenForReading, failed.pollLines(&lines));
+
+    var limited = App.CancelableStdinReader.initWithLimit(std.testing.allocator, std.testing.io, write_only, 0);
+    limited.start();
+    defer limited.deinit();
+    try std.testing.expectError(error.StdinReadLimitExceeded, limited.future.await(std.testing.io));
+    try std.testing.expectEqual(App.CancelableStdinReader.Status.failed, limited.status.load(.acquire));
+}
+
+test "CancelableStdinReader cancels while producer keeps pipe open" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "sh", "-c", "printf 'line\\n'; sleep 30" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(std.testing.io);
+    const source = child.stdout.?;
+
+    var reader = App.CancelableStdinReader.init(std.testing.allocator, std.testing.io, source);
+    reader.start();
+    defer reader.deinit();
+    reader.cancel();
+    try std.testing.expectEqual(App.CancelableStdinReader.Status.canceled, reader.status.load(.acquire));
+    try std.testing.expect(child.id != null);
 }
 
 test "colorEquals - same colors" {

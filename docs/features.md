@@ -32,7 +32,7 @@ Features are registered at compile time via `config.zig`. When a feature is disa
 3. RUNTIME
    - afterFilter hook: post-process results (hot path)
    - onSelect hook: handle item selection
-   - onExit hook: pre-shutdown cleanup (with timeout)
+   - onExit hook: synchronous pre-shutdown cleanup (cooperative budget)
 
 4. APP CLEANUP (App.deinit)
    - deinitAll() calls each feature's onDeinit hook
@@ -181,6 +181,7 @@ fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.Featur
 
 **Parameters via `FeatureInitData`:**
 - `allocator` - Use this for any allocations
+- `environ_map` - Read-only process environment map, when available
 - `cli_values` - Parsed CLI flag values for this feature
 - `cli_flags` - Flag declarations (for name-based lookup)
 
@@ -235,14 +236,19 @@ The `Item` has both `.display` and `.value` fields — choose which to act on.
 
 ### onExit
 
-**Called:** After `onSelect`, before SDL shutdown. Must complete within `config.exit_timeout_ms` (default: 500ms). No allocations, no error returns.
+**Called:** After `onSelect`, before SDL shutdown. All exit hooks share the global `config.exit_budget_ms` deadline (default: 500ms).
 
 **Signature:**
 ```zig
-fn onExit(state: ?features_mod.FeatureState) void
+fn onExit(
+    state: ?features_mod.FeatureState,
+    context: features_mod.ExitContext,
+) features_mod.ExitStatus
 ```
 
-Use for cleanup that requires SDL to still be alive (e.g., clipboard event pumping on Linux).
+Use for cleanup that requires SDL to still be alive (e.g., clipboard event pumping on Linux). Hooks remain synchronous on the main thread and cannot be interrupted forcibly without risking SDL state. Check `context.expired()` or `context.remainingMs()` during bounded work and return `.completed` or `.timed_out`. The dispatcher does not start another hook after the deadline.
+
+For compatibility, existing user configurations that still declare `exit_timeout_ms` are accepted when `exit_budget_ms` is absent.
 
 ## CLI Flags
 
@@ -264,6 +270,8 @@ pub const feature = features_mod.Feature{
             .description = "Maximum entries",
             .value_type = .int,
             .default = features_mod.FlagValue{ .int = 100 },
+            .int_min = 1,
+            .int_max = 10_000,
         },
     },
 };
@@ -271,11 +279,12 @@ pub const feature = features_mod.Feature{
 
 **Flag types:** `.string` (requires argument), `.int` (requires integer), `.bool` (no argument)
 
-**Flag properties:** `long` (required), `short` (optional), `description` (required), `value_type` (required), `required` (default: false), `default` (optional)
+**Flag properties:** `long` (required), `short` (optional), `description` (required), `value_type` (required), `required` (default: false), `default` (optional), and inclusive `int_min`/`int_max` bounds for integer flags.
 
 **Compile-time validation:**
 - Duplicate flags across features detected at compile time
 - Required flags with default values rejected
+- Invalid integer ranges and out-of-range integer defaults rejected
 - Help text auto-generated from flag metadata
 
 **Access in onInit:**
@@ -312,7 +321,7 @@ This centralizes the `@ptrCast/@alignCast` pattern and handles `null` in one cal
 ### Performance
 
 - Keep `afterFilter` fast — users notice lag on every keystroke
-- Keep `onSelect` and `onExit` fast — they block shutdown
+- Keep `onSelect` and `onExit` fast — they block shutdown; make `onExit` cooperate with its deadline
 - Cache expensive computations in state
 
 ### Error Handling

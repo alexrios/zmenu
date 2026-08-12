@@ -16,89 +16,40 @@ pub const std_options: std.Options = .{
     .log_level = @enumFromInt(@intFromEnum(build_options.log_level)),
 };
 
-/// Parse feature CLI flags from command-line arguments
-fn parseFeatureFlags(args: []const []const u8, allocator: std.mem.Allocator) !features.ParsedFlags {
-    var result = features.ParsedFlags.init(allocator);
-    errdefer result.deinit();
+const CliAction = enum { run, help, version, features };
 
-    // Initialize storage for each feature
-    inline for (features.enabled_features) |_| {
-        try result.values.append(allocator, std.ArrayList(?features.FlagValue).empty);
+const ParsedCli = struct {
+    action: CliAction = .run,
+    monitor_index: ?usize = null,
+    feature_flags: features.ParsedFlags,
+
+    fn deinit(self: *ParsedCli) void {
+        self.feature_flags.deinit();
     }
+};
 
-    // Parse flags for each enabled feature
-    inline for (features.enabled_features, 0..) |feature, feat_idx| {
-        if (feature.cli_flags) |flags| {
-            for (flags) |flag| {
-                const value = parseFlag(args, flag) catch |err| {
-                    switch (err) {
-                        error.MissingFlagValue => std.log.err("--{s} requires a value", .{flag.long}),
-                        error.InvalidFlagValue => std.log.err("--{s} requires a valid value", .{flag.long}),
-                    }
-                    return err;
-                };
-                if (value) |v| {
-                    try result.values.items[feat_idx].append(allocator, v);
-                } else if (flag.default) |default_val| {
-                    try result.values.items[feat_idx].append(allocator, default_val);
-                } else if (flag.required) {
-                    std.log.err("required flag --{s} not provided", .{flag.long});
-                    return error.MissingRequiredFlag;
-                } else {
-                    // Optional flag not provided — store null (distinguishable from zero)
-                    try result.values.items[feat_idx].append(allocator, null);
-                }
+const FeatureFlagLocation = struct { feature_index: usize, flag_index: usize };
+
+fn findFeatureFlag(arg: []const u8) ?FeatureFlagLocation {
+    for (features.enabled_features, 0..) |feature, feature_index| {
+        const flags = feature.cli_flags orelse continue;
+        for (flags, 0..) |flag, flag_index| {
+            if (std.mem.startsWith(u8, arg, "--") and std.mem.eql(u8, arg[2..], flag.long))
+                return .{ .feature_index = feature_index, .flag_index = flag_index };
+            if (flag.short) |short| {
+                if (arg.len == 2 and arg[0] == '-' and arg[1] == short)
+                    return .{ .feature_index = feature_index, .flag_index = flag_index };
             }
         }
     }
-
-    return result;
+    return null;
 }
 
-/// Check if a value argument looks like a flag (starts with "-")
-fn looksLikeFlag(value: []const u8) bool {
-    return value.len > 0 and value[0] == '-';
-}
-
-/// Parse a single flag from args.
-/// Returns the parsed value, null if not found, or an error.
-/// Caller is responsible for user-facing error messages.
-fn parseFlag(args: []const []const u8, flag: features.CliFlag) !?features.FlagValue {
-    std.debug.assert(args.len > 0); // Process always has at least argv[0]
-    std.debug.assert(flag.long.len > 0);
-
-    var i: usize = 1; // Skip program name
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-
-        // Check long flag (no allocation: match "--" prefix then compare suffix)
-        if (std.mem.startsWith(u8, arg, "--") and std.mem.eql(u8, arg[2..], flag.long)) {
-            const value = try parseFlagValue(args, i, flag);
-            std.debug.assert(@as(features.FlagValueType, value) == flag.value_type);
-            return value;
-        }
-
-        // Check short flag
-        if (flag.short) |short_char| {
-            const short_flag = &[_]u8{ '-', short_char };
-            if (std.mem.eql(u8, arg, short_flag)) {
-                const value = try parseFlagValue(args, i, flag);
-                std.debug.assert(@as(features.FlagValueType, value) == flag.value_type);
-                return value;
-            }
-        }
-    }
-
-    return null; // Flag not found
-}
-
-/// Extract the value for a matched flag at position i in args.
 fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !features.FlagValue {
-    std.debug.assert(i < args.len);
     const value: features.FlagValue = switch (flag.value_type) {
         .bool => features.FlagValue{ .bool = true },
         .string => blk: {
-            if (i + 1 >= args.len or looksLikeFlag(args[i + 1])) {
+            if (i + 1 >= args.len or (args[i + 1].len > 0 and args[i + 1][0] == '-')) {
                 return error.MissingFlagValue;
             }
             break :blk features.FlagValue{ .string = args[i + 1] };
@@ -109,13 +60,98 @@ fn parseFlagValue(args: []const []const u8, i: usize, flag: features.CliFlag) !f
                 return error.MissingFlagValue;
             }
             const parsed = std.fmt.parseInt(i64, args[i + 1], 10) catch {
+                if (args[i + 1].len > 0 and args[i + 1][0] == '-') return error.MissingFlagValue;
                 return error.InvalidFlagValue;
             };
+            if (flag.int_min) |min| if (parsed < min) return error.FlagValueOutOfRange;
+            if (flag.int_max) |max| if (parsed > max) return error.FlagValueOutOfRange;
             break :blk features.FlagValue{ .int = parsed };
         },
     };
     std.debug.assert(@as(features.FlagValueType, value) == flag.value_type);
     return value;
+}
+
+/// Parse every argument exactly once. Informational options are accepted in any
+/// position but cannot be combined with execution options or each other.
+fn parseCli(args: []const []const u8, allocator: std.mem.Allocator) !ParsedCli {
+    if (args.len == 0) return error.MissingArgvZero;
+
+    var result = ParsedCli{ .feature_flags = features.ParsedFlags.init(allocator) };
+    errdefer result.deinit();
+    var seen = std.ArrayList(std.ArrayList(bool)).empty;
+    defer {
+        for (seen.items) |*feature_seen| feature_seen.deinit(allocator);
+        seen.deinit(allocator);
+    }
+
+    for (features.enabled_features) |feature| {
+        const flags = feature.cli_flags orelse &.{};
+        try result.feature_flags.values.append(allocator, std.ArrayList(?features.FlagValue).empty);
+        try seen.append(allocator, std.ArrayList(bool).empty);
+        const values = &result.feature_flags.values.items[result.feature_flags.values.items.len - 1];
+        const feature_seen = &seen.items[seen.items.len - 1];
+        for (flags) |flag| {
+            try values.append(allocator, flag.default);
+            try feature_seen.append(allocator, false);
+        }
+    }
+
+    var action: ?CliAction = null;
+    var execution_seen = false;
+    var monitor_seen = false;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        const info: ?CliAction = if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h"))
+            .help
+        else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v"))
+            .version
+        else if (std.mem.eql(u8, arg, "--features"))
+            .features
+        else
+            null;
+        if (info) |requested| {
+            if (action != null) return error.DuplicateOrIncompatibleOption;
+            if (execution_seen) return error.IncompatibleInformationalOption;
+            action = requested;
+            continue;
+        }
+        if (action != null) return error.IncompatibleInformationalOption;
+
+        if (std.mem.eql(u8, arg, "--monitor") or std.mem.eql(u8, arg, "-m")) {
+            if (monitor_seen) return error.DuplicateOption;
+            if (i + 1 >= args.len) return error.MonitorIndexRequired;
+            result.monitor_index = std.fmt.parseInt(usize, args[i + 1], 10) catch return error.InvalidMonitorIndex;
+            monitor_seen = true;
+            execution_seen = true;
+            i += 1;
+            continue;
+        }
+
+        if (findFeatureFlag(arg)) |location| {
+            if (seen.items[location.feature_index].items[location.flag_index]) return error.DuplicateOption;
+            const flag = features.enabled_features[location.feature_index].cli_flags.?[location.flag_index];
+            const value = try parseFlagValue(args, i, flag);
+            result.feature_flags.values.items[location.feature_index].items[location.flag_index] = value;
+            seen.items[location.feature_index].items[location.flag_index] = true;
+            execution_seen = true;
+            if (flag.value_type != .bool) i += 1;
+            continue;
+        }
+
+        if (arg.len > 0 and arg[0] == '-') return error.UnknownOption;
+        return error.UnexpectedPositionalArgument;
+    }
+
+    for (features.enabled_features, 0..) |feature, feature_index| {
+        const flags = feature.cli_flags orelse continue;
+        for (flags, 0..) |flag, flag_index| {
+            if (flag.required and !seen.items[feature_index].items[flag_index]) return error.MissingRequiredFlag;
+        }
+    }
+    result.action = action orelse .run;
+    return result;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -143,41 +179,28 @@ pub fn main(init: std.process.Init) !void {
     for (zsentinel_args, args) |z, *out| out.* = z;
     std.debug.assert(args.len == zsentinel_args.len);
 
-    if (args.len > 1) {
-        if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
-            try printVersion(io);
-            return;
-        } else if (std.mem.eql(u8, args[1], "--features")) {
-            try printFeatures(io);
-            return;
-        } else if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
+    var cli = parseCli(args, allocator) catch |err| {
+        std.log.err("invalid command line: {}", .{err});
+        return err;
+    };
+    defer cli.deinit();
+    switch (cli.action) {
+        .help => {
             printHelp(io);
             return;
-        }
+        },
+        .version => {
+            try printVersion(io);
+            return;
+        },
+        .features => {
+            try printFeatures(io);
+            return;
+        },
+        .run => {},
     }
 
-    // Parse --monitor flag
-    var monitor_index: ?usize = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--monitor") or std.mem.eql(u8, args[i], "-m")) {
-            if (i + 1 >= args.len) {
-                std.log.err("--monitor requires a numeric argument", .{});
-                return error.MonitorIndexRequired;
-            }
-            monitor_index = std.fmt.parseInt(usize, args[i + 1], 10) catch {
-                std.log.err("--monitor argument must be a valid number", .{});
-                return error.InvalidMonitorIndex;
-            };
-            i += 1; // Skip the argument value
-        }
-    }
-
-    // Parse feature-specific CLI flags
-    var parsed_flags = try parseFeatureFlags(args, allocator);
-    defer parsed_flags.deinit();
-
-    var application = try app.App.init(allocator, io, monitor_index, &parsed_flags);
+    var application = try app.App.init(allocator, io, init.environ_map, cli.monitor_index, &cli.feature_flags);
     defer application.deinit();
 
     try application.run();
@@ -276,26 +299,17 @@ fn writeHelpBody(io: std.Io) !void {
         \\  Ctrl+W          Delete word
         \\  Type to filter   Fuzzy search
         \\
-        \\Environment Variables:
-        \\  ZMENU_THEME      Set color theme (default: mocha)
-        \\                   Available: mocha, latte, frappe, macchiato,
-        \\                              dracula, gruvbox, nord, solarized
-        \\
         \\Examples:
         \\  echo -e "Apple\nBanana\nCherry" | zmenu
         \\  find . -type f | zmenu
         \\  cat items.txt | zmenu
-        \\  echo -e "Option A\nOption B" | ZMENU_THEME=dracula zmenu
         \\
     );
 
     try stdout.flush();
 }
 
-test "parseFlag - string flag rejects value that looks like another flag" {
-    // --hist-file --hist-limit (user forgot the path argument).
-    // parseFlag should reject values starting with "-" for string/int flags.
-
+test "parseFlagValue validates missing strings and integer bounds" {
     const string_flag = features.CliFlag{
         .long = "hist-file",
         .short = 'H',
@@ -303,96 +317,56 @@ test "parseFlag - string flag rejects value that looks like another flag" {
         .value_type = .string,
     };
 
-    // Missing value: next arg is another flag
     const args = &[_][]const u8{ "zmenu", "--hist-file", "--hist-limit" };
-    const result = parseFlag(args, string_flag);
-    try std.testing.expectError(error.MissingFlagValue, result);
-}
+    try std.testing.expectError(error.MissingFlagValue, parseFlagValue(args, 1, string_flag));
 
-test "parseFlag - short flag rejects value that looks like a flag" {
-    const string_flag = features.CliFlag{
-        .long = "hist-file",
-        .short = 'H',
-        .description = "Custom history file path",
-        .value_type = .string,
-    };
-
-    const args = &[_][]const u8{ "zmenu", "-H", "--something" };
-    const result = parseFlag(args, string_flag);
-    try std.testing.expectError(error.MissingFlagValue, result);
-}
-
-test "parseFlag - int flag accepts negative values" {
     const int_flag = features.CliFlag{
-        .long = "offset",
-        .description = "An offset value",
+        .long = "limit",
+        .description = "A bounded count",
         .value_type = .int,
+        .int_min = 1,
+        .int_max = 10_000,
     };
-
-    const args = &[_][]const u8{ "zmenu", "--offset", "-5" };
-    const result = try parseFlag(args, int_flag);
-    if (result) |val| {
-        try std.testing.expectEqual(@as(i64, -5), val.int);
-    } else {
-        return error.TestExpectedEqual;
-    }
+    try std.testing.expectError(error.FlagValueOutOfRange, parseFlagValue(&.{ "zmenu", "--limit", "0" }, 1, int_flag));
+    try std.testing.expectError(error.FlagValueOutOfRange, parseFlagValue(&.{ "zmenu", "--limit", "-1" }, 1, int_flag));
+    try std.testing.expectError(error.FlagValueOutOfRange, parseFlagValue(&.{ "zmenu", "--limit", "10001" }, 1, int_flag));
+    const valid = try parseFlagValue(&.{ "zmenu", "--limit", "10000" }, 1, int_flag);
+    try std.testing.expectEqual(@as(i64, 10_000), valid.int);
 }
 
-test "parseFlag - int flag rejects non-numeric value" {
-    const int_flag = features.CliFlag{
-        .long = "offset",
-        .description = "An offset value",
-        .value_type = .int,
-    };
+test "single-pass CLI accepts valid forms and rejects ambiguous input" {
+    var help = try parseCli(&.{ "zmenu", "--help" }, std.testing.allocator);
+    defer help.deinit();
+    try std.testing.expectEqual(CliAction.help, help.action);
 
-    const args = &[_][]const u8{ "zmenu", "--offset", "--other-flag" };
-    const result = parseFlag(args, int_flag);
-    try std.testing.expectError(error.InvalidFlagValue, result);
+    var monitor = try parseCli(&.{ "zmenu", "-m", "2" }, std.testing.allocator);
+    defer monitor.deinit();
+    try std.testing.expectEqual(@as(?usize, 2), monitor.monitor_index);
+
+    try std.testing.expectError(error.UnknownOption, parseCli(&.{ "zmenu", "--unknown" }, std.testing.allocator));
+    try std.testing.expectError(error.UnexpectedPositionalArgument, parseCli(&.{ "zmenu", "item" }, std.testing.allocator));
+    try std.testing.expectError(error.DuplicateOption, parseCli(&.{ "zmenu", "-m", "1", "--monitor", "2" }, std.testing.allocator));
+    try std.testing.expectError(error.MonitorIndexRequired, parseCli(&.{ "zmenu", "--monitor" }, std.testing.allocator));
+    try std.testing.expectError(error.IncompatibleInformationalOption, parseCli(&.{ "zmenu", "-m", "1", "--version" }, std.testing.allocator));
+    try std.testing.expectError(error.DuplicateOrIncompatibleOption, parseCli(&.{ "zmenu", "--help", "--version" }, std.testing.allocator));
 }
 
-test "parseFlag - string flag accepts normal value" {
-    const string_flag = features.CliFlag{
-        .long = "hist-file",
-        .short = 'H',
-        .description = "Custom history file path",
-        .value_type = .string,
-    };
+test "history CLI validates limits, duplicates, ordering, and configured default" {
+    const location = findFeatureFlag("--hist-limit") orelse return;
 
-    const args = &[_][]const u8{ "zmenu", "--hist-file", "/tmp/history" };
-    const result = try parseFlag(args, string_flag);
-    if (result) |val| {
-        try std.testing.expectEqualStrings("/tmp/history", val.string);
-    } else {
-        return error.TestExpectedEqual;
-    }
-}
+    var defaults = try parseCli(&.{"zmenu"}, std.testing.allocator);
+    defer defaults.deinit();
+    const default_value = defaults.feature_flags.values.items[location.feature_index].items[location.flag_index].?;
+    try std.testing.expectEqual(@as(i64, @intCast(config.features.history_max_entries)), default_value.int);
 
-test "parseFlag - uses no heap allocation for flag matching" {
-    // Bug: parseFlag used allocPrint + catch unreachable to build "--flagname"
-    // for comparison. This is UB in release on OOM. The fix should use
-    // std.mem.startsWith which requires zero allocation.
+    var ordered = try parseCli(&.{ "zmenu", "--monitor", "1", "--hist-limit", "25" }, std.testing.allocator);
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(i64, 25), ordered.feature_flags.values.items[location.feature_index].items[location.flag_index].?.int);
 
-    const test_flag = features.CliFlag{
-        .long = "test-flag",
-        .short = 't',
-        .description = "A test flag",
-        .value_type = .bool,
-    };
-
-    // This should work without any allocator — zero allocations needed
-    const args = &[_][]const u8{ "zmenu", "--test-flag" };
-    const result = parseFlag(args, test_flag) catch |err| {
-        std.debug.print("BUG: parseFlag failed with allocator error: {}\n", .{err});
-        return error.TestExpectedEqual;
-    };
-
-    // Should find the flag
-    if (result) |val| {
-        try std.testing.expect(val.bool == true);
-    } else {
-        std.debug.print("BUG: parseFlag didn't find --test-flag\n", .{});
-        return error.TestExpectedEqual;
-    }
+    try std.testing.expectError(error.FlagValueOutOfRange, parseCli(&.{ "zmenu", "--hist-limit", "0" }, std.testing.allocator));
+    try std.testing.expectError(error.FlagValueOutOfRange, parseCli(&.{ "zmenu", "--hist-limit", "-1" }, std.testing.allocator));
+    try std.testing.expectError(error.FlagValueOutOfRange, parseCli(&.{ "zmenu", "--hist-limit", "10001" }, std.testing.allocator));
+    try std.testing.expectError(error.DuplicateOption, parseCli(&.{ "zmenu", "--hist-limit", "2", "--hist-limit", "3" }, std.testing.allocator));
 }
 
 // Re-export tests from modules

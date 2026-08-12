@@ -32,17 +32,17 @@ pub const HistoryState = struct {
     lookup_map: std.StringHashMap(usize),
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io) !*HistoryState {
-        return loadWithConfig(allocator, io, null, history_config.max_entries);
+        return loadWithConfig(allocator, io, null, null, history_config.max_entries);
     }
 
-    pub fn loadWithConfig(allocator: std.mem.Allocator, io: std.Io, custom_path: ?[]const u8, max_entries: usize) !*HistoryState {
+    pub fn loadWithConfig(allocator: std.mem.Allocator, io: std.Io, environ_map: ?*const std.process.Environ.Map, custom_path: ?[]const u8, max_entries: usize) !*HistoryState {
         const state = try allocator.create(HistoryState);
         errdefer allocator.destroy(state);
 
         const history_path = if (custom_path) |path|
             try allocator.dupe(u8, path)
         else
-            try getHistoryPath(allocator);
+            try getHistoryPath(allocator, environ_map);
         errdefer allocator.free(history_path);
 
         var lookup_map = std.StringHashMap(usize).init(allocator);
@@ -120,38 +120,39 @@ pub const HistoryState = struct {
     }
 
     pub fn save(self: *HistoryState) void {
+        self.saveAtomic(null) catch |err| {
+            std.log.warn("could not save history atomically: {}", .{err});
+        };
+    }
+
+    fn saveAtomic(self: *HistoryState, comptime before_replace: ?*const fn () anyerror!void) !void {
         std.debug.assert(self.history_path.len > 0);
         std.debug.assert(self.entries.items.len <= self.max_entries);
 
         if (!self.dirty) return;
 
         if (std.fs.path.dirname(self.history_path)) |dir| {
-            std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| {
-                std.log.warn("could not create history dir: {}", .{err});
-                return;
-            };
+            try std.Io.Dir.cwd().createDirPath(self.io, dir);
         }
 
-        const file = std.Io.Dir.createFileAbsolute(self.io, self.history_path, .{}) catch |err| {
-            std.log.warn("could not save history: {}", .{err});
-            return;
-        };
-        defer file.close(self.io);
+        var atomic_file = try std.Io.Dir.cwd().createFileAtomic(self.io, self.history_path, .{
+            .make_path = true,
+            .replace = true,
+        });
+        defer atomic_file.deinit(self.io);
 
         var write_buf: [4096]u8 = undefined;
-        var file_writer = file.writer(self.io, &write_buf);
+        var file_writer = atomic_file.file.writer(self.io, &write_buf);
         const writer = &file_writer.interface;
         for (self.entries.items) |entry| {
-            writer.writeAll(entry) catch |err| {
-                std.log.warn("history save aborted mid-write: {}", .{err});
-                return;
-            };
-            writer.writeAll("\n") catch |err| {
-                std.log.warn("history save aborted mid-write: {}", .{err});
-                return;
-            };
+            try writer.writeAll(entry);
+            try writer.writeAll("\n");
         }
-        writer.flush() catch |err| std.log.warn("history flush failed: {}", .{err});
+        try writer.flush();
+        try atomic_file.file.sync(self.io);
+        if (before_replace) |callback| try callback();
+        try atomic_file.replace(self.io);
+        self.dirty = false;
     }
 
     /// Add entry (moves to front if exists). Marks state as dirty.
@@ -244,35 +245,31 @@ pub const HistoryState = struct {
     }
 };
 
-fn getHistoryPath(allocator: std.mem.Allocator) ![]const u8 {
+fn getHistoryPath(allocator: std.mem.Allocator, environ_map: ?*const std.process.Environ.Map) ![]const u8 {
     const sep = std.fs.path.sep_str;
 
     if (comptime builtin.os.tag == .windows) {
         // Windows: use APPDATA
-        const appdata = std.process.getEnvVarOwned(allocator, "APPDATA") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.NoHomeDirectory,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        defer allocator.free(appdata);
+        const appdata = if (environ_map) |env| env.get("APPDATA") orelse return error.NoHomeDirectory else return error.NoHomeDirectory;
         return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ appdata, history_config.filename });
     } else if (comptime builtin.os.tag == .macos) {
         // macOS: ~/Library/Application Support/zmenu/ (XDG override respected)
-        if (std.posix.getenv("XDG_DATA_HOME")) |xdg_data| {
+        if (if (environ_map) |env| env.get("XDG_DATA_HOME") else null) |xdg_data| {
             return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ xdg_data, history_config.filename });
         }
 
-        if (std.posix.getenv("HOME")) |home| {
+        if (if (environ_map) |env| env.get("HOME") else null) |home| {
             return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "Library" ++ sep ++ "Application Support" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ home, history_config.filename });
         }
 
         return error.NoHomeDirectory;
     } else {
         // Linux/other Unix: XDG_DATA_HOME or ~/.local/share/zmenu/
-        if (std.posix.getenv("XDG_DATA_HOME")) |xdg_data| {
+        if (if (environ_map) |env| env.get("XDG_DATA_HOME") else null) |xdg_data| {
             return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ xdg_data, history_config.filename });
         }
 
-        if (std.posix.getenv("HOME")) |home| {
+        if (if (environ_map) |env| env.get("HOME") else null) |home| {
             return std.fmt.allocPrint(allocator, "{s}" ++ sep ++ ".local" ++ sep ++ "share" ++ sep ++ "zmenu" ++ sep ++ "{s}", .{ home, history_config.filename });
         }
 
@@ -292,7 +289,7 @@ fn onInit(init_data: features_mod.FeatureInitData) anyerror!?features_mod.Featur
 
     // Load or create history state with custom settings
     // Degrade gracefully if history path can't be resolved (e.g., missing HOME)
-    const state = HistoryState.loadWithConfig(allocator, init_data.io, custom_path, max_entries) catch |err| {
+    const state = HistoryState.loadWithConfig(allocator, init_data.io, init_data.environ_map, custom_path, max_entries) catch |err| {
         std.log.warn("history feature unavailable: {}", .{err});
         return null;
     };
@@ -384,10 +381,19 @@ pub const feature = features_mod.Feature{
             .long = "hist-limit",
             .description = "Maximum history entries",
             .value_type = .int,
-            .default = features_mod.FlagValue{ .int = 100 },
+            .default = features_mod.FlagValue{ .int = @intCast(history_config.max_entries) },
+            .int_min = 1,
+            .int_max = 10_000,
         },
     },
 };
+
+test "history CLI limit default and range follow configuration" {
+    const limit = feature.cli_flags.?[1];
+    try std.testing.expectEqual(@as(i64, @intCast(history_config.max_entries)), limit.default.?.int);
+    try std.testing.expectEqual(@as(?i64, 1), limit.int_min);
+    try std.testing.expectEqual(@as(?i64, 10_000), limit.int_max);
+}
 
 test "HistoryState - add and retrieve entries" {
     const allocator = std.testing.allocator;
@@ -507,21 +513,17 @@ test "History afterFilter - basic reordering correctness" {
     try std.testing.expectEqual(@as(usize, 4), filtered.items.len); // No items lost
 }
 
-
 test "HistoryState - save creates nested directories" {
     const allocator = std.testing.allocator;
-
-    // Use a deeply nested path where intermediate dirs don't exist
-    const nested_path = "/tmp/zmenu_test_nested/level1/level2/level3/history";
-
-    // Clean up any previous test artifacts
-    std.Io.Dir.cwd().deleteTree(std.testing.io, "/tmp/zmenu_test_nested") catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const nested_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/level1/level2/level3/history", .{tmp.sub_path});
 
     var state = HistoryState{
         .allocator = allocator,
         .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
-        .history_path = try allocator.dupe(u8, nested_path),
+        .history_path = nested_path,
         .max_entries = 100,
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
@@ -535,17 +537,8 @@ test "HistoryState - save creates nested directories" {
     state.addEntry("test_item");
     state.save();
 
-    // Verify the file was actually created
-    const file = std.Io.Dir.openFileAbsolute(std.testing.io, nested_path, .{}) catch |err| {
-        std.debug.print("BUG: save() failed to create file with nested dirs: {}\n", .{err});
-        // Clean up
-        std.Io.Dir.cwd().deleteTree(std.testing.io, "/tmp/zmenu_test_nested") catch {};
-        return error.TestExpectedEqual;
-    };
+    const file = try tmp.dir.openFile(std.testing.io, "level1/level2/level3/history", .{});
     file.close(std.testing.io);
-
-    // Clean up
-    std.Io.Dir.cwd().deleteTree(std.testing.io, "/tmp/zmenu_test_nested") catch {};
 }
 
 test "History afterFilter - matches on display field not value" {
@@ -608,17 +601,16 @@ test "HistoryState - save skipped when no changes made" {
 
     const allocator = std.testing.allocator;
 
-    const test_path = "/tmp/zmenu_test_dirty_flag_history";
-
-    // Clean up any previous artifacts
-    std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/history", .{tmp.sub_path});
 
     // Create state and add entries (simulates loading from file)
     var state = HistoryState{
         .allocator = allocator,
         .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
-        .history_path = try allocator.dupe(u8, test_path),
+        .history_path = test_path,
         .max_entries = 100,
         .dirty = false,
         .lookup_map = std.StringHashMap(usize).init(allocator),
@@ -638,7 +630,7 @@ test "HistoryState - save skipped when no changes made" {
 
     // File should NOT exist (save was skipped)
     const file_exists = blk: {
-        std.Io.Dir.accessAbsolute(std.testing.io, test_path, .{}) catch break :blk false;
+        tmp.dir.access(std.testing.io, "history", .{}) catch break :blk false;
         break :blk true;
     };
     try std.testing.expect(!file_exists);
@@ -652,13 +644,50 @@ test "HistoryState - save skipped when no changes made" {
 
     // File should exist
     const file_exists2 = blk: {
-        std.Io.Dir.accessAbsolute(std.testing.io, test_path, .{}) catch break :blk false;
+        tmp.dir.access(std.testing.io, "history", .{}) catch break :blk false;
         break :blk true;
     };
     try std.testing.expect(file_exists2);
+}
 
-    // Clean up
-    std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
+test "HistoryState - atomic save preserves previous file before rename and clears dirty only on success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "history", .data = "previous\n" });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/history", .{tmp.sub_path});
+
+    var state = HistoryState{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .entries = std.ArrayList([]const u8).empty,
+        .history_path = path,
+        .max_entries = 100,
+        .lookup_map = std.StringHashMap(usize).init(std.testing.allocator),
+    };
+    defer {
+        state.lookup_map.deinit();
+        for (state.entries.items) |entry| std.testing.allocator.free(entry);
+        state.entries.deinit(std.testing.allocator);
+        std.testing.allocator.free(state.history_path);
+    }
+    state.addEntry("replacement");
+
+    const failBeforeRename = struct {
+        fn run() anyerror!void {
+            return error.InjectedBeforeRename;
+        }
+    }.run;
+    try std.testing.expectError(error.InjectedBeforeRename, state.saveAtomic(&failBeforeRename));
+    try std.testing.expect(state.dirty);
+    const old_content = try tmp.dir.readFileAlloc(std.testing.io, "history", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(old_content);
+    try std.testing.expectEqualStrings("previous\n", old_content);
+
+    try state.saveAtomic(null);
+    try std.testing.expect(!state.dirty);
+    const new_content = try tmp.dir.readFileAlloc(std.testing.io, "history", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(new_content);
+    try std.testing.expectEqualStrings("replacement\n", new_content);
 }
 
 test "History afterFilter - rapid updates" {
@@ -896,26 +925,16 @@ test "HistoryState loadFromFile - dedupes duplicate lines without tripping asser
     // count==entries.len assertion holds.
     const allocator = std.testing.allocator;
 
-    const test_path = "/tmp/zmenu_test_dedup_history";
-    std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
-
-    // Write 6 lines, 3 unique
-    const file = try std.Io.Dir.createFileAbsolute(std.testing.io, test_path, .{});
-    {
-        var buf: [256]u8 = undefined;
-        var fw = file.writer(std.testing.io, &buf);
-        const w = &fw.interface;
-        try w.writeAll("alpha\nbeta\nalpha\ngamma\nbeta\nalpha\n");
-        try w.flush();
-        file.close(std.testing.io);
-    }
-    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, test_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "history", .data = "alpha\nbeta\nalpha\ngamma\nbeta\nalpha\n" });
+    const test_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/history", .{tmp.sub_path});
 
     var state = HistoryState{
         .allocator = allocator,
         .io = std.testing.io,
         .entries = std.ArrayList([]const u8).empty,
-        .history_path = try allocator.dupe(u8, test_path),
+        .history_path = test_path,
         .max_entries = 100,
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };

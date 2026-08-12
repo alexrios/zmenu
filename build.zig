@@ -30,6 +30,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .ext_ttf = true,
     });
+    const sdl3_module = sdl3.module("sdl3");
+
+    // Zig 0.16 translate-c emits invalid unused local declarations for the
+    // MinGW fortified wcscat/wcscpy inline wrappers in optimized builds.
+    // Disabling header fortification for the generated bindings avoids those
+    // wrappers; SDL itself is still compiled with its configured safety mode.
+    if (target.result.os.tag == .windows and optimize != .Debug) {
+        const c_module = sdl3_module.import_table.get("c") orelse @panic("zig-sdl3 c module missing");
+        const root = c_module.root_source_file orelse @panic("zig-sdl3 c source missing");
+        const generated = switch (root) {
+            .generated => |value| value,
+            else => @panic("zig-sdl3 c source is not generated"),
+        };
+        const translate_c: *std.Build.Step.TranslateC = @fieldParentPtr("step", generated.file.step);
+        translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
+    }
 
     // Check if user config exists, fallback to default
     // Users can copy config.def.zig to config.zig and customize
@@ -44,7 +60,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    config_module.addImport("sdl3", sdl3.module("sdl3"));
+    config_module.addImport("sdl3", sdl3_module);
 
     const exe = b.addExecutable(.{
         .name = "zmenu",
@@ -59,7 +75,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Import modules
-    exe.root_module.addImport("sdl3", sdl3.module("sdl3"));
+    exe.root_module.addImport("sdl3", sdl3_module);
     exe.root_module.addImport("config", config_module);
     exe.root_module.addImport("build_options", options.createModule());
 
@@ -84,7 +100,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Import modules for tests
-    unit_tests.root_module.addImport("sdl3", sdl3.module("sdl3"));
+    unit_tests.root_module.addImport("sdl3", sdl3_module);
     unit_tests.root_module.addImport("config", config_module);
     unit_tests.root_module.addImport("build_options", options.createModule());
 

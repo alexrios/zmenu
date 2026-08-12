@@ -30,7 +30,6 @@ pub const features = struct {
     /// When enabled, pressing Enter copies to both clipboard AND stdout
     /// Degrades gracefully in headless/SSH environments (warns but continues)
     pub const clipboard: bool = true;
-
 };
 
 pub const MatchMode = enum {
@@ -39,9 +38,9 @@ pub const MatchMode = enum {
     exact,
 };
 
-/// Graceful shutdown timeout for onExit hooks (milliseconds)
-/// Features exceeding this timeout will be logged but not blocked
-pub const exit_timeout_ms: u32 = 500;
+/// Global cooperative budget for synchronous onExit hooks (milliseconds).
+/// Hooks cannot be interrupted safely; they must observe their ExitContext.
+pub const exit_budget_ms: u32 = 500;
 
 // ============================================================================
 // MULTI-VALUE ITEMS
@@ -161,4 +160,3 @@ pub const default_font_paths = switch (builtin.os.tag) {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     },
 };
-

@@ -1,10 +1,10 @@
 .{
     .name = .zmenu,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .dependencies = .{
         .sdl3 = .{
-            .url = "https://codeberg.org/7Games/zig-sdl3/archive/v0.2.0.tar.gz",
-            .hash = "sdl3-0.2.0-NmT1Q0mFJwBi9kZmArzh2rfJ_mFshydV0zPGULVlpACc",
+            .url = "https://codeberg.org/7Games/zig-sdl3/archive/v0.2.2.tar.gz",
+            .hash = "sdl3-0.2.2-NmT1Q-2jKQBa4uSXUwuVwdmXpXe-eYwim7Wkyx531v6O",
         },
     },
     .paths = .{""},

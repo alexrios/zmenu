@@ -65,6 +65,9 @@ echo -e "Item1\nItem2" | zmenu -H /tmp/history --hist-limit 100
 ```
 
 The history feature tracks your selections and reorders items based on recency, with most recently selected items appearing first.
+`--hist-limit` accepts values from 1 through 10000; its default is the compile-time `features.history_max_entries` setting.
+
+The CLI rejects unknown options, positional arguments, duplicate options, and missing values before SDL is initialized. Informational options (`--help`, `--version`, and `--features`) cannot be combined with execution options.
 
 ### Responsiveness
 
@@ -111,6 +114,7 @@ find /large/directory -type f | zmenu
 When enabled via `config.zig` (`clipboard = true`), zmenu automatically copies your selection to the system clipboard when you press Enter. The selection is sent to **both** stdout (normal behavior) and clipboard.
 
 The clipboard feature gracefully handles cases where clipboard access fails, printing a warning but still outputting to stdout.
+Exit hooks such as the Linux clipboard event pump run synchronously on the main thread. They share the cooperative `exit_budget_ms` deadline; hooks must check the supplied context because they cannot be interrupted forcibly without risking SDL state.
 
 ## Themes
 

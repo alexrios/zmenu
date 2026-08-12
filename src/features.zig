@@ -19,9 +19,9 @@ pub fn castState(comptime T: type, state_ptr: ?FeatureState) ?*T {
 
 /// CLI flag value types
 pub const FlagValueType = enum {
-    string,  // --flag value
-    int,     // --flag 42
-    bool,    // --flag (no argument)
+    string, // --flag value
+    int, // --flag 42
+    bool, // --flag (no argument)
 };
 
 /// CLI flag value (runtime representation)
@@ -33,18 +33,43 @@ pub const FlagValue = union(FlagValueType) {
 
 /// CLI flag declaration
 pub const CliFlag = struct {
-    long: []const u8,           // Long flag name (without --), e.g., "hist-file"
-    short: ?u8 = null,          // Optional short flag (single char), e.g., 'H'
-    description: []const u8,    // Help text description
-    value_type: FlagValueType,  // Type of value expected
-    required: bool = false,     // Whether flag is required
+    long: []const u8, // Long flag name (without --), e.g., "hist-file"
+    short: ?u8 = null, // Optional short flag (single char), e.g., 'H'
+    description: []const u8, // Help text description
+    value_type: FlagValueType, // Type of value expected
+    required: bool = false, // Whether flag is required
     default: ?FlagValue = null, // Default value if not provided
+    int_min: ?i64 = null, // Inclusive lower bound for integer flags
+    int_max: ?i64 = null, // Inclusive upper bound for integer flags
+};
+
+pub const ExitStatus = enum { completed, timed_out };
+
+/// Cooperative deadline shared by all synchronous onExit hooks.
+/// Hooks run on the main thread and cannot be forcibly interrupted safely.
+pub const ExitContext = struct {
+    deadline_ms: u64,
+    clock_ms: *const fn () u64 = defaultExitClock,
+
+    fn defaultExitClock() u64 {
+        return sdl.timer.getMillisecondsSinceInit();
+    }
+
+    pub fn expired(self: ExitContext) bool {
+        return self.clock_ms() >= self.deadline_ms;
+    }
+
+    pub fn remainingMs(self: ExitContext) u64 {
+        const now = self.clock_ms();
+        return if (now >= self.deadline_ms) 0 else self.deadline_ms - now;
+    }
 };
 
 /// Feature initialization data (passed to onInit hook)
 pub const FeatureInitData = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    environ_map: ?*const std.process.Environ.Map = null,
     cli_values: []const ?FlagValue, // Parsed CLI flag values (null = not provided)
     cli_flags: []const CliFlag, // Flag declarations (for name-based lookup)
 
@@ -126,17 +151,16 @@ pub const Hooks = struct {
     /// Receives the full Item so features can choose display or value field
     onSelect: ?*const fn (?FeatureState, types.Item) void = null,
 
-    /// Called after user selects an item (presses Enter), before SDL shutdown
-    /// Must complete within global timeout (see config.exit_timeout_ms)
-    /// No allocations allowed, no error returns
-    onExit: ?*const fn (?FeatureState) void = null,
+    /// Called synchronously after selection and before SDL shutdown.
+    /// Hooks must cooperate with the shared deadline and report their status.
+    onExit: ?*const fn (?FeatureState, ExitContext) ExitStatus = null,
 };
 
 /// Feature definition
 pub const Feature = struct {
     name: []const u8,
     hooks: Hooks,
-    cli_flags: ?[]const CliFlag = null,  // Optional CLI flags for this feature
+    cli_flags: ?[]const CliFlag = null, // Optional CLI flags for this feature
 };
 
 /// Validate CLI flags at compile time
@@ -154,10 +178,35 @@ fn validateCliFlags(features_list: []const Feature) void {
                     if (flag.long.len == 0) {
                         @compileError("Feature '" ++ feature.name ++ "': CLI flag has empty .long name");
                     }
+                    if (std.mem.eql(u8, flag.long, "help") or
+                        std.mem.eql(u8, flag.long, "version") or
+                        std.mem.eql(u8, flag.long, "features") or
+                        std.mem.eql(u8, flag.long, "monitor"))
+                    {
+                        @compileError("Feature '" ++ feature.name ++ "': CLI flag --" ++ flag.long ++ " is reserved");
+                    }
                     // Check for required flag with default value (invalid)
                     if (flag.required and flag.default != null) {
                         @compileError("Feature '" ++ feature.name ++ "': Flag --" ++ flag.long ++
                             " cannot be both required and have a default value");
+                    }
+                    if (flag.value_type != .int and (flag.int_min != null or flag.int_max != null)) {
+                        @compileError("Feature '" ++ feature.name ++ "': non-integer flag --" ++ flag.long ++
+                            " cannot declare integer bounds");
+                    }
+                    if (flag.int_min != null and flag.int_max != null and flag.int_min.? > flag.int_max.?) {
+                        @compileError("Feature '" ++ feature.name ++ "': invalid integer range for --" ++ flag.long);
+                    }
+                    if (flag.default) |default_value| {
+                        if (@as(FlagValueType, default_value) != flag.value_type) {
+                            @compileError("Feature '" ++ feature.name ++ "': default type does not match --" ++ flag.long);
+                        }
+                        if (default_value == .int) {
+                            if (flag.int_min) |min| if (default_value.int < min)
+                                @compileError("Feature '" ++ feature.name ++ "': default below minimum for --" ++ flag.long);
+                            if (flag.int_max) |max| if (default_value.int > max)
+                                @compileError("Feature '" ++ feature.name ++ "': default above maximum for --" ++ flag.long);
+                        }
                     }
 
                     // Check for duplicate long flags
@@ -171,6 +220,10 @@ fn validateCliFlags(features_list: []const Feature) void {
 
                     // Check for duplicate short flags
                     if (flag.short) |short_char| {
+                        if (short_char == 'h' or short_char == 'v' or short_char == 'm') {
+                            const short_str = &[_]u8{short_char};
+                            @compileError("Feature '" ++ feature.name ++ "': CLI flag -" ++ short_str ++ " is reserved");
+                        }
                         for (seen_short) |existing_short| {
                             if (short_char == existing_short) {
                                 const short_str = &[_]u8{short_char};
@@ -234,10 +287,7 @@ pub fn getFeatureFlagsHelp() []const u8 {
                     // Format required marker
                     const required_text = if (flag.required) " [required]" else "";
 
-                    help = help ++ std.fmt.comptimePrint(
-                        "{s}--{s}{s:<12} {s}{s}{s}\n",
-                        .{ short_part, flag.long, type_hint, flag.description, default_text, required_text }
-                    );
+                    help = help ++ std.fmt.comptimePrint("{s}--{s}{s:<12} {s}{s}{s}\n", .{ short_part, flag.long, type_hint, flag.description, default_text, required_text });
                 }
             }
         }
@@ -293,7 +343,7 @@ pub fn initStates() FeatureStates {
 
 /// Initialize all enabled features - called from App.init()
 /// On failure, cleans up any features that were already initialized.
-pub fn initAll(allocator: std.mem.Allocator, io: std.Io, states: *FeatureStates, parsed_flags: *const ParsedFlags) !void {
+pub fn initAll(allocator: std.mem.Allocator, io: std.Io, environ_map: ?*const std.process.Environ.Map, states: *FeatureStates, parsed_flags: *const ParsedFlags) !void {
     if (enabled_count == 0) return;
 
     errdefer deinitAll(states, allocator);
@@ -303,6 +353,7 @@ pub fn initAll(allocator: std.mem.Allocator, io: std.Io, states: *FeatureStates,
             const init_data = FeatureInitData{
                 .allocator = allocator,
                 .io = io,
+                .environ_map = environ_map,
                 .cli_values = parsed_flags.getFeatureValues(i),
                 .cli_flags = feature.cli_flags orelse &.{},
             };
@@ -348,45 +399,36 @@ pub fn callOnSelect(states: *FeatureStates, selected_item: types.Item) void {
     }
 }
 
-/// Call onExit hooks with timeout - called after onSelect, before deinit
-/// Returns true if all hooks completed within timeout, false if any timed out
-pub fn callOnExit(states: *FeatureStates, timeout_ms: u32) bool {
-    std.debug.assert(timeout_ms > 0);
-    if (enabled_count == 0) return true;
-
-    // Deadline-based to avoid bare unsigned subtraction on the SDL timer:
-    // saturating add for the cutoff, comparison against `now`. Plain `-` for
-    // the elapsed-time diagnostic is safe inside each guarded branch — `now`
-    // is provably greater than the start it's subtracted from.
+/// Call synchronous onExit hooks within one cooperative global budget.
+/// No new hook is started after the deadline. A running hook must observe the
+/// context itself because forcibly interrupting SDL-dependent code is unsafe.
+pub fn callOnExit(states: *FeatureStates, budget_ms: u32) ExitStatus {
+    std.debug.assert(budget_ms > 0);
+    if (enabled_count == 0) return .completed;
     const start_time: u64 = sdl.timer.getMillisecondsSinceInit();
-    const total_deadline: u64 = start_time +| @as(u64, timeout_ms);
-    var all_completed = true;
+    const context = ExitContext{ .deadline_ms = start_time +| @as(u64, budget_ms) };
 
     inline for (enabled_features, 0..) |feature, i| {
         if (feature.hooks.onExit) |exitFn| {
-            const hook_start: u64 = sdl.timer.getMillisecondsSinceInit();
-            const hook_deadline: u64 = hook_start +| @as(u64, timeout_ms);
-            exitFn(states[i]);
-            const hook_now: u64 = sdl.timer.getMillisecondsSinceInit();
-
-            if (hook_now > hook_deadline) {
-                std.debug.assert(hook_now > hook_start);
-                const hook_duration: u64 = hook_now - hook_start;
-                std.log.warn("Feature '{s}' onExit exceeded timeout ({d}ms > {d}ms)", .{ feature.name, hook_duration, timeout_ms });
-                all_completed = false;
+            if (callExitHook(feature.name, exitFn, states[i], context) == .timed_out) {
+                std.log.warn("onExit budget exhausted; skipping feature '{s}'", .{feature.name});
+                return .timed_out;
             }
         }
-
-        const now: u64 = sdl.timer.getMillisecondsSinceInit();
-        if (now > total_deadline) {
-            std.debug.assert(now > start_time);
-            const total_elapsed: u64 = now - start_time;
-            std.log.warn("onExit total timeout exceeded ({d}ms > {d}ms), skipping remaining features", .{ total_elapsed, timeout_ms });
-            return false;
-        }
     }
+    return if (context.expired()) .timed_out else .completed;
+}
 
-    return all_completed;
+fn callExitHook(
+    name: []const u8,
+    exit_fn: *const fn (?FeatureState, ExitContext) ExitStatus,
+    state: ?FeatureState,
+    context: ExitContext,
+) ExitStatus {
+    if (context.expired()) return .timed_out;
+    const status = exit_fn(state, context);
+    if (status == .timed_out) std.log.warn("Feature '{s}' exhausted the onExit budget", .{name});
+    return status;
 }
 
 test "Feature hooks - handle empty filtered items gracefully" {
@@ -520,4 +562,31 @@ test "castState - typed cast from opaque pointer" {
     // Null input returns null
     const null_result = castState(TestState, null);
     try std.testing.expect(null_result == null);
+}
+
+test "onExit cooperative context skips expired hook and accepts completed hook" {
+    const Clock = struct {
+        var now: u64 = 0;
+        fn read() u64 {
+            return now;
+        }
+    };
+    const Hook = struct {
+        var calls: usize = 0;
+        fn run(_: ?FeatureState, context: ExitContext) ExitStatus {
+            calls += 1;
+            return if (context.expired()) .timed_out else .completed;
+        }
+    };
+
+    Clock.now = 10;
+    Hook.calls = 0;
+    const expired = ExitContext{ .deadline_ms = 10, .clock_ms = &Clock.read };
+    try std.testing.expectEqual(ExitStatus.timed_out, callExitHook("test", &Hook.run, null, expired));
+    try std.testing.expectEqual(@as(usize, 0), Hook.calls);
+
+    Clock.now = 9;
+    const active = ExitContext{ .deadline_ms = 10, .clock_ms = &Clock.read };
+    try std.testing.expectEqual(ExitStatus.completed, callExitHook("test", &Hook.run, null, active));
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls);
 }

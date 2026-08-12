@@ -52,7 +52,7 @@ fn onSelect(state_ptr: ?features_mod.FeatureState, selected_item: types.Item) vo
 const linux_pump_budget_ms: u32 = 50;
 // Outer tick loop: 1ms minimum delay per iteration => ~50 iterations expected.
 // Cap at 500 so the pathological clock-stuck case still completes well within
-// the global features.callOnExit timeout (500ms in config). A larger cap (e.g.
+// the global features.callOnExit budget (500ms in the default config). A larger cap (e.g.
 // 10000 → 10s) would make the app feel frozen on shutdown if the clock misbehaves.
 const max_outer_iterations: u32 = 500;
 // Inner event drain: SDL's queue is small; X11/Wayland clipboard completion
@@ -60,8 +60,10 @@ const max_outer_iterations: u32 = 500;
 // safety valve, well above realistic bursts.
 const max_inner_iterations: u32 = 256;
 
-fn onExit(state_ptr: ?features_mod.FeatureState) void {
+fn onExit(state_ptr: ?features_mod.FeatureState, context: features_mod.ExitContext) features_mod.ExitStatus {
     _ = state_ptr; // Stateless feature
+
+    if (context.expired()) return .timed_out;
 
     if (builtin.os.tag == .linux) {
         // Linux (X11/Wayland) requires event pumping to complete async clipboard transfer
@@ -73,7 +75,7 @@ fn onExit(state_ptr: ?features_mod.FeatureState) void {
         // SDL ms-since-init returns u64. Use saturating addition so the bound
         // computation never traps even in pathological cases (per Kimi review).
         const start: u64 = sdl.timer.getMillisecondsSinceInit();
-        const end_time: u64 = start +| @as(u64, timeout_ms);
+        const end_time: u64 = @min(start +| @as(u64, timeout_ms), context.deadline_ms);
         std.debug.assert(end_time >= start);
 
         // The `for (0..MAX) |_|` form encodes the static upper bound in the loop
@@ -92,11 +94,14 @@ fn onExit(state_ptr: ?features_mod.FeatureState) void {
             }
             sdl.timer.delayMilliseconds(1); // Small sleep to avoid busy loop
         }
+        if (context.expired()) return .timed_out;
         std.log.info("clipboard: completed linux async transfer", .{});
     } else {
         // macOS/Windows handle clipboard synchronously
+        if (context.remainingMs() < 10) return .timed_out;
         sdl.timer.delayMilliseconds(10);
     }
+    return if (context.expired()) .timed_out else .completed;
 }
 
 pub const feature = features_mod.Feature{
@@ -138,4 +143,14 @@ test "Clipboard - truncation for long items" {
     try std.testing.expectEqual(@as(usize, 4096), copy_len);
     try std.testing.expectEqual(@as(u8, 0), buffer[copy_len]);
     try std.testing.expectEqual(@as(u8, 'A'), buffer[0]);
+}
+
+test "Clipboard onExit respects an already-expired global deadline" {
+    const Clock = struct {
+        fn read() u64 {
+            return 100;
+        }
+    };
+    const context = features_mod.ExitContext{ .deadline_ms = 100, .clock_ms = &Clock.read };
+    try std.testing.expectEqual(features_mod.ExitStatus.timed_out, onExit(null, context));
 }
