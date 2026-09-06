@@ -1332,7 +1332,8 @@ test "CancelableStdinReader propagates read errors and iteration exhaustion" {
     _ = failed.future.await(std.testing.io) catch {};
     var lines = std.ArrayList([]u8).empty;
     defer lines.deinit(std.testing.allocator);
-    try std.testing.expectError(error.NotOpenForReading, failed.pollLines(&lines));
+    const read_error = if (@import("builtin").os.tag == .windows) error.AccessDenied else error.NotOpenForReading;
+    try std.testing.expectError(read_error, failed.pollLines(&lines));
 
     var limited = App.CancelableStdinReader.initWithLimit(std.testing.allocator, std.testing.io, write_only, 0);
     limited.start();
