@@ -208,6 +208,44 @@ pub const App = struct {
         }
     }
 
+    /// Internal benchmark entrypoint; never used by the launcher's CLI.
+    pub fn benchmark(self: *App, count: usize) !void {
+        var line: [1024]u8 = undefined;
+        var start = sdl.timer.getPerformanceCounter();
+        for (0..count) |i| {
+            const text = try std.fmt.bufPrint(&line, "/projects/long/deterministic/path/日本語/café/component-{d}/repeated-{d}.txt|value-{d}", .{ i, i % 100, i });
+            try self.processLine(text);
+        }
+        reportTiming("ingest", start);
+        self.state.input_state = .ready;
+        start = sdl.timer.getPerformanceCounter();
+        try self.updateFilter();
+        reportTiming("search_empty", start);
+        start = sdl.timer.getPerformanceCounter();
+        try self.handleTextInput("cpt99");
+        reportTiming("search_fuzzy", start);
+        self.state.input_buffer.clearRetainingCapacity();
+        try self.updateFilter();
+        const history = @import("features/history.zig");
+        const hist = try history.HistoryState.loadWithConfig(self.allocator, self.io, null, "/nonexistent/zmenu-benchmark-history", 100);
+        defer hist.deinit();
+        for (0..100) |i| hist.addEntry(self.state.items.items[count - 1 - i].display);
+        start = sdl.timer.getPerformanceCounter();
+        history.feature.hooks.afterFilter.?(hist, &self.state.filtered_items, self.state.items.items);
+        reportTiming("history", start);
+        for (0..20) |_| {
+            start = sdl.timer.getPerformanceCounter();
+            self.navigate(1);
+            try self.render();
+            reportTiming("render_navigation", start);
+        }
+    }
+
+    fn reportTiming(label: []const u8, start: u64) void {
+        const ms = @as(f64, @floatFromInt(sdl.timer.getPerformanceCounter() - start)) * 1000 / @as(f64, @floatFromInt(sdl.timer.getPerformanceFrequency()));
+        std.debug.print("BENCH {s} {d:.3}\n", .{ label, ms });
+    }
+
     fn processNewLines(self: *App, new_lines: *std.ArrayList([]u8)) !void {
         if (new_lines.items.len == 0) return;
         for (new_lines.items) |line| {
