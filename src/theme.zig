@@ -24,8 +24,8 @@ pub const latte = Theme{
     .background = .{ .r = 0xef, .g = 0xf1, .b = 0xf5, .a = 0xff },
     .foreground = .{ .r = 0x4c, .g = 0x4f, .b = 0x69, .a = 0xff },
     .selected = .{ .r = 0x1e, .g = 0x66, .b = 0xf5, .a = 0xff },
-    .prompt = .{ .r = 0xdc, .g = 0x8a, .b = 0x78, .a = 0xff },
-    .value_preview = .{ .r = 0x9c, .g = 0xa0, .b = 0xb0, .a = 0xff },
+    .prompt = .{ .r = 0x4c, .g = 0x4f, .b = 0x69, .a = 0xff },
+    .value_preview = .{ .r = 0x4c, .g = 0x4f, .b = 0x69, .a = 0xff },
 };
 
 /// Catppuccin Frappé - Medium pastel theme
