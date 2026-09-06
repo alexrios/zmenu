@@ -4,11 +4,12 @@ const features = @import("features.zig");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const count = try std.fmt.parseInt(usize, args[1], 10);
-    if (count < 100) return error.TooFewItems;
     var flags = features.ParsedFlags.init(std.heap.smp_allocator);
     defer flags.deinit();
     var app = try App.init(std.heap.smp_allocator, init.io, null, null, &flags);
     defer app.deinit();
+    if (std.mem.eql(u8, args[1], "check-confirm")) return app.checkEmptyConfirmation();
+    const count = try std.fmt.parseInt(usize, args[1], 10);
+    if (count < 100) return error.TooFewItems;
     try app.benchmark(count);
 }

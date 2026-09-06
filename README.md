@@ -260,3 +260,6 @@ To add a new feature, see [docs/features.md](docs/features.md) for the compile-t
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE) for details.
+
+Enter confirms only a valid selection. With no matches, the menu stays open so
+that the query can be edited. Escape and Ctrl+C still cancel.

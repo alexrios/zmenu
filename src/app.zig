@@ -208,6 +208,22 @@ pub const App = struct {
         }
     }
 
+    pub fn checkEmptyConfirmation(self: *App) !void {
+        try self.processLine("alpha|confirmed-value");
+        try self.handleEofTransition();
+        try self.handleTextInput("zzzz");
+        var event = std.mem.zeroes(sdl.events.Keyboard);
+        event.key = .return_key;
+        if (try self.handleKeyEvent(event)) return error.EmptyConfirmationClosedMenu;
+        event.key = .u;
+        event.mod.left_control = true;
+        _ = try self.handleKeyEvent(event);
+        if (self.state.filtered_items.items.len != 1) return error.SearchDidNotRecover;
+        event.key = .return_key;
+        event.mod.left_control = false;
+        if (!try self.handleKeyEvent(event)) return error.ValidConfirmationDidNotClose;
+    }
+
     /// Internal benchmark entrypoint; never used by the launcher's CLI.
     pub fn benchmark(self: *App, count: usize) !void {
         var line: [1024]u8 = undefined;
@@ -653,8 +669,7 @@ pub const App = struct {
         if (key == .escape) return true;
         if (key == .c and ctrl) return true;
         if (key == .return_key or key == .kp_enter) {
-            try self.handleConfirm();
-            return true;
+            return try self.handleConfirm();
         }
 
         if (key == .backspace) {
@@ -699,8 +714,8 @@ pub const App = struct {
 
     /// Confirm the current selection: notify features, run their onExit hooks,
     /// and write the selected item's value to stdout. No-op if nothing matches.
-    fn handleConfirm(self: *App) !void {
-        if (self.state.filtered_items.items.len == 0) return;
+    fn handleConfirm(self: *App) !bool {
+        if (self.state.filtered_items.items.len == 0) return false;
         std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len);
 
         const item_idx = self.state.filtered_items.items[self.state.selected_index];
@@ -727,6 +742,7 @@ pub const App = struct {
         try stdout.writeAll(selected_item.value);
         try stdout.writeAll("\n");
         try stdout.flush();
+        return true;
     }
 
     fn handleTextInput(self: *App, text: []const u8) !void {
