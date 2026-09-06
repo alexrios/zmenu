@@ -16,3 +16,13 @@ scheduling. History is invoked explicitly even though disabled in default config
 
 Verification for the baseline commit: `mise run test`,
 `mise run build:release-safe`, `mise run benchmark`, `git diff --check`.
+
+`viewport.json` repeats the baseline after removing all-item text measurement.
+`mise run test:ui` also writes layout captures under `benchmarks/visual/` for
+100%, 150% and 200%. These use SDL render targets at physical pixel dimensions;
+they exercise the production drawing path, but do not validate compositor DPI
+notifications or real monitor placement. Loading, long rows/previews, paging and
+query-tail clipping were inspected at all three scales. The embedded font lacks
+Japanese glyphs (tofu boxes); UTF-8 data is preserved. Latte contrast is addressed
+in the final theme commit. Unit tests, ReleaseSafe build and confirmation checks
+passed with the viewport changes.

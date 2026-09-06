@@ -111,6 +111,7 @@ pub const App = struct {
         errdefer font.deinit();
 
         const metrics = try queryDisplayMetrics(window);
+        try font.setSize(config.font.size * metrics.scale);
 
         var app = App{
             .sdl = .{ .window = window, .renderer = renderer, .font = font, .loaded_font_path = font_result.path },
@@ -206,6 +207,44 @@ pub const App = struct {
                 self.state.needs_render = false;
             }
         }
+    }
+
+    /// Offscreen layout acceptance at explicit physical pixel scales.
+    pub fn checkLayout(self: *App, scale: f32) !void {
+        const target = try self.sdl.renderer.createTexture(.array_rgba_32, .target, @intFromFloat(800 * scale), @intFromFloat(300 * scale));
+        defer target.deinit();
+        try self.sdl.renderer.setTarget(target);
+        defer self.sdl.renderer.setTarget(null) catch {};
+        self.render_ctx.window.current_width = 800;
+        self.render_ctx.window.current_height = 300;
+        self.render_ctx.window.display_scale = scale;
+        try self.sdl.font.setSize(config.font.size * scale);
+        try self.drawFrame();
+        try self.saveFrame(scale, "loading");
+        for (0..50) |i| {
+            var line: [1024]u8 = undefined;
+            const text = try std.fmt.bufPrint(&line, "/projects/a-very-long-directory-name/another-long-directory/café/component/{d}/important-final-filename.txt|/home/alexrios/very/long/path/to/preview-file-{d}.txt", .{ i, i });
+            try self.processLine(text);
+        }
+        try self.handleEofTransition();
+        try self.drawFrame();
+        try self.saveFrame(scale, "items");
+        self.navigatePage(1);
+        if (self.state.selected_index != self.visibleRows()) return error.IncorrectPageSize;
+        try self.drawFrame();
+        try self.saveFrame(scale, "page");
+        try self.handleTextInput("a query with no matches that keeps extending until the visible prompt must show its newest characters: café 日本語 END-OF-QUERY");
+        if (self.render_ctx.window.current_height != 300 or self.render_ctx.window.current_width != 800) return error.UnstableViewport;
+        try self.drawFrame();
+        try self.saveFrame(scale, "query");
+    }
+
+    fn saveFrame(self: *App, scale: f32, scene: []const u8) !void {
+        var path: [128]u8 = undefined;
+        const name = try std.fmt.bufPrintZ(&path, "benchmarks/visual/{d}-{s}.bmp", .{ @as(u32, @intFromFloat(scale * 100)), scene });
+        const surface = try self.sdl.renderer.readPixels(null);
+        defer surface.deinit();
+        try surface.saveBmpFile(name);
     }
 
     pub fn checkEmptyConfirmation(self: *App) !void {
@@ -482,12 +521,6 @@ pub const App = struct {
             std.debug.assert(item.display.len <= config.limits.max_item_length);
             try self.state.items.append(self.allocator, item);
 
-            // Update cached max item width (measure once on ingest, not per frame)
-            const item_width = self.measureItemWidth(item);
-            if (item_width > self.render_ctx.cached_max_item_width) {
-                self.render_ctx.cached_max_item_width = item_width;
-            }
-
             // Increment items loaded counter if we're in loading state
             if (self.state.input_state == .loading) {
                 self.state.input_state.loading.items_loaded += 1;
@@ -495,53 +528,11 @@ pub const App = struct {
         }
     }
 
-    /// Measure the rendered width of an item (display + optional value preview).
-    /// Used once per item on ingest to maintain the cached max width.
-    fn measureItemWidth(self: *App, item: types.Item) f32 {
-        // bufPrint failure here means item_buffer_size is misconfigured (smaller
-        // than max_item_length + prefix). This is a comptime invariant per
-        // CLAUDE.md; assert it instead of silently degrading.
-        std.debug.assert(self.render_ctx.item_buffer.len >= config.limits.max_item_length + 16);
-
-        const display_text = std.fmt.bufPrint(self.render_ctx.item_buffer, "> {s}", .{item.display}) catch |err| {
-            std.log.warn("measureItemWidth: display bufPrint failed ({}); width may be wrong", .{err});
-            return 0;
-        };
-        const display_w, _ = self.sdl.font.getStringSize(display_text) catch |err| {
-            std.log.warn("measureItemWidth: SDL getStringSize failed ({}); width may be wrong", .{err});
-            return 0;
-        };
-        var total: f32 = @floatFromInt(display_w);
-
-        if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
-            const preview_len = if (config.multivalue.preview_max_length > 0)
-                @min(item.value.len, config.multivalue.preview_max_length)
-            else
-                item.value.len;
-
-            const preview_text = std.fmt.bufPrint(self.render_ctx.value_preview_buffer, "{s}", .{item.value[0..preview_len]}) catch |err| {
-                std.log.warn("measureItemWidth: preview bufPrint failed ({}); width may be wrong", .{err});
-                return total;
-            };
-            const preview_w, _ = self.sdl.font.getStringSize(preview_text) catch |err| {
-                std.log.warn("measureItemWidth: preview getStringSize failed ({}); width may be wrong", .{err});
-                return total;
-            };
-
-            total += config.multivalue.preview_spacing + @as(f32, @floatFromInt(preview_w));
-        }
-
-        total += config.layout.width_padding * 2.0;
-        std.debug.assert(total >= 0.0);
-        return total;
-    }
-
     fn updateFilter(self: *App) !void {
         // Pre: invariants every caller must satisfy.
         std.debug.assert(self.state.filtered_items.items.len <= self.state.items.items.len);
         std.debug.assert(self.state.input_buffer.items.len <= config.limits.max_input_length);
 
-        const prev_filtered_count = self.state.filtered_items.items.len;
         const total_items = self.state.items.items.len;
         self.state.filtered_items.clearRetainingCapacity();
 
@@ -584,10 +575,6 @@ pub const App = struct {
             self.state.filtered_items.items.len == 0);
 
         self.adjustScroll();
-
-        if (prev_filtered_count != self.state.filtered_items.items.len) {
-            try self.updateWindowSize();
-        }
     }
 
     fn adjustScroll(self: *App) void {
@@ -599,8 +586,8 @@ pub const App = struct {
         std.debug.assert(self.state.selected_index < filtered_len);
 
         // Clamp scroll_offset when filtered list shrinks below previous range
-        const max_scroll = if (filtered_len > config.limits.max_visible_items)
-            filtered_len - config.limits.max_visible_items
+        const max_scroll = if (filtered_len > self.visibleRows())
+            filtered_len - self.visibleRows()
         else
             0;
         if (self.state.scroll_offset > max_scroll) {
@@ -609,13 +596,13 @@ pub const App = struct {
 
         if (self.state.selected_index < self.state.scroll_offset) {
             self.state.scroll_offset = self.state.selected_index;
-        } else if (self.state.selected_index >= self.state.scroll_offset + config.limits.max_visible_items) {
-            self.state.scroll_offset = self.state.selected_index - config.limits.max_visible_items + 1;
+        } else if (self.state.selected_index >= self.state.scroll_offset + self.visibleRows()) {
+            self.state.scroll_offset = self.state.selected_index - self.visibleRows() + 1;
         }
 
         // Post: the selected row is inside the visible window.
         std.debug.assert(self.state.scroll_offset <= self.state.selected_index);
-        std.debug.assert(self.state.selected_index < self.state.scroll_offset + config.limits.max_visible_items);
+        std.debug.assert(self.state.selected_index < self.state.scroll_offset + self.visibleRows());
     }
 
     fn navigate(self: *App, delta: isize) void {
@@ -623,7 +610,7 @@ pub const App = struct {
         std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len);
 
         const current = @as(isize, @intCast(self.state.selected_index));
-        const new_idx = current + delta;
+        const new_idx = std.math.clamp(current + delta, 0, @as(isize, @intCast(self.state.filtered_items.items.len)) - 1);
 
         if (new_idx >= 0 and new_idx < @as(isize, @intCast(self.state.filtered_items.items.len))) {
             self.state.selected_index = @intCast(new_idx);
@@ -652,7 +639,7 @@ pub const App = struct {
 
     fn navigatePage(self: *App, direction: isize) void {
         if (self.state.filtered_items.items.len == 0) return;
-        const page_size = @as(isize, @intCast(config.limits.max_visible_items));
+        const page_size = @as(isize, @intCast(self.visibleRows()));
         self.navigate(page_size * direction);
     }
 
@@ -755,6 +742,10 @@ pub const App = struct {
 
     fn updateDisplayScale(self: *App) !void {
         self.render_ctx.window.display_scale = try self.sdl.window.getDisplayScale();
+        try self.sdl.font.setSize(config.font.size * self.render_ctx.window.display_scale);
+        self.render_ctx.prompt_cache.deinit();
+        self.render_ctx.count_cache.deinit();
+        self.render_ctx.no_match_cache.deinit();
         const w_width, const w_height = try self.sdl.window.getSizeInPixels();
 
         if (w_width > std.math.maxInt(u32) or w_height > std.math.maxInt(u32)) {
@@ -763,81 +754,30 @@ pub const App = struct {
 
         self.render_ctx.window.width = @intCast(w_width);
         self.render_ctx.window.height = @intCast(w_height);
+        const logical_w, const logical_h = try self.sdl.window.getSize();
+        self.render_ctx.window.current_width = @intCast(logical_w);
+        self.render_ctx.window.current_height = @intCast(logical_h);
+        self.adjustScroll();
         self.state.needs_render = true;
     }
 
-    fn calculateOptimalWidth(self: *App) !u32 {
-        var max_width: f32 = @floatFromInt(config.window.min_width);
-
-        // Measure actual prompt text (or use sample if empty)
-        const prompt_text = if (self.state.input_buffer.items.len > 0)
-            std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> {s}", .{self.state.input_buffer.items}) catch config.layout.sample_prompt_text
-        else
-            config.layout.sample_prompt_text;
-        const prompt_w, _ = try self.sdl.font.getStringSize(prompt_text);
-
-        // Measure actual count text
-        const count_text = std.fmt.bufPrintZ(
-            self.render_ctx.count_buffer,
-            "{d}/{d}",
-            .{ self.state.filtered_items.items.len, self.state.items.items.len },
-        ) catch config.layout.sample_count_text;
-        const count_w, _ = try self.sdl.font.getStringSize(count_text);
-
-        // Measure scroll indicator if needed
-        const filtered_len = self.state.filtered_items.items.len;
-        const has_scroll = filtered_len > config.limits.max_visible_items;
-        const scroll_w = if (has_scroll) blk: {
-            const visible_end = @min(self.state.scroll_offset + config.limits.max_visible_items, filtered_len);
-            const scroll_text = std.fmt.bufPrintZ(
-                self.render_ctx.scroll_buffer,
-                "[{d}-{d}]",
-                .{ self.state.scroll_offset + 1, visible_end },
-            ) catch config.layout.sample_scroll_text;
-            const w, _ = try self.sdl.font.getStringSize(scroll_text);
-            break :blk w;
-        } else 0;
-
-        const right_side_width = @max(count_w, scroll_w);
-
-        // Width needed for prompt on left + right side elements + padding between
-        const base_width = @as(f32, @floatFromInt(prompt_w + right_side_width)) + (config.layout.width_padding * 3.0);
-        if (base_width > max_width) max_width = base_width;
-
-        // Use cached max item width (measured once per item on ingest)
-        // instead of re-measuring visible items every frame
-        if (self.render_ctx.cached_max_item_width > max_width) {
-            max_width = self.render_ctx.cached_max_item_width;
-        }
-
-        const rounded_width = @as(u32, @intFromFloat(@ceil(max_width)));
-        const final_width = @max(rounded_width, config.window.min_width);
-        const result = @min(final_width, config.window.max_width);
-        std.debug.assert(result >= config.window.min_width);
-        std.debug.assert(result <= config.window.max_width);
-        return result;
+    fn lineHeight(self: *App) f32 {
+        return @max(config.layout.item_line_height, @as(f32, @floatFromInt(self.sdl.font.getHeight())) / self.render_ctx.window.display_scale);
     }
 
-    fn calculateOptimalHeight(self: *App) u32 {
-        const filtered_len = self.state.filtered_items.items.len;
-        const visible_items = @min(filtered_len, config.limits.max_visible_items);
-        std.debug.assert(visible_items <= config.limits.max_visible_items);
+    fn visibleRows(self: *App) usize {
+        return rendering_mod.visibleRows(self.render_ctx.window.current_height, self.lineHeight());
+    }
 
-        const prompt_area_height = config.layout.items_start_y;
-        const items_height = @as(f32, @floatFromInt(visible_items)) * config.layout.item_line_height;
-        const total_height = prompt_area_height + items_height + config.layout.bottom_margin;
-
-        const rounded_height = @as(u32, @intFromFloat(@ceil(total_height)));
-        const final_height = @max(rounded_height, config.window.min_height);
-        const result = @min(final_height, config.window.max_height);
-        std.debug.assert(result >= config.window.min_height);
-        std.debug.assert(result <= config.window.max_height);
-        return result;
+    fn footerY(self: *App) f32 {
+        return @as(f32, @floatFromInt(self.render_ctx.window.current_height)) - self.lineHeight() - config.layout.bottom_margin;
     }
 
     fn updateWindowSize(self: *App) !void {
-        const new_width = try self.calculateOptimalWidth();
-        const new_height = self.calculateOptimalHeight();
+        const active_display = self.target_display orelse try self.sdl.window.getDisplayForWindow();
+        const bounds = try active_display.getUsableBounds();
+        const new_width = @min(config.window.initial_width, @as(u32, @intCast(@max(1, bounds.w))));
+        const new_height = @min(config.window.initial_height, @as(u32, @intCast(@max(1, bounds.h))));
 
         if (new_width != self.render_ctx.window.current_width or new_height != self.render_ctx.window.current_height) {
             self.render_ctx.window.current_width = new_width;
@@ -857,6 +797,11 @@ pub const App = struct {
     /// reorder without understanding the implications (background must be first,
     /// present() must be last).
     fn render(self: *App) !void {
+        try self.drawFrame();
+        try self.sdl.renderer.present();
+    }
+
+    fn drawFrame(self: *App) !void {
         try self.renderClear();
         const scale = self.render_ctx.window.display_scale;
 
@@ -864,7 +809,6 @@ pub const App = struct {
         switch (self.state.input_state) {
             .loading => |data| {
                 try self.renderLoading(scale, data.items_loaded);
-                try self.sdl.renderer.present();
                 return;
             },
             .ready => {},
@@ -873,7 +817,6 @@ pub const App = struct {
         try self.renderPromptLine(scale);
         try self.renderCounter(scale);
         try self.renderItemList(scale);
-        try self.sdl.renderer.present();
     }
 
     /// Fill the framebuffer with the configured background color.
@@ -901,7 +844,7 @@ pub const App = struct {
             .{items_loaded},
         ) catch "Loading...";
 
-        try self.renderCachedText(5.0 * scale, config.layout.items_start_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
+        try self.renderCachedText(5.0 * scale, self.footerY() * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
     }
 
     /// Render the prompt line: "> " followed by the user's input (with leading
@@ -910,20 +853,8 @@ pub const App = struct {
         std.debug.assert(scale > 0.0);
         std.debug.assert(config.limits.input_ellipsis_margin < config.limits.max_input_length);
 
-        const prompt_text = if (self.state.input_buffer.items.len > 0) blk: {
-            const ellipsis_threshold = config.limits.max_input_length - config.limits.input_ellipsis_margin;
-            const display_input = if (self.state.input_buffer.items.len > ellipsis_threshold) blk2: {
-                const approx_start = self.state.input_buffer.items.len - ellipsis_threshold;
-                var start = approx_start;
-                while (start < self.state.input_buffer.items.len and (self.state.input_buffer.items[start] & 0xC0) == 0x80) {
-                    start += 1;
-                }
-                break :blk2 self.state.input_buffer.items[start..];
-            } else self.state.input_buffer.items;
-
-            const prefix = if (self.state.input_buffer.items.len > ellipsis_threshold) "> ..." else "> ";
-            break :blk std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "{s}{s}", .{ prefix, display_input }) catch "> [error]";
-        } else std.fmt.bufPrintZ(self.render_ctx.prompt_buffer, "> ", .{}) catch "> ";
+        const width = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - 10) * scale;
+        const prompt_text = try rendering_mod.fitText(self.sdl.font, self.render_ctx.prompt_buffer, "> ", self.state.input_buffer.items, width, .tail);
 
         try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, prompt_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
     }
@@ -935,13 +866,11 @@ pub const App = struct {
 
         const count_text = std.fmt.bufPrintZ(
             self.render_ctx.count_buffer,
-            "{d}/{d}",
-            .{ self.state.filtered_items.items.len, self.state.items.items.len },
+            "{s}{d}/{d}",
+            .{ if (self.state.input_state == .loading) "Reading... " else "", self.state.filtered_items.items.len, self.state.items.items.len },
         ) catch "?/?";
 
-        const count_text_w, _ = try self.sdl.font.getStringSize(count_text);
-        const count_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(count_text_w)) - config.layout.width_padding) * scale;
-        try self.renderCachedText(count_x, config.layout.prompt_y * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
+        try self.renderCachedText(5.0 * scale, self.footerY() * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
     }
 
     /// Render the filtered item list (or the empty-state message), plus the
@@ -955,7 +884,7 @@ pub const App = struct {
             return;
         }
 
-        const visible_end = @min(self.state.scroll_offset + config.limits.max_visible_items, filtered_len);
+        const visible_end = @min(self.state.scroll_offset + self.visibleRows(), filtered_len);
         std.debug.assert(visible_end <= filtered_len);
         std.debug.assert(self.state.scroll_offset <= visible_end);
 
@@ -969,10 +898,10 @@ pub const App = struct {
             const item = self.state.items.items[item_index];
             const is_selected = (i == self.state.selected_index);
             try self.renderItem(scale, y_pos, item, is_selected);
-            y_pos += config.layout.item_line_height * scale;
+            y_pos += self.lineHeight() * scale;
         }
 
-        if (filtered_len > config.limits.max_visible_items) {
+        if (filtered_len > self.visibleRows()) {
             try self.renderScrollIndicator(scale, visible_end);
         }
     }
@@ -984,24 +913,19 @@ pub const App = struct {
         std.debug.assert(y_pos >= 0.0);
 
         const prefix = if (is_selected) "> " else "  ";
-        const display_text = std.fmt.bufPrintZ(self.render_ctx.item_buffer, "{s}{s}", .{ prefix, item.display }) catch "  [error]";
+        const width = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - 10) * scale;
+        const preview = config.multivalue.show_preview and item.value.ptr != item.display.ptr and item.value.len > 0;
+        const display_budget = if (preview) width * 0.65 else width;
+        const display_text = try rendering_mod.fitText(self.sdl.font, self.render_ctx.item_buffer, prefix, item.display, display_budget, .middle);
         const display_color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
         try self.renderText(5.0 * scale, y_pos, display_text, display_color);
 
-        if (config.multivalue.show_preview and item.value.ptr != item.display.ptr) {
+        if (preview) {
             const display_w, _ = try self.sdl.font.getStringSize(display_text);
             const value_x = 5.0 * scale + @as(f32, @floatFromInt(display_w)) + config.multivalue.preview_spacing * scale;
-
-            const preview_text = if (config.multivalue.preview_max_length > 0 and item.value.len > config.multivalue.preview_max_length) blk: {
-                const truncate_len = input.findUtf8Boundary(item.value, config.multivalue.preview_max_length);
-                // Paired: re-verify the boundary on the caller's side.
-                std.debug.assert(truncate_len <= item.value.len);
-                std.debug.assert(truncate_len == 0 or truncate_len == item.value.len or (item.value[truncate_len] & 0xC0) != 0x80);
-                break :blk std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}...", .{item.value[0..truncate_len]}) catch "...";
-            } else std.fmt.bufPrintZ(self.render_ctx.value_preview_buffer, "{s}", .{item.value}) catch "...";
-
-            // Use dimmed color (never use selected color for preview).
-            try self.renderText(value_x, y_pos, preview_text, self.color_scheme.value_preview);
+            const preview_buffer = self.render_ctx.value_preview_buffer[0..if (config.multivalue.preview_max_length > 0) @min(self.render_ctx.value_preview_buffer.len, config.multivalue.preview_max_length + 4) else self.render_ctx.value_preview_buffer.len];
+            const preview_text = try rendering_mod.fitText(self.sdl.font, preview_buffer, "", item.value, @max(0, width - (value_x - 5.0 * scale)), .middle);
+            if (preview_text.len > 0) try self.renderText(value_x, y_pos, preview_text, self.color_scheme.value_preview);
         }
     }
 
@@ -1026,8 +950,8 @@ pub const App = struct {
         ) catch "[?]";
 
         const scroll_text_w, _ = try self.sdl.font.getStringSize(scroll_text);
-        const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - @as(f32, @floatFromInt(scroll_text_w)) - config.layout.width_padding) * scale;
-        try self.renderText(scroll_x, config.layout.items_start_y * scale, scroll_text, self.color_scheme.foreground);
+        const scroll_x = (@as(f32, @floatFromInt(self.render_ctx.window.current_width)) - config.layout.width_padding) * scale - @as(f32, @floatFromInt(scroll_text_w));
+        try self.renderText(scroll_x, self.footerY() * scale, scroll_text, self.color_scheme.foreground);
     }
 
     fn renderText(self: *App, x: f32, y: f32, text: [:0]const u8, color: sdl.pixels.Color) !void {

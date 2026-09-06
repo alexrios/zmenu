@@ -48,6 +48,7 @@ pub const TextureCache = struct {
 
     pub fn deinit(self: *TextureCache) void {
         if (self.texture) |tex| tex.deinit();
+        self.texture = null;
     }
 
     pub fn lastText(self: *const TextureCache) []const u8 {
@@ -88,8 +89,6 @@ pub const RenderContext = struct {
     prompt_cache: TextureCache,
     count_cache: TextureCache,
     no_match_cache: TextureCache,
-    // Cached max item width (updated on item ingest, avoids per-frame measurement)
-    cached_max_item_width: f32 = 0,
     // Window and display state
     window: Window,
 
@@ -107,4 +106,81 @@ pub const RenderContext = struct {
 
 pub fn colorEquals(a: sdl.pixels.Color, b: sdl.pixels.Color) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+}
+
+/// Reserve prompt, footer and margins independently of the match count.
+pub fn visibleRows(height: u32, line_height: f32) usize {
+    const usable = @max(0, @as(f32, @floatFromInt(height)) - config.layout.items_start_y - config.layout.bottom_margin - line_height);
+    return @min(config.limits.max_visible_items, @max(1, @as(usize, @intFromFloat(@floor(usable / line_height)))));
+}
+
+pub const FitMode = enum { tail, middle };
+
+/// Fit a label using actual glyph widths. All cuts occur at UTF-8 boundaries.
+/// Paths retain their basename where it fits; queries retain their newest text.
+pub fn fitText(font: anytype, buffer: []u8, prefix: []const u8, text: []const u8, width: f32, mode: FitMode) ![:0]const u8 {
+    if (prefix.len + text.len + 1 <= buffer.len) {
+        const full = try std.fmt.bufPrintZ(buffer, "{s}{s}", .{ prefix, text });
+        const w, _ = try font.getStringSize(full);
+        if (@as(f32, @floatFromInt(w)) <= width) return full;
+    }
+    if (buffer.len < prefix.len + 4) return error.BufferTooSmall;
+    var low: usize = 0;
+    var high = @min(text.len, buffer.len - prefix.len - 4);
+    var best: usize = 0;
+    while (low <= high) {
+        const keep = low + (high - low) / 2;
+        const candidate = try fitCandidate(buffer, prefix, text, keep, mode);
+        const w, _ = try font.getStringSize(candidate);
+        if (@as(f32, @floatFromInt(w)) <= width) {
+            best = keep;
+            low = keep + 1;
+        } else {
+            if (keep == 0) return try std.fmt.bufPrintZ(buffer, "", .{});
+            high = keep - 1;
+        }
+    }
+    return fitCandidate(buffer, prefix, text, best, mode);
+}
+
+fn fitCandidate(buffer: []u8, prefix: []const u8, text: []const u8, keep: usize, mode: FitMode) ![:0]const u8 {
+    const input = @import("input.zig");
+    var head: usize = 0;
+    var tail = text.len;
+    if (mode == .tail) {
+        tail = text.len - keep;
+    } else if (std.mem.lastIndexOfAny(u8, text, "/\\")) |slash| {
+        const basename_len = text.len - slash - 1;
+        const suffix_len = @min(keep, basename_len);
+        head = input.findUtf8Boundary(text, keep - suffix_len);
+        tail = text.len - suffix_len;
+    } else {
+        head = input.findUtf8Boundary(text, keep);
+    }
+    while (tail < text.len and (text[tail] & 0xc0) == 0x80) tail += 1;
+    return std.fmt.bufPrintZ(buffer, "{s}{s}...{s}", .{ prefix, text[0..head], text[tail..] });
+}
+
+const TestFont = struct {
+    pub fn getStringSize(_: TestFont, text: []const u8) !struct { u32, u32 } {
+        return .{ @intCast((try std.unicode.utf8CountCodepoints(text)) * 10), 20 };
+    }
+};
+
+test "pixel fitting preserves UTF-8, query tail and path basename" {
+    var buffer: [256]u8 = undefined;
+    const query = try fitText(TestFont{}, &buffer, "> ", "日本語café", 80, .tail);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(query));
+    try std.testing.expect(std.mem.endsWith(u8, query, "afé"));
+    const path = try fitText(TestFont{}, &buffer, "", "/very/long/日本語/directory/file.txt", 180, .middle);
+    try std.testing.expect(std.mem.endsWith(u8, path, "file.txt"));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(path));
+    const w, _ = try (TestFont{}).getStringSize(path);
+    try std.testing.expect(w <= 180);
+    try std.testing.expectEqualStrings("", try fitText(TestFont{}, &buffer, "> ", "abc", 1, .tail));
+}
+
+test "viewport reserves footer and derives rows from height" {
+    try std.testing.expectEqual(@as(usize, 12), visibleRows(300, 20));
+    try std.testing.expectEqual(@as(usize, 7), visibleRows(300, 30));
 }

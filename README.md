@@ -263,3 +263,10 @@ AGPL-3.0. See [LICENSE](LICENSE) for details.
 
 Enter confirms only a valid selection. With no matches, the menu stays open so
 that the query can be edited. Escape and Ctrl+C still cancel.
+
+The window keeps `window.initial_width` and `window.initial_height` during loading
+and search, clamped to the monitor's usable area. Rows and Page Up/Down use the
+available height, reserving a footer for counts and position. Text fits the
+available pixel width: queries show the tail, and long paths retain their final
+filename with a middle ellipsis. UTF-8 boundaries are preserved. Font size and
+all layout options remain compile-time configuration.
