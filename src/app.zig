@@ -12,6 +12,7 @@ const rendering_mod = @import("rendering.zig");
 const input = @import("input.zig");
 const features = @import("features.zig");
 const types = @import("types.zig");
+const Search = @import("search.zig").Search;
 
 pub const SdlContext = sdl_context.SDLContext;
 pub const ColorScheme = rendering_mod.ColorScheme;
@@ -45,6 +46,17 @@ pub const App = struct {
     target_display: ?sdl.video.Display,
     monitor_index: ?usize,
     feature_states: features.FeatureStates, // Zero-size when no features enabled
+
+    search: Search = .{},
+    actions: std.ArrayList(Action) = .empty,
+    action_cursor: usize = 0,
+    actions_blocked: bool = false,
+    results_dirty: bool = false,
+
+    const Action = union(enum) {
+        key: sdl.events.Keyboard,
+        text: struct { bytes: [config.limits.max_input_length]u8, len: usize },
+    };
 
     const RenderBuffers = struct {
         prompt: []u8,
@@ -156,6 +168,8 @@ pub const App = struct {
         sdl.keyboard.stopTextInput(self.sdl.window) catch |err| {
             std.log.warn("Failed to stop text input: {}", .{err});
         };
+        self.search.deinit(self.allocator);
+        self.actions.deinit(self.allocator);
         self.state.input_buffer.deinit(self.allocator);
         for (self.state.items.items) |item| {
             item.deinit(self.allocator);
@@ -192,15 +206,18 @@ pub const App = struct {
 
         var running = true;
         while (running) {
-            if (new_lines.items.len == 0) read_status = try stdin_reader.pollLines(&new_lines);
-            try self.processNewLines(&new_lines, &line_cursor);
-            if (read_status == .eof and new_lines.items.len == 0 and self.state.input_state == .loading) {
-                try self.handleEofTransition();
+            if (!self.actions_blocked) {
+                if (new_lines.items.len == 0) read_status = try stdin_reader.pollLines(&new_lines);
+                try self.processNewLines(&new_lines, &line_cursor);
+                if (read_status == .eof and new_lines.items.len == 0 and self.state.input_state == .loading) {
+                    try self.handleEofTransition();
+                }
             }
-
-            if (sdl.events.waitTimeout(if (new_lines.items.len > 0) 0 else 16)) {
+            try self.processSearchSlice();
+            if (sdl.events.waitTimeout(if (new_lines.items.len > 0 or self.search.pending or self.actions.items.len > 0) 0 else 16)) {
                 running = try self.processEvents();
             }
+            if (running) running = try self.processActions();
 
             if (!running) stdin_reader.cancel();
 
@@ -209,6 +226,67 @@ pub const App = struct {
                 self.state.needs_render = false;
             }
         }
+    }
+
+    fn pushText(text: [:0]const u8) !void {
+        try sdl.events.push(.{ .text_input = .{ .common = std.mem.zeroes(sdl.events.Common), .text = text } });
+    }
+
+    fn pushKey(key: sdl.keycode.Keycode, ctrl: bool) !void {
+        var event = std.mem.zeroes(sdl.events.Keyboard);
+        event.key = key;
+        event.mod.left_control = ctrl;
+        try sdl.events.push(.{ .key_down = event });
+    }
+
+    pub fn checkIncremental(self: *App) !void {
+        try self.processLine("alpha|duplicate");
+        try self.processLine("bravo|duplicate");
+        try self.processLine("alps|duplicate");
+        self.navigateToLast();
+        try self.handleTextInput("al");
+        try self.finishSearch();
+        if (self.selectedItemId() != 2) return error.DuplicateIdentityLost;
+        self.state.input_buffer.clearRetainingCapacity();
+        try self.updateFilter();
+        try self.finishSearch();
+        self.navigateToFirst();
+        try pushText("a");
+        try pushKey(.down, false);
+        try pushText("l");
+        _ = try self.processEvents();
+        _ = try self.processActions();
+        if (!self.actions_blocked) return error.NavigationCrossedSearch;
+        while (self.search.pending or self.actions.items.len > 0) {
+            try self.processSearchSlice();
+            _ = try self.processActions();
+        }
+        if (self.selectedItemId() != 0) return error.EditsCrossedNavigation;
+        if (self.state.input_state != .loading) return error.ExpectedPartialResults;
+        try self.handleTextInput("zzzz");
+        try pushKey(.return_key, false);
+        _ = try self.processEvents();
+        if (!try self.processActions()) return error.StaleResultConfirmed;
+        try pushKey(.escape, false);
+        if (try self.processEvents()) return error.EscapeWasDeferred;
+        if (!self.search.pending) return error.EscapeWaitedForSearch;
+    }
+
+    fn streamDriver(io: std.Io) !void {
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+        try pushText("zzzz");
+        try pushKey(.return_key, false);
+        try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+        try pushKey(.u, true);
+        try pushText("beta");
+        try pushKey(.return_key, false);
+    }
+
+    pub fn checkStream(self: *App) !void {
+        var driver = self.io.async(streamDriver, .{self.io});
+        defer driver.cancel(self.io) catch {};
+        try self.run();
+        if (self.state.input_state != .loading) return error.ConfirmationWaitedForEof;
     }
 
     /// Offscreen layout acceptance at explicit physical pixel scales.
@@ -236,6 +314,7 @@ pub const App = struct {
         try self.drawFrame();
         try self.saveFrame(scale, "page");
         try self.handleTextInput("a query with no matches that keeps extending until the visible prompt must show its newest characters: café 日本語 END-OF-QUERY");
+        try self.finishSearch();
         if (self.render_ctx.window.current_height != 300 or self.render_ctx.window.current_width != 800) return error.UnstableViewport;
         try self.drawFrame();
         try self.saveFrame(scale, "query");
@@ -253,12 +332,14 @@ pub const App = struct {
         try self.processLine("alpha|confirmed-value");
         try self.handleEofTransition();
         try self.handleTextInput("zzzz");
+        try self.finishSearch();
         var event = std.mem.zeroes(sdl.events.Keyboard);
         event.key = .return_key;
         if (try self.handleKeyEvent(event)) return error.EmptyConfirmationClosedMenu;
         event.key = .u;
         event.mod.left_control = true;
         _ = try self.handleKeyEvent(event);
+        try self.finishSearch();
         if (self.state.filtered_items.items.len != 1) return error.SearchDidNotRecover;
         event.key = .return_key;
         event.mod.left_control = false;
@@ -277,12 +358,20 @@ pub const App = struct {
         self.state.input_state = .ready;
         start = sdl.timer.getPerformanceCounter();
         try self.updateFilter();
+        try self.benchmarkSearch();
         reportTiming("search_empty", start);
         start = sdl.timer.getPerformanceCounter();
         try self.handleTextInput("cpt99");
+        try self.benchmarkSearch();
         reportTiming("search_fuzzy", start);
+        start = sdl.timer.getPerformanceCounter();
+        try self.handleTextInput("9");
+        try self.benchmarkSearch();
+        reportTiming("search_extension", start);
+        std.debug.print("BENCH candidates_examined {d}\n", .{self.search.inspected});
         self.state.input_buffer.clearRetainingCapacity();
         try self.updateFilter();
+        try self.benchmarkSearch();
         const history = @import("features/history.zig");
         const hist = try history.HistoryState.loadWithConfig(self.allocator, self.io, null, "/nonexistent/zmenu-benchmark-history", 100);
         defer hist.deinit();
@@ -295,6 +384,14 @@ pub const App = struct {
             self.navigate(1);
             try self.render();
             reportTiming("render_navigation", start);
+        }
+    }
+
+    fn benchmarkSearch(self: *App) !void {
+        while (self.search.pending) {
+            const start = sdl.timer.getPerformanceCounter();
+            try self.processSearchSlice();
+            reportTiming("search_slice", start);
         }
     }
 
@@ -320,6 +417,7 @@ pub const App = struct {
             new_lines.clearRetainingCapacity();
             cursor.* = 0;
         }
+        if (!self.search.pending and self.results_dirty) self.orderResults();
         self.state.needs_render = true;
     }
 
@@ -332,7 +430,7 @@ pub const App = struct {
             return error.NoItemsProvided;
         }
 
-        try self.updateFilter();
+        if (!self.search.pending and self.results_dirty) self.orderResults();
         self.state.needs_render = true;
 
         // Post: one-way transition complete; filter reflects the now-final set.
@@ -340,27 +438,69 @@ pub const App = struct {
         std.debug.assert(self.state.filtered_items.items.len <= self.state.items.items.len);
     }
 
-    /// Drain SDL's event queue (capped by max_events_per_tick — Safe-Zig R2).
-    /// Returns false when the user requested quit/terminate, true to keep running.
+    /// SDL events are copied into a bounded action queue. Escape bypasses
+    /// pending search/navigation barriers; text lifetime never escapes SDL.
     fn processEvents(self: *App) !bool {
         for (0..max_events_per_tick) |_| {
+            if (self.actions.items.len - self.action_cursor >= max_events_per_tick) break;
             const event = sdl.events.poll() orelse break;
             switch (event) {
                 .quit, .terminating => return false,
-                .key_down => |key_event| {
-                    if (try self.handleKeyEvent(key_event)) return false;
+                .key_down => |key| {
+                    if (key.key == .escape or (key.key == .c and (key.mod.left_control or key.mod.right_control))) return false;
+                    try self.queueAction(.{ .key = key });
                 },
-                .text_input => |text_event| {
-                    if (self.state.input_state == .ready) {
-                        try self.handleTextInput(text_event.text);
-                    }
+                .text_input => |text| {
+                    if (text.text.len > config.limits.max_input_length) continue;
+                    var action: Action = .{ .text = .{ .bytes = undefined, .len = text.text.len } };
+                    @memcpy(action.text.bytes[0..text.text.len], text.text);
+                    try self.queueAction(action);
                 },
-                .window_display_scale_changed,
-                .window_pixel_size_changed,
-                => try self.updateDisplayScale(),
+                .window_display_scale_changed, .window_pixel_size_changed => try self.updateDisplayScale(),
                 else => {},
             }
         }
+        return true;
+    }
+
+    fn queueAction(self: *App, action: Action) !void {
+        if (self.action_cursor > 0 and self.actions.items.len == max_events_per_tick) {
+            const remaining = self.actions.items.len - self.action_cursor;
+            std.mem.copyForwards(Action, self.actions.items[0..remaining], self.actions.items[self.action_cursor..]);
+            self.actions.shrinkRetainingCapacity(remaining);
+            self.action_cursor = 0;
+        }
+        try self.actions.append(self.allocator, action);
+    }
+
+    fn isSearchBarrier(event: sdl.events.Keyboard) bool {
+        const key = event.key orelse return false;
+        return switch (key) {
+            .return_key, .kp_enter, .up, .down, .j, .k, .tab, .home, .end, .page_up, .page_down => true,
+            else => false,
+        };
+    }
+
+    fn processActions(self: *App) !bool {
+        self.actions_blocked = false;
+        while (self.action_cursor < self.actions.items.len) {
+            const action = &self.actions.items[self.action_cursor];
+            switch (action.*) {
+                .key => |key| {
+                    if (isSearchBarrier(key) and self.search.pending) {
+                        // Stop ingestion until this query finishes, so a fast
+                        // producer cannot indefinitely postpone navigation/Enter.
+                        self.actions_blocked = true;
+                        return true;
+                    }
+                    if (try self.handleKeyEvent(key)) return false;
+                },
+                .text => |*text| try self.handleTextInput(text.bytes[0..text.len]),
+            }
+            self.action_cursor += 1;
+        }
+        self.actions.clearRetainingCapacity();
+        self.action_cursor = 0;
         return true;
     }
 
@@ -542,58 +682,57 @@ pub const App = struct {
             return;
         }
         const item = types.Item.fromOwned(line);
-        errdefer item.deinit(self.allocator);
-        try self.state.items.append(self.allocator, item);
+        self.state.items.append(self.allocator, item) catch |err| {
+            item.deinit(self.allocator);
+            return err;
+        };
         if (self.state.input_state == .loading) self.state.input_state.loading.items_loaded += 1;
+        try self.search.append(self.allocator, self.state.items.items, &self.state.filtered_items);
+        self.results_dirty = true;
+    }
+
+    fn selectedItemId(self: *const App) ?usize {
+        if (self.state.selected_index >= self.state.filtered_items.items.len) return null;
+        return self.state.filtered_items.items[self.state.selected_index];
     }
 
     fn updateFilter(self: *App) !void {
-        // Pre: invariants every caller must satisfy.
-        std.debug.assert(self.state.filtered_items.items.len <= self.state.items.items.len);
-        std.debug.assert(self.state.input_buffer.items.len <= config.limits.max_input_length);
+        self.search.begin(self.state.input_buffer.items, config.features.match_mode, self.selectedItemId());
+        self.state.needs_render = true;
+    }
 
-        const total_items = self.state.items.items.len;
-        self.state.filtered_items.clearRetainingCapacity();
-
-        if (self.state.input_buffer.items.len == 0) {
-            for (self.state.items.items, 0..) |_, i| {
-                try self.state.filtered_items.append(self.allocator, i);
-            }
-        } else {
-            const query = self.state.input_buffer.items;
-            for (self.state.items.items, 0..) |item, i| {
-                if (input.matchItem(item.display, query)) {
-                    try self.state.filtered_items.append(self.allocator, i);
+    fn orderResults(self: *App) void {
+        const selected = self.selectedItemId();
+        features.callAfterFilter(&self.feature_states, &self.state.filtered_items, self.state.items.items);
+        self.state.selected_index = 0;
+        if (selected) |id| {
+            for (self.state.filtered_items.items, 0..) |candidate, i| {
+                if (candidate == id) {
+                    self.state.selected_index = i;
+                    break;
                 }
             }
         }
-
-        // Filtering is a subset operation: result never exceeds the source.
-        std.debug.assert(self.state.filtered_items.items.len <= total_items);
-
-        // Let features post-process filtered results (e.g., history boost).
-        // Features may reorder, but not add or remove items.
-        features.callAfterFilter(&self.feature_states, &self.state.filtered_items, self.state.items.items);
-        std.debug.assert(self.state.filtered_items.items.len <= total_items);
-        // Defend against a future feature that mutates indices: every entry
-        // must still point inside self.state.items.items.
-        for (self.state.filtered_items.items) |idx| {
-            std.debug.assert(idx < total_items);
-        }
-
-        if (self.state.filtered_items.items.len > 0) {
-            if (self.state.selected_index >= self.state.filtered_items.items.len) {
-                self.state.selected_index = self.state.filtered_items.items.len - 1;
-            }
-        } else {
-            self.state.selected_index = 0;
-        }
-
-        // Post: selection always points inside the filtered range (or is 0 when empty).
-        std.debug.assert(self.state.selected_index < self.state.filtered_items.items.len or
-            self.state.filtered_items.items.len == 0);
-
+        self.results_dirty = false;
         self.adjustScroll();
+    }
+
+    fn processSearchSlice(self: *App) !void {
+        if (!self.search.pending) return;
+        const start = sdl.timer.getPerformanceCounter();
+        while (self.search.pending) {
+            if (try self.search.step(self.allocator, self.state.items.items, &self.state.filtered_items)) {
+                self.state.selected_index = self.search.selected_result;
+                self.orderResults();
+                self.state.needs_render = true;
+                return;
+            }
+            if (sliceExpired(start)) return;
+        }
+    }
+
+    fn finishSearch(self: *App) !void {
+        while (self.search.pending) try self.processSearchSlice();
     }
 
     fn adjustScroll(self: *App) void {
@@ -666,11 +805,6 @@ pub const App = struct {
         const key = event.key orelse return false;
         const ctrl = event.mod.left_control or event.mod.right_control;
         const shift = event.mod.left_shift or event.mod.right_shift;
-
-        // During loading, only allow ESC and Ctrl+C for early cancellation
-        if (self.state.input_state == .loading) {
-            return key == .escape or (key == .c and ctrl);
-        }
 
         if (key == .escape) return true;
         if (key == .c and ctrl) return true;
@@ -824,15 +958,6 @@ pub const App = struct {
         try self.renderClear();
         const scale = self.render_ctx.window.display_scale;
 
-        // Loading state has its own minimal layout and short-circuits.
-        switch (self.state.input_state) {
-            .loading => |data| {
-                try self.renderLoading(scale, data.items_loaded);
-                return;
-            },
-            .ready => {},
-        }
-
         try self.renderPromptLine(scale);
         try self.renderCounter(scale);
         try self.renderItemList(scale);
@@ -842,28 +967,6 @@ pub const App = struct {
     fn renderClear(self: *App) !void {
         try self.sdl.renderer.setDrawColor(self.color_scheme.background);
         try self.sdl.renderer.clear();
-    }
-
-    /// Render the loading screen (shown while stdin is still being read).
-    fn renderLoading(self: *App, scale: f32, items_loaded: usize) !void {
-        std.debug.assert(scale > 0.0);
-        std.debug.assert(self.state.input_state == .loading);
-
-        const loading_text = std.fmt.bufPrintZ(
-            self.render_ctx.prompt_buffer,
-            "Loading...",
-            .{},
-        ) catch "Loading...";
-
-        try self.renderCachedText(5.0 * scale, config.layout.prompt_y * scale, loading_text, self.color_scheme.prompt, &self.render_ctx.prompt_cache);
-
-        const count_text = std.fmt.bufPrintZ(
-            self.render_ctx.count_buffer,
-            "Loaded {d} items",
-            .{items_loaded},
-        ) catch "Loading...";
-
-        try self.renderCachedText(5.0 * scale, self.footerY() * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
     }
 
     /// Render the prompt line: "> " followed by the user's input (with leading
@@ -886,7 +989,7 @@ pub const App = struct {
         const count_text = std.fmt.bufPrintZ(
             self.render_ctx.count_buffer,
             "{s}{d}/{d}",
-            .{ if (self.state.input_state == .loading) "Reading... " else "", self.state.filtered_items.items.len, self.state.items.items.len },
+            .{ if (self.search.pending) "Searching... " else if (self.state.input_state == .loading) "Reading... " else "", self.state.filtered_items.items.len, self.state.items.items.len },
         ) catch "?/?";
 
         try self.renderCachedText(5.0 * scale, self.footerY() * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
@@ -1245,10 +1348,14 @@ fn checkIngestionAllocationFailures(allocator: std.mem.Allocator) !void {
     _ = try reader.pollLines(&lines);
     var app: App = undefined;
     app.state = AppState.empty;
+    app.search = .{};
+    app.results_dirty = false;
     app.allocator = allocator;
     defer {
         for (app.state.items.items) |item| item.deinit(allocator);
         app.state.items.deinit(allocator);
+        app.state.filtered_items.deinit(allocator);
+        app.search.deinit(allocator);
     }
     while (cursor < lines.items.len) {
         const line = lines.items[cursor];

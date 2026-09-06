@@ -279,3 +279,12 @@ slice. Queue limits do **not** bound the final item collection, which still grow
 with the number of input items. Lines transfer ownership into items without a
 second text copy; whitespace trimming, `display|value` and final lines without a
 newline retain their behavior.
+
+Typing, navigation and Enter work while stdin is still loading. The footer marks
+reading or a pending search; Enter waits for the current query, then confirms a
+valid partial result and cancels further reading. This can cause SIGPIPE in the
+producer. Escape cancels immediately. Search scans yield every 4 ms between
+items; extending fuzzy/prefix queries reuses candidates, while deleting,
+replacing or using exact matching scans the collection again. Selection follows
+item identity, including items with duplicate values. Consecutive edits are
+coalesced before scanning; navigation and confirmation are ordering barriers.

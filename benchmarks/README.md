@@ -33,3 +33,14 @@ ordered delivery, byte-limit and line-limit backpressure, and cancellation with
 a full queue and an open producer pipe. `ownership.json` repeats internal
 measurements; its ingest adapter excludes the queue, so it does not quantify the
 removed producer-to-item copy or pipeline peak memory.
+
+`incremental.json` includes whole-query time, per-slice time and extension work.
+`candidates_examined` is an item count, not milliseconds. For 1 million items,
+the fuzzy query took 56.6 ms p95 overall while slices were 4.0 ms p95; its extension
+visited 232,363 candidates. Total completion exceeds 50 ms for this query and
+must not be confused with input/Escape dispatch latency. The SDL event checks
+cover edits separated by navigation, duplicate identities, pending Enter,
+Escape bypass and confirmation in the real run loop while a pipe stays open.
+Matching tests compare fuzzy/prefix/exact against an independent reference,
+including abandoned queries and arrivals during scans. Unit tests, ReleaseSafe
+and `test:ui` passed. Real compositor input-to-present p95 remains unmeasured.
