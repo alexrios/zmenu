@@ -1,7 +1,0 @@
-{
-  "video": "wayland",
-  "returncode": 0,
-  "stdout": "confirmed-stream\n",
-  "stderr": "ERROR: wayland cannot position non-popup windows\nwarning: Failed to position window: error.SdlError\ninfo: Loaded embedded font: Crimson Pro Regular\ninfo: clipboard: completed linux async transfer\n",
-  "elapsed_s": 0.31445037099911133
-}
