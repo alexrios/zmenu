@@ -30,6 +30,8 @@ pub const HistoryState = struct {
     // map is consistent, so default false.
     lookup_dirty: bool = false,
     lookup_map: std.StringHashMap(usize),
+    rank_counts: std.ArrayList(usize) = .empty,
+    rank_output: std.ArrayList(usize) = .empty,
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io) !*HistoryState {
         return loadWithConfig(allocator, io, null, null, history_config.max_entries);
@@ -235,6 +237,8 @@ pub const HistoryState = struct {
     pub fn deinit(self: *HistoryState) void {
         // Tear down the map before freeing entries — keys are slices into entry
         // strings, so dropping entries first would leave dangling references.
+        self.rank_counts.deinit(self.allocator);
+        self.rank_output.deinit(self.allocator);
         self.lookup_map.deinit();
         for (self.entries.items) |entry| {
             self.allocator.free(entry);
@@ -327,31 +331,29 @@ fn afterFilter(
     }
     const position_map = &state.lookup_map;
 
-    // Insertion sort using O(1) lookups instead of O(N) getPosition scans
-    const items = filtered_items.items;
-
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const idx = items[i];
-        std.debug.assert(idx < all_items.len);
-        const item_pos = position_map.get(all_items[idx].display);
-
-        var j = i;
-        while (j > 0) {
-            const prev_pos = position_map.get(all_items[items[j - 1]].display);
-
-            const should_swap = if (item_pos) |ip|
-                if (prev_pos) |pp| ip < pp else true
-            else
-                false;
-
-            if (!should_swap) break;
-
-            items[j] = items[j - 1];
-            j -= 1;
-        }
-        items[j] = idx;
+    // Stable counting distribution: O(N + H), retaining scratch capacity.
+    // Allocate before touching the caller's indices so OOM leaves order intact.
+    const ranks = state.entries.items.len + 1;
+    state.rank_counts.resize(state.allocator, ranks) catch return;
+    state.rank_output.resize(state.allocator, filtered_items.items.len) catch return;
+    @memset(state.rank_counts.items, 0);
+    const absent = ranks - 1;
+    for (filtered_items.items) |idx| {
+        const rank = position_map.get(all_items[idx].display) orelse absent;
+        state.rank_counts.items[rank] += 1;
     }
+    var offset: usize = 0;
+    for (state.rank_counts.items) |*count| {
+        const size = count.*;
+        count.* = offset;
+        offset += size;
+    }
+    for (filtered_items.items) |idx| {
+        const rank = position_map.get(all_items[idx].display) orelse absent;
+        state.rank_output.items[state.rank_counts.items[rank]] = idx;
+        state.rank_counts.items[rank] += 1;
+    }
+    @memcpy(filtered_items.items, state.rank_output.items);
 
     // Post: reorder is in-place — no items added, removed, or invalidated.
     std.debug.assert(filtered_items.items.len == original_len);
@@ -407,6 +409,8 @@ test "HistoryState - add and retrieve entries" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| {
             allocator.free(entry);
@@ -437,6 +441,8 @@ test "HistoryState - re-adding moves to front" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| {
             allocator.free(entry);
@@ -455,9 +461,7 @@ test "HistoryState - re-adding moves to front" {
 }
 
 test "History afterFilter - basic reordering correctness" {
-    // This test verifies that the afterFilter insertion sort correctly
-    // promotes history items to the front while maintaining order.
-    // Tests the core reordering logic (lines 172-205).
+    // History rank distribution promotes recent items and preserves ties.
 
     const allocator = std.testing.allocator;
 
@@ -471,6 +475,8 @@ test "History afterFilter - basic reordering correctness" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -528,6 +534,8 @@ test "HistoryState - save creates nested directories" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -556,6 +564,8 @@ test "History afterFilter - matches on display field not value" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -616,6 +626,8 @@ test "HistoryState - save skipped when no changes made" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -665,6 +677,8 @@ test "HistoryState - atomic save preserves previous file before rename and clear
         .lookup_map = std.StringHashMap(usize).init(std.testing.allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| std.testing.allocator.free(entry);
         state.entries.deinit(std.testing.allocator);
@@ -705,6 +719,8 @@ test "History afterFilter - rapid updates" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -776,6 +792,8 @@ test "History lazy lookup_map - addEntry invalidates and reorder still works" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -837,6 +855,8 @@ test "History lazy lookup_map - repeated afterFilter without mutation skips rebu
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -888,6 +908,8 @@ test "History loadFromFile - partial-load state still triggers rebuild" {
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -939,6 +961,8 @@ test "HistoryState loadFromFile - dedupes duplicate lines without tripping asser
         .lookup_map = std.StringHashMap(usize).init(allocator),
     };
     defer {
+        state.rank_counts.deinit(state.allocator);
+        state.rank_output.deinit(state.allocator);
         state.lookup_map.deinit();
         for (state.entries.items) |entry| allocator.free(entry);
         state.entries.deinit(allocator);
@@ -952,4 +976,68 @@ test "HistoryState loadFromFile - dedupes duplicate lines without tripping asser
     try std.testing.expectEqual(@as(usize, 3), state.entries.items.len);
     try std.testing.expect(state.rebuildLookupMap());
     try std.testing.expectEqual(@as(usize, 3), state.lookup_map.count());
+}
+
+test "history rank ordering equals independent stable reference including duplicates" {
+    const allocator = std.testing.allocator;
+    const state = try HistoryState.loadWithConfig(allocator, std.testing.io, null, "/nonexistent/rank-test", 100);
+    defer state.deinit();
+    state.addEntry("name-2");
+    state.addEntry("name-5");
+    state.addEntry("name-1");
+    var items: std.ArrayList(types.Item) = .empty;
+    defer {
+        for (items.items) |item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+    var filtered: std.ArrayList(usize) = .empty;
+    defer filtered.deinit(allocator);
+    for (0..300) |i| {
+        var line: [32]u8 = undefined;
+        try items.append(allocator, try types.Item.parse(allocator, try std.fmt.bufPrint(&line, "name-{d}|duplicate", .{i % 9})));
+        try filtered.append(allocator, i);
+    }
+    var random = std.Random.DefaultPrng.init(0xcafe);
+    random.random().shuffle(usize, filtered.items);
+    const original = try allocator.dupe(usize, filtered.items);
+    defer allocator.free(original);
+    var expected: std.ArrayList(usize) = .empty;
+    defer expected.deinit(allocator);
+    // Independent O(N*H) oracle: enumerate each history name, then non-history.
+    for (state.entries.items) |entry| {
+        for (original) |idx| {
+            if (std.mem.eql(u8, items.items[idx].display, entry)) try expected.append(allocator, idx);
+        }
+    }
+    for (original) |idx| {
+        if (state.getPosition(items.items[idx].display) == null) try expected.append(allocator, idx);
+    }
+    afterFilter(state, &filtered, items.items);
+    try std.testing.expectEqualSlices(usize, expected.items, filtered.items);
+    const scratch = state.rank_output.items.ptr;
+    afterFilter(state, &filtered, items.items);
+    try std.testing.expectEqual(scratch, state.rank_output.items.ptr);
+    try std.testing.expectEqualSlices(usize, expected.items, filtered.items);
+}
+
+test "history allocation failures preserve the original ordering" {
+    const allocator = std.testing.allocator;
+    for (0..2) |failure| {
+        const state = try HistoryState.loadWithConfig(allocator, std.testing.io, null, "/nonexistent/rank-test", 100);
+        defer state.deinit();
+        state.addEntry("recent");
+        try std.testing.expect(state.rebuildLookupMap());
+        const items = [_]types.Item{ try types.Item.parse(allocator, "other"), try types.Item.parse(allocator, "recent") };
+        defer for (items) |item| item.deinit(allocator);
+        var filtered: std.ArrayList(usize) = .empty;
+        defer filtered.deinit(allocator);
+        try filtered.appendSlice(allocator, &.{ 0, 1 });
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = failure });
+        state.allocator = failing.allocator();
+        afterFilter(state, &filtered, &items);
+        state.allocator = allocator;
+        try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, filtered.items);
+        afterFilter(state, &filtered, &items);
+        try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, filtered.items);
+    }
 }

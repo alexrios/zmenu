@@ -44,3 +44,11 @@ Escape bypass and confirmation in the real run loop while a pipe stays open.
 Matching tests compare fuzzy/prefix/exact against an independent reference,
 including abandoned queries and arrivals during scans. Unit tests, ReleaseSafe
 and `test:ui` passed. Real compositor input-to-present p95 remains unmeasured.
+
+`history.json` measures stable rank distribution. At 1 million matches, history
+p95 fell from 2,151.9 ms to 62.7 ms. This hook is synchronous and remains outside
+the cooperative matching budget; enabling history can exceed the 50 ms response
+target. An independent O(N*H) oracle checks duplicate ranks and stable order;
+allocation failures leave the original order intact and scratch capacity is
+reused. Unit tests and ReleaseSafe were checked with history both disabled and
+enabled; offscreen UI checks used the default configuration.

@@ -288,3 +288,8 @@ items; extending fuzzy/prefix queries reuses candidates, while deleting,
 replacing or using exact matching scans the collection again. Selection follows
 item identity, including items with duplicate values. Consecutive edits are
 coalesced before scanning; navigation and confirmation are ordering barriers.
+
+Optional history ordering uses stable rank distribution with reusable buffers,
+O(N + H) for N matches and H history entries. Recency wins; duplicates at the
+same rank and items absent from history retain their order. History remains
+disabled by default and its feature hooks retain their contracts.
