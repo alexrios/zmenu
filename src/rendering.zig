@@ -24,11 +24,9 @@ pub const ColorScheme = struct {
     }
 };
 
-/// Maximum cached label length, bounded by the largest render text we ever
-/// produce (the prompt with ellipsis + max input). Other cache uses (counter,
-/// "No matches") are far smaller; trading ~2 KB of static storage for the
-/// simplicity of a single sized type is the right Safe-Zig R3 trade.
-pub const max_cache_text_len: usize = config.limits.prompt_buffer_size;
+/// Cached labels fit the item and prompt buffers. Storage is bounded by the
+/// viewport, independent of the collection size.
+pub const max_cache_text_len: usize = @max(config.limits.item_buffer_size, config.limits.prompt_buffer_size);
 
 /// Text texture cache entry for rendering performance.
 /// Stores its own copy of the previous frame's label in a fixed-size buffer so
@@ -38,6 +36,9 @@ pub const TextureCache = struct {
     last_text_buf: [max_cache_text_len]u8,
     last_text_len: usize,
     last_color: sdl.pixels.Color,
+    font_id: usize = 0,
+    font_generation: u32 = 0,
+    scale: f32 = 0,
 
     pub const empty = TextureCache{
         .texture = null,
@@ -68,6 +69,18 @@ pub const TextureCache = struct {
     }
 };
 
+pub const RowCache = struct {
+    item_id: ?usize = null,
+    display: TextureCache = .empty,
+    preview: TextureCache = .empty,
+
+    pub fn deinit(self: *RowCache) void {
+        self.display.deinit();
+        self.preview.deinit();
+        self.item_id = null;
+    }
+};
+
 /// Render context with buffers and caches
 pub const RenderContext = struct {
     /// Window and display properties
@@ -89,10 +102,47 @@ pub const RenderContext = struct {
     prompt_cache: TextureCache,
     count_cache: TextureCache,
     no_match_cache: TextureCache,
+    textures_created: usize = 0,
+    rows: std.ArrayList(RowCache) = .empty,
     // Window and display state
     window: Window,
 
+    pub fn invalidateRows(self: *RenderContext) void {
+        for (self.rows.items) |*row| row.deinit();
+    }
+
+    pub fn prepareRows(self: *RenderContext, allocator: std.mem.Allocator, visible: []const usize) !void {
+        if (visible.len < self.rows.items.len) {
+            for (self.rows.items[visible.len..]) |*row| row.deinit();
+            self.rows.shrinkRetainingCapacity(visible.len);
+        } else {
+            const old_len = self.rows.items.len;
+            try self.rows.resize(allocator, visible.len);
+            for (self.rows.items[old_len..]) |*row| row.* = .{};
+        }
+        for (self.rows.items) |*row| {
+            if (row.item_id) |id| {
+                if (std.mem.indexOfScalar(usize, visible, id) == null) row.deinit();
+            }
+        }
+    }
+
+    pub fn rowFor(self: *RenderContext, id: usize) *RowCache {
+        for (self.rows.items) |*row| {
+            if (row.item_id == id) return row;
+        }
+        for (self.rows.items) |*row| {
+            if (row.item_id == null) {
+                row.item_id = id;
+                return row;
+            }
+        }
+        unreachable; // One slot per unique visible item.
+    }
+
     pub fn deinit(self: *RenderContext, allocator: std.mem.Allocator) void {
+        self.invalidateRows();
+        self.rows.deinit(allocator);
         allocator.free(self.prompt_buffer);
         allocator.free(self.item_buffer);
         allocator.free(self.count_buffer);

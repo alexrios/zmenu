@@ -293,3 +293,8 @@ Optional history ordering uses stable rank distribution with reusable buffers,
 O(N + H) for N matches and H history entries. Recency wins; duplicates at the
 same rank and items absent from history retain their order. History remains
 disabled by default and its feature hooks retain their contracts.
+
+Text textures are cached only for visible rows and their previews. Scrolling
+reuses rows that stay visible and releases rows that leave the viewport. Content,
+color, font generation and scale changes invalidate the relevant textures;
+resource creation and destruction stay on the main SDL thread.

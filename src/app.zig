@@ -228,6 +228,38 @@ pub const App = struct {
         }
     }
 
+    pub fn checkCache(self: *App) !void {
+        for (0..200) |i| {
+            var line: [128]u8 = undefined;
+            try self.processLine(try std.fmt.bufPrint(&line, "row-{d}|preview-{d}", .{ i, i }));
+        }
+        try self.render();
+        const first = self.render_ctx.textures_created;
+        try self.render();
+        // Only the uncached scroll indicator is recreated on an identical frame.
+        if (self.render_ctx.textures_created != first + 1) return error.RowsWereNotCached;
+        self.navigate(1);
+        try self.render();
+        if (self.render_ctx.textures_created != first + 4) return error.SelectionRebuiltUnchangedRows;
+        for (0..100) |_| {
+            self.navigate(1);
+            try self.render();
+            if (self.render_ctx.rows.items.len > self.visibleRows()) return error.UnboundedRowCache;
+        }
+        const old = self.render_ctx.textures_created;
+        try self.sdl.font.setSize(config.font.size + 2);
+        try self.render();
+        if (self.render_ctx.textures_created <= old + 1) return error.FontChangeDidNotInvalidate;
+        const generation = try self.sdl.font.getGeneration();
+        for (self.render_ctx.rows.items) |row| {
+            if (row.display.font_generation != generation) return error.StaleFontTexture;
+        }
+        try self.handleTextInput("no-such-item");
+        try self.finishSearch();
+        try self.render();
+        if (self.render_ctx.rows.items.len != 0) return error.InvisibleRowsRetained;
+    }
+
     fn pushText(text: [:0]const u8) !void {
         try sdl.events.push(.{ .text_input = .{ .common = std.mem.zeroes(sdl.events.Common), .text = text } });
     }
@@ -379,12 +411,14 @@ pub const App = struct {
         start = sdl.timer.getPerformanceCounter();
         history.feature.hooks.afterFilter.?(hist, &self.state.filtered_items, self.state.items.items);
         reportTiming("history", start);
+        self.render_ctx.textures_created = 0;
         for (0..20) |_| {
             start = sdl.timer.getPerformanceCounter();
             self.navigate(1);
             try self.render();
             reportTiming("render_navigation", start);
         }
+        std.debug.print("BENCH textures_created {d}\n", .{self.render_ctx.textures_created});
     }
 
     fn benchmarkSearch(self: *App) !void {
@@ -899,6 +933,7 @@ pub const App = struct {
         self.render_ctx.prompt_cache.deinit();
         self.render_ctx.count_cache.deinit();
         self.render_ctx.no_match_cache.deinit();
+        self.render_ctx.invalidateRows();
         const w_width, const w_height = try self.sdl.window.getSizeInPixels();
 
         if (w_width > std.math.maxInt(u32) or w_height > std.math.maxInt(u32)) {
@@ -1002,6 +1037,7 @@ pub const App = struct {
 
         const filtered_len = self.state.filtered_items.items.len;
         if (filtered_len == 0) {
+            try self.render_ctx.prepareRows(self.allocator, &.{});
             try self.renderEmptyState(scale);
             return;
         }
@@ -1009,6 +1045,7 @@ pub const App = struct {
         const visible_end = @min(self.state.scroll_offset + self.visibleRows(), filtered_len);
         std.debug.assert(visible_end <= filtered_len);
         std.debug.assert(self.state.scroll_offset <= visible_end);
+        try self.render_ctx.prepareRows(self.allocator, self.state.filtered_items.items[self.state.scroll_offset..visible_end]);
 
         var y_pos: f32 = config.layout.items_start_y * scale;
         for (self.state.scroll_offset..visible_end) |i| {
@@ -1019,7 +1056,7 @@ pub const App = struct {
 
             const item = self.state.items.items[item_index];
             const is_selected = (i == self.state.selected_index);
-            try self.renderItem(scale, y_pos, item, is_selected);
+            try self.renderItem(scale, y_pos, item, is_selected, self.render_ctx.rowFor(item_index));
             y_pos += self.lineHeight() * scale;
         }
 
@@ -1030,7 +1067,7 @@ pub const App = struct {
 
     /// Render a single item row: prefix ("> " when selected, "  " otherwise),
     /// display text, and optional dimmed value-preview.
-    fn renderItem(self: *App, scale: f32, y_pos: f32, item: types.Item, is_selected: bool) !void {
+    fn renderItem(self: *App, scale: f32, y_pos: f32, item: types.Item, is_selected: bool, cache: *rendering_mod.RowCache) !void {
         std.debug.assert(scale > 0.0);
         std.debug.assert(y_pos >= 0.0);
 
@@ -1040,15 +1077,15 @@ pub const App = struct {
         const display_budget = if (preview) width * 0.65 else width;
         const display_text = try rendering_mod.fitText(self.sdl.font, self.render_ctx.item_buffer, prefix, item.display, display_budget, .middle);
         const display_color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
-        try self.renderText(5.0 * scale, y_pos, display_text, display_color);
+        try self.renderCachedText(5.0 * scale, y_pos, display_text, display_color, &cache.display);
 
         if (preview) {
             const display_w, _ = try self.sdl.font.getStringSize(display_text);
             const value_x = 5.0 * scale + @as(f32, @floatFromInt(display_w)) + config.multivalue.preview_spacing * scale;
             const preview_buffer = self.render_ctx.value_preview_buffer[0..if (config.multivalue.preview_max_length > 0) @min(self.render_ctx.value_preview_buffer.len, config.multivalue.preview_max_length + 4) else self.render_ctx.value_preview_buffer.len];
             const preview_text = try rendering_mod.fitText(self.sdl.font, preview_buffer, "", item.value, @max(0, width - (value_x - 5.0 * scale)), .middle);
-            if (preview_text.len > 0) try self.renderText(value_x, y_pos, preview_text, self.color_scheme.value_preview);
-        }
+            try self.renderCachedText(value_x, y_pos, preview_text, self.color_scheme.value_preview, &cache.preview);
+        } else cache.preview.deinit();
     }
 
     /// Render the "No matches" placeholder when the filter excludes every item.
@@ -1082,6 +1119,7 @@ pub const App = struct {
         defer surface.deinit();
 
         const texture = try self.sdl.renderer.createTextureFromSurface(surface);
+        self.render_ctx.textures_created += 1;
         defer texture.deinit();
 
         const width, const height = try texture.getSize();
@@ -1101,20 +1139,32 @@ pub const App = struct {
         // memory); setText below uses @memcpy. No heap allocation per frame.
         std.debug.assert(text.len <= rendering_mod.max_cache_text_len);
 
+        if (text.len == 0) {
+            cache.deinit();
+            return;
+        }
+        const font_id = @intFromPtr(self.sdl.font.value);
+        const generation = try self.sdl.font.getGeneration();
+        const font_changed = cache.font_id != font_id or cache.font_generation != generation;
+        const scale_changed = cache.scale != self.render_ctx.window.display_scale;
         const text_changed = !std.mem.eql(u8, cache.lastText(), text);
         const color_changed = !rendering_mod.colorEquals(cache.last_color, color);
 
-        if (text_changed or color_changed or cache.texture == null) {
+        if (text_changed or color_changed or font_changed or scale_changed or cache.texture == null) {
             // Build the new texture before mutating cache state — if the SDL
             // call fails, the cache stays consistent with the previous frame.
             const ttf_color = sdl.ttf.Color{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
             const surface = try self.sdl.font.renderTextBlended(text, ttf_color);
             defer surface.deinit();
             const new_texture = try self.sdl.renderer.createTextureFromSurface(surface);
+            self.render_ctx.textures_created += 1;
 
             if (cache.texture) |old_tex| old_tex.deinit();
             cache.setText(text);
             cache.last_color = color;
+            cache.font_id = font_id;
+            cache.font_generation = generation;
+            cache.scale = self.render_ctx.window.display_scale;
             cache.texture = new_texture;
         }
 

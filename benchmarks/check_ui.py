@@ -28,3 +28,7 @@ with subprocess.Popen(["zig-out/bin/large-list-bench", "check-stream"],
         if process.poll() is None:
             process.kill()
 print("Partial results, duplicate identity, edit/navigation barriers, pending Enter and immediate Escape passed")
+
+subprocess.run(["zig-out/bin/large-list-bench", "check-cache"],
+    env={**os.environ, "SDL_VIDEODRIVER": "offscreen"}, check=True, timeout=10)
+print("Visible texture reuse, selection-only updates, font invalidation and eviction passed")

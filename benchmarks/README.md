@@ -52,3 +52,18 @@ target. An independent O(N*H) oracle checks duplicate ranks and stable order;
 allocation failures leave the original order intact and scratch capacity is
 reused. Unit tests and ReleaseSafe were checked with history both disabled and
 enabled; offscreen UI checks used the default configuration.
+
+Texture counts were remeasured on `c4ed9f2` with only the instrumentation in
+`baseline-texture-counter.patch`; `baseline-textures.json` records 1,222 texture
+creations per 20 navigation renders for every input size. `before-cache.json`
+records 382 after the viewport changes, and `cache.json` records 97 with visible
+row caching. At 1 million items, render p95 is 2.78 ms versus 7.59 ms originally;
+short-run timing variance remains, so texture counts are the clearer evidence
+for the cache itself. UI tests check identical-frame reuse, selection-only
+updates, font generation invalidation and eviction after an empty result.
+
+When global mise tools are still missing, use `mise run --skip-tools benchmark`
+(or `MISE_TASK_RUN_AUTO_INSTALL=false`) to use installed tools without automatic
+installation. One measurement attempt was stopped after global auto-install
+started unrelated Cargo tools and installed pass-cli 2.3.3; measured runs used
+the existing Zig 0.16.0 with auto-install disabled afterward.
