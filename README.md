@@ -270,3 +270,12 @@ available height, reserving a footer for counts and position. Text fits the
 available pixel width: queries show the tail, and long paths retain their final
 filename with a middle ellipsis. UTF-8 boundaries are preserved. Font size and
 all layout options remain compile-time configuration.
+
+Stdin uses a cancelable reader with a shared queue capped at 4 MiB of line
+content or 4,096 lines, whichever fills first. The consumer holds at most one
+additional bounded batch. Partial lines retain only the prefix needed for the
+existing UTF-8 truncation rule. Ingestion yields between items after a 4 ms
+slice. Queue limits do **not** bound the final item collection, which still grows
+with the number of input items. Lines transfer ownership into items without a
+second text copy; whitespace trimming, `display|value` and final lines without a
+newline retain their behavior.

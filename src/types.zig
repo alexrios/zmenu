@@ -18,8 +18,11 @@ pub const Item = struct {
     /// UTF-8 safe: pipe is ASCII (0x7C)
     pub fn parse(allocator: std.mem.Allocator, line: []const u8) !Item {
         const owned_line = try allocator.dupe(u8, line);
-        errdefer allocator.free(owned_line);
+        return fromOwned(owned_line);
+    }
 
+    /// Transfer one allocation to an item. Slices borrow from raw until deinit.
+    pub fn fromOwned(owned_line: []u8) Item {
         if (std.mem.indexOfScalar(u8, owned_line, '|')) |pipe_idx| {
             // Found pipe: split into display|value
             const item = Item{
@@ -155,4 +158,13 @@ test "Item.parse - slices point into same raw memory" {
     try std.testing.expect(@intFromPtr(item.display.ptr) < @intFromPtr(item.raw.ptr) + item.raw.len);
     try std.testing.expect(@intFromPtr(item.value.ptr) >= @intFromPtr(item.raw.ptr));
     try std.testing.expect(@intFromPtr(item.value.ptr) < @intFromPtr(item.raw.ptr) + item.raw.len);
+}
+
+test "Item.fromOwned transfers the original allocation without copying" {
+    const owned = try std.testing.allocator.dupe(u8, "café|duplicate");
+    const item = Item.fromOwned(owned);
+    defer item.deinit(std.testing.allocator);
+    try std.testing.expect(item.raw.ptr == owned.ptr);
+    try std.testing.expectEqualStrings("café", item.display);
+    try std.testing.expectEqualStrings("duplicate", item.value);
 }

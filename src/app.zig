@@ -179,8 +179,10 @@ pub const App = struct {
         defer stdin_reader.deinit();
 
         var new_lines = std.ArrayList([]u8).empty;
+        var line_cursor: usize = 0;
+        var read_status: CancelableStdinReader.Status = .reading;
         defer {
-            for (new_lines.items) |line| self.allocator.free(line);
+            for (new_lines.items[line_cursor..]) |line| self.allocator.free(line);
             new_lines.deinit(self.allocator);
         }
 
@@ -190,13 +192,13 @@ pub const App = struct {
 
         var running = true;
         while (running) {
-            const read_status = try stdin_reader.pollLines(&new_lines);
-            try self.processNewLines(&new_lines);
-            if (read_status == .eof and self.state.input_state == .loading) {
+            if (new_lines.items.len == 0) read_status = try stdin_reader.pollLines(&new_lines);
+            try self.processNewLines(&new_lines, &line_cursor);
+            if (read_status == .eof and new_lines.items.len == 0 and self.state.input_state == .loading) {
                 try self.handleEofTransition();
             }
 
-            if (sdl.events.waitTimeout(16)) {
+            if (sdl.events.waitTimeout(if (new_lines.items.len > 0) 0 else 16)) {
                 running = try self.processEvents();
             }
 
@@ -301,13 +303,23 @@ pub const App = struct {
         std.debug.print("BENCH {s} {d:.3}\n", .{ label, ms });
     }
 
-    fn processNewLines(self: *App, new_lines: *std.ArrayList([]u8)) !void {
+    fn sliceExpired(start: u64) bool {
+        return sdl.timer.getPerformanceCounter() - start >= sdl.timer.getPerformanceFrequency() / 250;
+    }
+
+    fn processNewLines(self: *App, new_lines: *std.ArrayList([]u8), cursor: *usize) !void {
         if (new_lines.items.len == 0) return;
-        for (new_lines.items) |line| {
-            try self.processLine(line);
-            self.allocator.free(line);
+        const start = sdl.timer.getPerformanceCounter();
+        while (cursor.* < new_lines.items.len) {
+            const line = new_lines.items[cursor.*];
+            cursor.* += 1; // processOwnedLine consumes ownership even on error.
+            try self.processOwnedLine(line);
+            if (sliceExpired(start)) break;
         }
-        new_lines.clearRetainingCapacity();
+        if (cursor.* == new_lines.items.len) {
+            new_lines.clearRetainingCapacity();
+            cursor.* = 0;
+        }
         self.state.needs_render = true;
     }
 
@@ -364,6 +376,13 @@ pub const App = struct {
         io: std.Io,
         file: std.Io.File,
         max_iterations: u32,
+        space_available: std.Io.Condition = .init,
+        queue_bytes: usize = 0,
+        significant_len: usize = 0,
+        line_started: bool = false,
+
+        pub const max_queue_bytes = 4 * 1024 * 1024;
+        pub const max_queue_lines = 4096;
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) CancelableStdinReader {
             return .{
@@ -391,44 +410,46 @@ pub const App = struct {
             self.started = true;
         }
 
-        /// Dupe `line` into heap memory, then enqueue it on the shared list
-        /// under the mutex. Returns OOM on either allocation failure; caller
-        /// should stop reading rather than masking the failure.
-        fn emitLine(self: *CancelableStdinReader, line: []const u8) std.mem.Allocator.Error!void {
+        /// Wait for bounded queue space; cancellation interrupts this wait.
+        fn emitLine(self: *CancelableStdinReader, line: []const u8) !void {
+            std.debug.assert(line.len <= config.limits.max_item_length);
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+            while (self.lines.items.len >= max_queue_lines or self.queue_bytes + line.len > max_queue_bytes) {
+                try self.space_available.wait(self.io, &self.mutex);
+            }
             const owned = try self.allocator.dupe(u8, line);
             errdefer self.allocator.free(owned);
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
             try self.lines.append(self.allocator, owned);
+            self.queue_bytes += line.len;
         }
 
-        /// Split one chunk on '\n', emit each completed line, and buffer the
-        /// trailing partial line (if any) into `line_buffer` for the next chunk
-        /// to complete. Propagates OOM.
-        fn processChunk(
-            self: *CancelableStdinReader,
-            chunk: []const u8,
-            line_buffer: *std.ArrayList(u8),
-        ) std.mem.Allocator.Error!void {
-            var chunk_start: usize = 0;
-            for (chunk, 0..) |byte, i| {
-                std.debug.assert(chunk_start <= chunk.len);
-                if (byte != '\n') continue;
-                try line_buffer.appendSlice(self.allocator, chunk[chunk_start..i]);
-                try self.emitLine(line_buffer.items);
-                line_buffer.clearRetainingCapacity();
-                chunk_start = i + 1;
-            }
-            if (chunk_start < chunk.len) {
-                try line_buffer.appendSlice(self.allocator, chunk[chunk_start..]);
+        /// Trim before truncation, retaining only a bounded prefix plus UTF-8
+        /// lookahead. significant_len tracks non-whitespace even past the cap.
+        fn processChunk(self: *CancelableStdinReader, chunk: []const u8, line_buffer: *std.ArrayList(u8)) !void {
+            for (chunk) |byte| {
+                if (byte == '\n') {
+                    try self.flushPartialLine(line_buffer);
+                    line_buffer.clearRetainingCapacity();
+                    self.significant_len = 0;
+                    self.line_started = false;
+                    continue;
+                }
+                const whitespace = std.ascii.isWhitespace(byte);
+                if (!self.line_started and whitespace) continue;
+                self.line_started = true;
+                if (line_buffer.items.len < config.limits.max_item_length + 4) {
+                    try line_buffer.append(self.allocator, byte);
+                }
+                if (!whitespace) self.significant_len = line_buffer.items.len;
             }
         }
 
-        /// Emit any final partial line at EOF (stdin without trailing newline).
-        /// Allocation failures propagate to the task result.
         fn flushPartialLine(self: *CancelableStdinReader, line_buffer: *std.ArrayList(u8)) !void {
-            if (line_buffer.items.len == 0) return;
-            try self.emitLine(line_buffer.items);
+            if (self.significant_len == 0) return;
+            const trimmed = line_buffer.items[0..self.significant_len];
+            const length = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
+            try self.emitLine(trimmed[0..length]);
         }
 
         fn readTask(self: *CancelableStdinReader) anyerror!Status {
@@ -440,7 +461,7 @@ pub const App = struct {
                 const bytes_read = self.file.readStreaming(self.io, &.{&chunk_buffer}) catch |err| switch (err) {
                     error.EndOfStream => {
                         self.flushPartialLine(&line_buffer) catch |flush_err| {
-                            self.status.store(.failed, .release);
+                            self.status.store(if (flush_err == error.Canceled) .canceled else .failed, .release);
                             return flush_err;
                         };
                         self.status.store(.eof, .release);
@@ -457,7 +478,7 @@ pub const App = struct {
                 };
                 std.debug.assert(bytes_read <= chunk_buffer.len);
                 self.processChunk(chunk_buffer[0..bytes_read], &line_buffer) catch |err| {
-                    self.status.store(.failed, .release);
+                    self.status.store(if (err == error.Canceled) .canceled else .failed, .release);
                     return err;
                 };
             }
@@ -470,9 +491,12 @@ pub const App = struct {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            // Transfer lines from thread buffer to destination
-            try dest.appendSlice(self.allocator, self.lines.items);
-            self.lines.clearRetainingCapacity();
+            // Swap only into an exhausted consumer batch. Each side retains a
+            // bounded allocation; the final item collection is not bounded.
+            std.debug.assert(dest.items.len == 0);
+            std.mem.swap(std.ArrayList([]u8), dest, &self.lines);
+            self.queue_bytes = 0;
+            self.space_available.signal(self.io);
 
             const current = self.status.load(.acquire);
             if (current == .failed) {
@@ -504,28 +528,23 @@ pub const App = struct {
         }
     };
 
+    // Benchmark/test adapter for borrowed lines. Production transfers ownership.
     fn processLine(self: *App, line: []const u8) !void {
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-        if (trimmed.len > 0) {
-            std.debug.assert(trimmed.len <= line.len);
+        const length = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
+        try self.processOwnedLine(try self.allocator.dupe(u8, trimmed[0..length]));
+    }
 
-            const truncate_len = input.findUtf8Boundary(trimmed, config.limits.max_item_length);
-            // Paired with findUtf8Boundary's internal postcondition: the
-            // returned index must be on a leading byte (or at end / zero).
-            std.debug.assert(truncate_len <= trimmed.len);
-            std.debug.assert(truncate_len <= config.limits.max_item_length);
-            std.debug.assert(truncate_len == 0 or truncate_len == trimmed.len or (trimmed[truncate_len] & 0xC0) != 0x80);
-
-            const final_line = trimmed[0..truncate_len];
-            const item = try types.Item.parse(self.allocator, final_line);
-            std.debug.assert(item.display.len <= config.limits.max_item_length);
-            try self.state.items.append(self.allocator, item);
-
-            // Increment items loaded counter if we're in loading state
-            if (self.state.input_state == .loading) {
-                self.state.input_state.loading.items_loaded += 1;
-            }
+    /// Always consumes the line, including empty input and allocation failures.
+    fn processOwnedLine(self: *App, line: []u8) !void {
+        if (line.len == 0) {
+            self.allocator.free(line);
+            return;
         }
+        const item = types.Item.fromOwned(line);
+        errdefer item.deinit(self.allocator);
+        try self.state.items.append(self.allocator, item);
+        if (self.state.input_state == .loading) self.state.input_state.loading.items_loaded += 1;
     }
 
     fn updateFilter(self: *App) !void {
@@ -1168,4 +1187,155 @@ test "TextureCache - max-size text fits exactly" {
     cache.setText(&buf);
     try std.testing.expectEqual(rendering_mod.max_cache_text_len, cache.last_text_len);
     try std.testing.expectEqualSlices(u8, &buf, cache.lastText());
+}
+
+test "stdin normalization matches trim then UTF-8 truncation across chunks" {
+    const allocator = std.testing.allocator;
+    var reader = App.CancelableStdinReader.init(allocator, std.testing.io, std.Io.File.stdin());
+    defer reader.deinit();
+    var partial = std.ArrayList(u8).empty;
+    defer partial.deinit(allocator);
+    var source = std.ArrayList(u8).empty;
+    defer source.deinit(allocator);
+    try source.appendSlice(allocator, " \t");
+    try source.appendNTimes(allocator, 'a', config.limits.max_item_length - 1);
+    try source.appendSlice(allocator, "日本語  \r\n  display|value|extra \t\n\n \t\nfinal");
+    var offset: usize = 0;
+    while (offset < source.items.len) {
+        const end = @min(offset + 7, source.items.len);
+        try reader.processChunk(source.items[offset..end], &partial);
+        try std.testing.expect(partial.items.len <= config.limits.max_item_length + 4);
+        offset = end;
+    }
+    try reader.flushPartialLine(&partial);
+    try std.testing.expectEqual(@as(usize, 3), reader.lines.items.len);
+    try std.testing.expectEqual(config.limits.max_item_length - 1, reader.lines.items[0].len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(reader.lines.items[0]));
+    try std.testing.expectEqualStrings("display|value|extra", reader.lines.items[1]);
+    try std.testing.expectEqualStrings("final", reader.lines.items[2]);
+}
+
+test "stdin preserves whitespace at truncation boundary when later text exists" {
+    var reader = App.CancelableStdinReader.init(std.testing.allocator, std.testing.io, std.Io.File.stdin());
+    defer reader.deinit();
+    var partial = std.ArrayList(u8).empty;
+    defer partial.deinit(std.testing.allocator);
+    var text: [config.limits.max_item_length + 100]u8 = undefined;
+    @memset(&text, ' ');
+    text[0] = 'a';
+    text[text.len - 1] = 'b';
+    try reader.processChunk(&text, &partial);
+    try reader.flushPartialLine(&partial);
+    try std.testing.expectEqual(config.limits.max_item_length, reader.lines.items[0].len);
+    try std.testing.expectEqual(@as(u8, ' '), reader.lines.items[0][config.limits.max_item_length - 1]);
+}
+
+fn checkIngestionAllocationFailures(allocator: std.mem.Allocator) !void {
+    var reader = App.CancelableStdinReader.init(allocator, std.testing.io, std.Io.File.stdin());
+    defer reader.deinit();
+    var partial = std.ArrayList(u8).empty;
+    defer partial.deinit(allocator);
+    try reader.processChunk(" alpha|value \nsecond\n", &partial);
+    var lines = std.ArrayList([]u8).empty;
+    var cursor: usize = 0;
+    defer {
+        for (lines.items[cursor..]) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    _ = try reader.pollLines(&lines);
+    var app: App = undefined;
+    app.state = AppState.empty;
+    app.allocator = allocator;
+    defer {
+        for (app.state.items.items) |item| item.deinit(allocator);
+        app.state.items.deinit(allocator);
+    }
+    while (cursor < lines.items.len) {
+        const line = lines.items[cursor];
+        cursor += 1;
+        try app.processOwnedLine(line);
+    }
+    try std.testing.expectEqualStrings("value", app.state.items.items[0].value);
+}
+
+test "stdin ownership is leak free at every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkIngestionAllocationFailures, .{});
+}
+
+test "stdin byte bound blocks below the line limit and accepts cancellation" {
+    const io = std.testing.io;
+    var reader = App.CancelableStdinReader.init(std.testing.allocator, io, std.Io.File.stdin());
+    defer reader.deinit();
+    var line: [4096]u8 = undefined;
+    @memset(&line, 'x');
+    for (0..1024) |_| try reader.emitLine(&line);
+    try std.testing.expectEqual(App.CancelableStdinReader.max_queue_bytes, reader.queue_bytes);
+    try std.testing.expect(reader.lines.items.len < App.CancelableStdinReader.max_queue_lines);
+    var future = io.async(App.CancelableStdinReader.emitLine, .{ &reader, &line });
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+    try std.testing.expectEqual(@as(usize, 1024), reader.lines.items.len);
+}
+
+test "stdin cancels a full line queue while producer keeps its pipe open" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "i=0; while [ \"$i\" -lt 5000 ]; do printf 'line\\n'; i=$((i+1)); done; exec sleep 30" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    var reader = App.CancelableStdinReader.init(std.testing.allocator, io, child.stdout.?);
+    reader.start();
+    defer reader.deinit();
+    var full = false;
+    for (0..2000) |_| {
+        reader.mutex.lockUncancelable(io);
+        full = reader.lines.items.len == App.CancelableStdinReader.max_queue_lines;
+        reader.mutex.unlock(io);
+        if (full) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(full);
+    reader.cancel();
+    try std.testing.expectEqual(App.CancelableStdinReader.Status.canceled, reader.status.load(.acquire));
+    try std.testing.expect(child.id != null);
+}
+
+test "stdin bounded batch swaps preserve order without loss or duplication" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(allocator);
+    for (0..10000) |i| {
+        var line: [32]u8 = undefined;
+        try data.appendSlice(allocator, try std.fmt.bufPrint(&line, "{d}\n", .{i}));
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "items", .data = data.items });
+    const file = try tmp.dir.openFile(io, "items", .{});
+    defer file.close(io);
+    var reader = App.CancelableStdinReader.init(allocator, io, file);
+    reader.start();
+    defer reader.deinit();
+    var lines = std.ArrayList([]u8).empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    var expected: usize = 0;
+    for (0..10000) |_| {
+        const status = try reader.pollLines(&lines);
+        try std.testing.expect(lines.items.len <= App.CancelableStdinReader.max_queue_lines);
+        for (lines.items) |line| {
+            try std.testing.expectEqual(expected, try std.fmt.parseInt(usize, line, 10));
+            expected += 1;
+        }
+        for (lines.items) |line| allocator.free(line);
+        lines.clearRetainingCapacity();
+        if (status == .eof) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 10000), expected);
 }

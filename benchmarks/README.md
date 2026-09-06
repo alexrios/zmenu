@@ -26,3 +26,10 @@ query-tail clipping were inspected at all three scales. The embedded font lacks
 Japanese glyphs (tofu boxes); UTF-8 data is preserved. Latte contrast is addressed
 in the final theme commit. Unit tests, ReleaseSafe build and confirmation checks
 passed with the viewport changes.
+
+The ownership commit passed 85 unit tests, ReleaseSafe and `test:ui`. Added
+allocation-failure injection across parsing and item transfer, 10,000-line
+ordered delivery, byte-limit and line-limit backpressure, and cancellation with
+a full queue and an open producer pipe. `ownership.json` repeats internal
+measurements; its ingest adapter excludes the queue, so it does not quantify the
+removed producer-to-item copy or pipeline peak memory.
