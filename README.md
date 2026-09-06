@@ -298,3 +298,7 @@ Text textures are cached only for visible rows and their previews. Scrolling
 reuses rows that stay visible and releases rows that leave the viewport. Content,
 color, font generation and scale changes invalidate the relevant textures;
 resource creation and destruction stay on the main SDL thread.
+
+Latte uses its main text color for the prompt and value previews. The selected
+row uses the existing selection color as its background and the window's
+background color for its text and preview, retaining the `>` marker.

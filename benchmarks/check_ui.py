@@ -32,3 +32,7 @@ print("Partial results, duplicate identity, edit/navigation barriers, pending En
 subprocess.run(["zig-out/bin/large-list-bench", "check-cache"],
     env={**os.environ, "SDL_VIDEODRIVER": "offscreen"}, check=True, timeout=10)
 print("Visible texture reuse, selection-only updates, font invalidation and eviction passed")
+
+subprocess.run(["zig-out/bin/large-list-bench", "check-themes"],
+    env={**os.environ, "SDL_VIDEODRIVER": "offscreen"}, check=True, timeout=10)
+print("Selection frames generated for all eight themes")

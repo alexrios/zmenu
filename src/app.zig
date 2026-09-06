@@ -228,6 +228,20 @@ pub const App = struct {
         }
     }
 
+    pub fn checkThemes(self: *App) !void {
+        try self.processLine("First result|/home/alexrios/first.txt");
+        try self.processLine("Selected result|/home/alexrios/selected.txt");
+        try self.processLine("Third result|/home/alexrios/third.txt");
+        try self.handleEofTransition();
+        self.navigate(1);
+        for ([_][]const u8{ "latte", "mocha", "frappe", "macchiato", "dracula", "gruvbox", "nord", "solarized" }) |name| {
+            const theme = config.theme.getByName(name);
+            self.color_scheme = .{ .background = theme.background, .foreground = theme.foreground, .selected = theme.selected, .prompt = theme.prompt, .value_preview = theme.value_preview };
+            try self.drawFrame();
+            try self.saveFrame(1, name);
+        }
+    }
+
     pub fn checkCache(self: *App) !void {
         for (0..200) |i| {
             var line: [128]u8 = undefined;
@@ -240,7 +254,7 @@ pub const App = struct {
         if (self.render_ctx.textures_created != first + 1) return error.RowsWereNotCached;
         self.navigate(1);
         try self.render();
-        if (self.render_ctx.textures_created != first + 4) return error.SelectionRebuiltUnchangedRows;
+        if (self.render_ctx.textures_created != first + 6) return error.SelectionRebuiltUnchangedRows;
         for (0..100) |_| {
             self.navigate(1);
             try self.render();
@@ -338,6 +352,8 @@ pub const App = struct {
             const text = try std.fmt.bufPrint(&line, "/projects/a-very-long-directory-name/another-long-directory/café/component/{d}/important-final-filename.txt|/home/alexrios/very/long/path/to/preview-file-{d}.txt", .{ i, i });
             try self.processLine(text);
         }
+        try self.drawFrame();
+        try self.saveFrame(scale, "partial");
         try self.handleEofTransition();
         try self.drawFrame();
         try self.saveFrame(scale, "items");
@@ -419,6 +435,52 @@ pub const App = struct {
             reportTiming("render_navigation", start);
         }
         std.debug.print("BENCH textures_created {d}\n", .{self.render_ctx.textures_created});
+        try self.benchmarkEvents();
+    }
+
+    /// SDL event-to-present timings, separate from internal matching time.
+    /// Injection starts at SDL's queue, excluding physical keyboard latency.
+    fn benchmarkEvents(self: *App) !void {
+        for (0..20) |i| {
+            const start = sdl.timer.getPerformanceCounter();
+            try pushKey(.u, true);
+            try pushText(if (i % 2 == 0) "cpt99" else "zzzzzz");
+            var first_frame = true;
+            while (true) {
+                try self.processSearchSlice();
+                if (sdl.events.waitTimeout(0)) {
+                    if (!try self.processEvents()) return error.UnexpectedBenchmarkQuit;
+                }
+                if (!try self.processActions()) return error.UnexpectedBenchmarkConfirmation;
+                if (self.state.needs_render) {
+                    try self.render();
+                    self.state.needs_render = false;
+                    if (first_frame) {
+                        reportTiming("input_first_frame", start);
+                        first_frame = false;
+                    }
+                }
+                if (!self.search.pending and self.actions.items.len == 0) break;
+            }
+            reportTiming("input_results_frame", start);
+        }
+        for (0..20) |_| {
+            self.state.input_buffer.clearRetainingCapacity();
+            try self.updateFilter();
+            try self.processSearchSlice();
+            const start = sdl.timer.getPerformanceCounter();
+            try pushKey(.escape, false);
+            var escaped = false;
+            for (0..max_events_per_tick) |_| {
+                if (sdl.events.waitTimeout(1) and !try self.processEvents()) {
+                    escaped = true;
+                    break;
+                }
+            }
+            if (!escaped) return error.EscapeWasDeferred;
+            reportTiming("escape_dispatch", start);
+            self.search.pending = false;
+        }
     }
 
     fn benchmarkSearch(self: *App) !void {
@@ -1024,7 +1086,7 @@ pub const App = struct {
         const count_text = std.fmt.bufPrintZ(
             self.render_ctx.count_buffer,
             "{s}{d}/{d}",
-            .{ if (self.search.pending) "Searching... " else if (self.state.input_state == .loading) "Reading... " else "", self.state.filtered_items.items.len, self.state.items.items.len },
+            .{ if (self.search.pending) (if (self.state.input_state == .loading) "Reading / searching... " else "Searching... ") else if (self.state.input_state == .loading) "Reading... " else "", self.state.filtered_items.items.len, self.state.items.items.len },
         ) catch "?/?";
 
         try self.renderCachedText(5.0 * scale, self.footerY() * scale, count_text, self.color_scheme.foreground, &self.render_ctx.count_cache);
@@ -1076,7 +1138,16 @@ pub const App = struct {
         const preview = config.multivalue.show_preview and item.value.ptr != item.display.ptr and item.value.len > 0;
         const display_budget = if (preview) width * 0.65 else width;
         const display_text = try rendering_mod.fitText(self.sdl.font, self.render_ctx.item_buffer, prefix, item.display, display_budget, .middle);
-        const display_color = if (is_selected) self.color_scheme.selected else self.color_scheme.foreground;
+        if (is_selected) {
+            try self.sdl.renderer.setDrawColor(self.color_scheme.selected);
+            try self.sdl.renderer.renderFillRect(.{
+                .x = 0,
+                .y = y_pos,
+                .w = @as(f32, @floatFromInt(self.render_ctx.window.current_width)) * scale,
+                .h = self.lineHeight() * scale,
+            });
+        }
+        const display_color = if (is_selected) self.color_scheme.background else self.color_scheme.foreground;
         try self.renderCachedText(5.0 * scale, y_pos, display_text, display_color, &cache.display);
 
         if (preview) {
@@ -1084,7 +1155,7 @@ pub const App = struct {
             const value_x = 5.0 * scale + @as(f32, @floatFromInt(display_w)) + config.multivalue.preview_spacing * scale;
             const preview_buffer = self.render_ctx.value_preview_buffer[0..if (config.multivalue.preview_max_length > 0) @min(self.render_ctx.value_preview_buffer.len, config.multivalue.preview_max_length + 4) else self.render_ctx.value_preview_buffer.len];
             const preview_text = try rendering_mod.fitText(self.sdl.font, preview_buffer, "", item.value, @max(0, width - (value_x - 5.0 * scale)), .middle);
-            try self.renderCachedText(value_x, y_pos, preview_text, self.color_scheme.value_preview, &cache.preview);
+            try self.renderCachedText(value_x, y_pos, preview_text, if (is_selected) self.color_scheme.background else self.color_scheme.value_preview, &cache.preview);
         } else cache.preview.deinit();
     }
 

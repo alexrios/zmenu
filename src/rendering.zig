@@ -169,7 +169,8 @@ pub const FitMode = enum { tail, middle };
 /// Fit a label using actual glyph widths. All cuts occur at UTF-8 boundaries.
 /// Paths retain their basename where it fits; queries retain their newest text.
 pub fn fitText(font: anytype, buffer: []u8, prefix: []const u8, text: []const u8, width: f32, mode: FitMode) ![:0]const u8 {
-    if (prefix.len + text.len + 1 <= buffer.len) {
+    // Reserve the ellipsis budget even for full labels, honoring preview caps.
+    if (prefix.len + text.len + 4 <= buffer.len) {
         const full = try std.fmt.bufPrintZ(buffer, "{s}{s}", .{ prefix, text });
         const w, _ = try font.getStringSize(full);
         if (@as(f32, @floatFromInt(w)) <= width) return full;

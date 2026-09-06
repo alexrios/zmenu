@@ -1,0 +1,174 @@
+{
+  "environment": {
+    "platform": "Linux-7.0.11-76070011-generic-x86_64-with-glibc2.39",
+    "cpu": "x86_64",
+    "zig": "0.16.0",
+    "mode": "ReleaseSafe",
+    "video": "offscreen",
+    "repetitions": 5
+  },
+  "sizes": {
+    "10000": {
+      "ingest": {
+        "p50": 1.112,
+        "p95": 1.152
+      },
+      "search_slice": {
+        "p50": 0.1645,
+        "p95": 0.546
+      },
+      "search_empty": {
+        "p50": 0.192,
+        "p95": 0.215
+      },
+      "search_fuzzy": {
+        "p50": 0.56,
+        "p95": 0.582
+      },
+      "search_extension": {
+        "p50": 0.121,
+        "p95": 0.128
+      },
+      "candidates_examined": {
+        "p50": 1981.0,
+        "p95": 1981.0
+      },
+      "history": {
+        "p50": 0.433,
+        "p95": 0.443
+      },
+      "render_navigation": {
+        "p50": 0.992,
+        "p95": 2.889
+      },
+      "textures_created": {
+        "p50": 116.0,
+        "p95": 116.0
+      },
+      "input_first_frame": {
+        "p50": 0.8154999999999999,
+        "p95": 1.353
+      },
+      "input_results_frame": {
+        "p50": 1.7605,
+        "p95": 3.375
+      },
+      "escape_dispatch": {
+        "p50": 0.001,
+        "p95": 0.001
+      },
+      "rss_kib": {
+        "p50": 117784.0,
+        "p95": 118256.0
+      }
+    },
+    "100000": {
+      "ingest": {
+        "p50": 9.809,
+        "p95": 9.997
+      },
+      "search_slice": {
+        "p50": 1.447,
+        "p95": 4.0
+      },
+      "search_empty": {
+        "p50": 1.607,
+        "p95": 1.634
+      },
+      "search_fuzzy": {
+        "p50": 5.541,
+        "p95": 5.751
+      },
+      "search_extension": {
+        "p50": 1.409,
+        "p95": 1.436
+      },
+      "candidates_examined": {
+        "p50": 21268.0,
+        "p95": 21268.0
+      },
+      "history": {
+        "p50": 5.906,
+        "p95": 5.983
+      },
+      "render_navigation": {
+        "p50": 0.99,
+        "p95": 3.001
+      },
+      "textures_created": {
+        "p50": 116.0,
+        "p95": 116.0
+      },
+      "input_first_frame": {
+        "p50": 0.785,
+        "p95": 1.109
+      },
+      "input_results_frame": {
+        "p50": 6.6265,
+        "p95": 8.146
+      },
+      "escape_dispatch": {
+        "p50": 0.001,
+        "p95": 0.002
+      },
+      "rss_kib": {
+        "p50": 135740.0,
+        "p95": 136112.0
+      }
+    },
+    "1000000": {
+      "ingest": {
+        "p50": 94.64,
+        "p95": 98.726
+      },
+      "search_slice": {
+        "p50": 4.0,
+        "p95": 4.0
+      },
+      "search_empty": {
+        "p50": 15.672,
+        "p95": 16.135
+      },
+      "search_fuzzy": {
+        "p50": 54.936,
+        "p95": 56.158
+      },
+      "search_extension": {
+        "p50": 16.26,
+        "p95": 16.746
+      },
+      "candidates_examined": {
+        "p50": 232363.0,
+        "p95": 232363.0
+      },
+      "history": {
+        "p50": 45.658,
+        "p95": 52.326
+      },
+      "render_navigation": {
+        "p50": 0.9784999999999999,
+        "p95": 2.87
+      },
+      "textures_created": {
+        "p50": 116.0,
+        "p95": 116.0
+      },
+      "input_first_frame": {
+        "p50": 0.8125,
+        "p95": 1.565
+      },
+      "input_results_frame": {
+        "p50": 55.5165,
+        "p95": 61.639
+      },
+      "escape_dispatch": {
+        "p50": 0.003,
+        "p95": 0.009
+      },
+      "rss_kib": {
+        "p50": 314500.0,
+        "p95": 315160.0
+      }
+    }
+  }
+}

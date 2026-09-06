@@ -8,6 +8,7 @@ pub fn main(init: std.process.Init) !void {
     defer flags.deinit();
     var app = try App.init(std.heap.smp_allocator, init.io, null, null, &flags);
     defer app.deinit();
+    if (std.mem.eql(u8, args[1], "check-themes")) return app.checkThemes();
     if (std.mem.eql(u8, args[1], "check-cache")) return app.checkCache();
     if (std.mem.eql(u8, args[1], "check-incremental")) return app.checkIncremental();
     if (std.mem.eql(u8, args[1], "check-stream")) return app.checkStream();
