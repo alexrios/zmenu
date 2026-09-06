@@ -64,19 +64,27 @@ seq 1 1000 | zmenu --hist-limit 50
 echo -e "Item1\nItem2" | zmenu -H /tmp/history --hist-limit 100
 ```
 
-The history feature tracks your selections and reorders items based on recency, with most recently selected items appearing first.
+The history feature is disabled by default. When enabled, it tracks your selections and reorders items based on recency, with most recently selected items appearing first. Duplicates at the same history rank and items absent from history retain their order.
 `--hist-limit` accepts values from 1 through 10000; its default is the compile-time `features.history_max_entries` setting.
 
 The CLI rejects unknown options, positional arguments, duplicate options, and missing values before SDL is initialized. Informational options (`--help`, `--version`, and `--features`) cannot be combined with execution options.
 
 ### Responsiveness
 
-zmenu reads stdin **non-blocking** - the window appears immediately and shows a loading indicator while items are being read:
+zmenu reads stdin asynchronously. The window appears while input is still arriving,
+and partial results are available for typing, navigation and selection.
 
-- **Instant feedback** - Window appears right away, even for slow stdin sources.
-- **Real-time progress** - Shows "Loaded N items" counter as items arrive.
-- **Early cancellation** - Press `Escape` or `Ctrl+C` to exit anytime, even during loading.
-- **Batch display** - Items appear all at once after stdin completes (prevents UI jumpiness).
+The footer shows reading or search progress, item counts and position. Enter waits
+for the current query to finish, then confirms a valid partial result and cancels
+further reading. This can cause SIGPIPE in the producer. Escape cancels immediately.
+Selection follows item identity, including items with duplicate values.
+
+The window keeps `window.initial_width` and `window.initial_height` during loading
+and search, clamped to the monitor's usable area. Rows and Page Up/Down use the
+available height, reserving a footer for counts and position. Text fits the
+available pixel width: queries show the tail, and long paths retain their final
+filename with a middle ellipsis. UTF-8 boundaries are preserved. Font size and
+all layout options remain compile-time configuration.
 
 This is especially useful for slow commands:
 ```bash
@@ -106,7 +114,7 @@ find /large/directory -type f | zmenu
 - `Ctrl+W` - Delete last word
 
 **Actions:**
-- `Enter` - Select current item and output to stdout
+- `Enter` - Confirm a valid selection and output to stdout; with no matches, keep the menu open to edit the query
 - `Escape` / `Ctrl+C` - Cancel without selection (works anytime, even during loading)
 
 ### Clipboard Support
@@ -135,6 +143,10 @@ cp config.def.zig config.zig
 # Rebuild
 zig build
 ```
+
+Latte uses its main text color for the prompt and value previews. The selected
+row uses the existing selection color as its background and the window's
+background color for its text and preview, retaining the `>` marker.
 
 ### Available Themes
 
@@ -179,6 +191,8 @@ mise run build
 - `mise run build` - Build the project.
 - `mise run run` - Run the application.
 - `mise run test` - Run tests.
+- `mise run test:ui` - Run offscreen UI checks.
+- `mise run benchmark` - Measure large-list performance in ReleaseSafe; see [methodology and results](benchmarks/README.md).
 - `mise run clean` - Clean build artifacts.
 - `mise run check` - Check code without building.
 
@@ -238,6 +252,28 @@ zmenu embraces pragmatic software engineering.
 - **Smart allocation** - Buffers allocated once, reused every frame.
 - **Zero overhead** - Disabled features completely removed from binary.
 
+Stdin uses a cancelable reader with a shared queue capped at 4 MiB of line
+content or 4,096 lines, whichever fills first. The consumer holds at most one
+additional bounded batch. Partial lines retain only the prefix needed for the
+existing UTF-8 truncation rule. Ingestion yields between items after a 4 ms
+slice. Queue limits do **not** bound the final item collection, which still grows
+with the number of input items. Lines transfer ownership into items without a
+second text copy; whitespace trimming, `display|value` and final lines without a
+newline retain their behavior.
+
+Search scans also yield every 4 ms between items. Extending fuzzy/prefix queries
+reuses candidates, while deleting, replacing or using exact matching scans the
+collection again. Consecutive edits are coalesced before scanning; navigation and
+confirmation are ordering barriers.
+
+Optional history ordering uses stable rank distribution with reusable buffers,
+O(N + H) for N matches and H history entries. Its feature hooks retain their contracts.
+
+Text textures are cached only for visible rows and their previews. Scrolling
+reuses rows that stay visible and releases rows that leave the viewport. Content,
+color, font generation and scale changes invalidate the relevant textures;
+resource creation and destruction stay on the main SDL thread.
+
 **Philosophy:**
 Like dmenu's patch system, but better: features are enabled at compile-time via `config.zig`, type-checked by the compiler, and auto-update when APIs change. No merge conflicts, no runtime cost, pure Zig.
 
@@ -260,45 +296,3 @@ To add a new feature, see [docs/features.md](docs/features.md) for the compile-t
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE) for details.
-
-Enter confirms only a valid selection. With no matches, the menu stays open so
-that the query can be edited. Escape and Ctrl+C still cancel.
-
-The window keeps `window.initial_width` and `window.initial_height` during loading
-and search, clamped to the monitor's usable area. Rows and Page Up/Down use the
-available height, reserving a footer for counts and position. Text fits the
-available pixel width: queries show the tail, and long paths retain their final
-filename with a middle ellipsis. UTF-8 boundaries are preserved. Font size and
-all layout options remain compile-time configuration.
-
-Stdin uses a cancelable reader with a shared queue capped at 4 MiB of line
-content or 4,096 lines, whichever fills first. The consumer holds at most one
-additional bounded batch. Partial lines retain only the prefix needed for the
-existing UTF-8 truncation rule. Ingestion yields between items after a 4 ms
-slice. Queue limits do **not** bound the final item collection, which still grows
-with the number of input items. Lines transfer ownership into items without a
-second text copy; whitespace trimming, `display|value` and final lines without a
-newline retain their behavior.
-
-Typing, navigation and Enter work while stdin is still loading. The footer marks
-reading or a pending search; Enter waits for the current query, then confirms a
-valid partial result and cancels further reading. This can cause SIGPIPE in the
-producer. Escape cancels immediately. Search scans yield every 4 ms between
-items; extending fuzzy/prefix queries reuses candidates, while deleting,
-replacing or using exact matching scans the collection again. Selection follows
-item identity, including items with duplicate values. Consecutive edits are
-coalesced before scanning; navigation and confirmation are ordering barriers.
-
-Optional history ordering uses stable rank distribution with reusable buffers,
-O(N + H) for N matches and H history entries. Recency wins; duplicates at the
-same rank and items absent from history retain their order. History remains
-disabled by default and its feature hooks retain their contracts.
-
-Text textures are cached only for visible rows and their previews. Scrolling
-reuses rows that stay visible and releases rows that leave the viewport. Content,
-color, font generation and scale changes invalidate the relevant textures;
-resource creation and destruction stay on the main SDL thread.
-
-Latte uses its main text color for the prompt and value previews. The selected
-row uses the existing selection color as its background and the window's
-background color for its text and preview, retaining the `>` marker.
