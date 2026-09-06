@@ -17,6 +17,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      # Savannah intermittently returns 502/504 for this transitive dependency.
+      - name: Fetch FreeType from its release mirror
+        shell: bash
+        run: |
+          hash=$(zig fetch https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/freetype-2.14.3.tar.xz)
+          test "$hash" = "N-V-__8AAJo-LAHFNfa0p0oMQqmwlBEAZMOeo03azXgrKLTT"
       - name: Build ReleaseSafe
         run: zig build -Doptimize=ReleaseSafe
       - name: Test
