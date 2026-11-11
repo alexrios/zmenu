@@ -1,0 +1,10 @@
+{
+  "revision": "c4ed9f2",
+  "instrumentation": "baseline-texture-counter.patch",
+  "renders": 20,
+  "sizes": {
+    "10000": 1222,
+    "100000": 1222,
+    "1000000": 1222
+  }
+}

@@ -1,0 +1,47 @@
+diff --git a/src/app.zig b/src/app.zig
+index c9fdf10..3371160 100644
+--- a/src/app.zig
++++ b/src/app.zig
+@@ -233,12 +233,14 @@ pub const App = struct {
+         start = sdl.timer.getPerformanceCounter();
+         history.feature.hooks.afterFilter.?(hist, &self.state.filtered_items, self.state.items.items);
+         reportTiming("history", start);
++        self.render_ctx.textures_created = 0;
+         for (0..20) |_| {
+             start = sdl.timer.getPerformanceCounter();
+             self.navigate(1);
+             try self.render();
+             reportTiming("render_navigation", start);
+         }
++        std.debug.print("BENCH textures_created {d}\n", .{self.render_ctx.textures_created});
+     }
+ 
+     fn reportTiming(label: []const u8, start: u64) void {
+@@ -1020,6 +1022,7 @@ pub const App = struct {
+         defer surface.deinit();
+ 
+         const texture = try self.sdl.renderer.createTextureFromSurface(surface);
++        self.render_ctx.textures_created += 1;
+         defer texture.deinit();
+ 
+         const width, const height = try texture.getSize();
+@@ -1049,6 +1052,7 @@ pub const App = struct {
+             const surface = try self.sdl.font.renderTextBlended(text, ttf_color);
+             defer surface.deinit();
+             const new_texture = try self.sdl.renderer.createTextureFromSurface(surface);
++            self.render_ctx.textures_created += 1;
+ 
+             if (cache.texture) |old_tex| old_tex.deinit();
+             cache.setText(text);
+diff --git a/src/rendering.zig b/src/rendering.zig
+index bfd7b93..27a43bc 100644
+--- a/src/rendering.zig
++++ b/src/rendering.zig
+@@ -90,6 +90,7 @@ pub const RenderContext = struct {
+     no_match_cache: TextureCache,
+     // Cached max item width (updated on item ingest, avoids per-frame measurement)
+     cached_max_item_width: f32 = 0,
++    textures_created: usize = 0,
+     // Window and display state
+     window: Window,
+ 

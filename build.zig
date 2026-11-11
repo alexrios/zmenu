@@ -81,6 +81,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const bench = b.addExecutable(.{
+        .name = "large-list-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    bench.root_module.addImport("sdl3", sdl3_module);
+    bench.root_module.addImport("config", config_module);
+    bench.root_module.addImport("build_options", options.createModule());
+    const install_bench = b.addInstallArtifact(bench, .{});
+    b.step("benchmark", "Build the internal large-list benchmark").dependOn(&install_bench.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 

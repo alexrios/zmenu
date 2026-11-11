@@ -9,7 +9,7 @@ pub const InputState = union(enum) {
     loading: struct {
         items_loaded: usize,
     },
-    /// All items loaded, ready for interaction
+    /// All items loaded; interaction is also available during loading
     ready: void,
 };
 
@@ -34,37 +34,6 @@ pub const AppState = struct {
         .input_state = .{ .loading = .{ .items_loaded = 0 } },
     };
 };
-
-test "AppState - text input respects loading state" {
-    // This test verifies that input handling is properly guarded during
-    // state transitions. Text input should only be processed when in .ready state.
-    // This prevents race conditions where user input is accepted before all
-    // items are loaded from stdin.
-
-    const allocator = std.testing.allocator;
-
-    var state = AppState.empty;
-    defer {
-        state.input_buffer.deinit(allocator);
-        for (state.items.items) |item| item.deinit(allocator);
-        state.items.deinit(allocator);
-        state.filtered_items.deinit(allocator);
-    }
-
-    // Verify initial state is loading
-    try std.testing.expect(state.input_state == .loading);
-
-    // Simulate guard check (as in app.zig:212-214)
-    const should_process = (state.input_state == .ready);
-    try std.testing.expect(!should_process); // Should NOT process during loading
-
-    // Transition to ready
-    state.input_state = .ready;
-
-    // Now input should be processed
-    const should_process_now = (state.input_state == .ready);
-    try std.testing.expect(should_process_now);
-}
 
 test "AppState - loading counter accuracy during transitions" {
     // This test verifies that the loading counter accurately tracks items

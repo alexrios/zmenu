@@ -28,3 +28,14 @@ run = "zig build -Doptimize=ReleaseFast"
 [tasks."build:release-small"]
 description = "Build optimized release (ReleaseSmall)"
 run = "zig build -Doptimize=ReleaseSmall"
+
+[tasks."build:release-safe"]
+run = "zig build -Doptimize=ReleaseSafe"
+
+[tasks.benchmark]
+description = "ReleaseSafe internal large-list timings and peak RSS (SDL offscreen)"
+run = "zig build benchmark -Doptimize=ReleaseSafe && python3 benchmarks/run.py"
+
+[tasks."test:ui"]
+description = "Exercise real confirmation dispatch with SDL offscreen"
+run = "zig build benchmark -Doptimize=ReleaseSafe && python3 benchmarks/check_ui.py"

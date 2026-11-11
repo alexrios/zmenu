@@ -1,0 +1,7 @@
+{
+  "cpu": "Intel(R) Core(TM) i9-14900K",
+  "logical_cpus": 32,
+  "kernel": "7.0.11-76070011-generic",
+  "session": "wayland",
+  "revision": "ca24613a8a4f449892d04fddd43566c869e5e97e"
+}
